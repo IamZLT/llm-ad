@@ -1,0 +1,20 @@
+# Weights and run artifacts
+model_card/
+outputs/
+datasets
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / local
+.cursor/
+.vscode/
+*.swp
+
+# Vendored third-party dump (not part of this pipeline)
+docs/Anomaly-OneVision-main/

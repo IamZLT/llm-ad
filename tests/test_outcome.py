@@ -1,0 +1,383 @@
+"""Regression tests for outcome reward, geometry, masks and metric denominators."""
+import copy
+import json
+
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+
+from outcome.protocol import parse_output, score_output, render_prompt, validate_gt
+from outcome.inputs import region_proposals
+from outcome.policy import group_advantages, trim_completion
+from outcome.engine import summarize, validate_config
+from rl.grpo import padded_completion_tensors, token_logprobs
+
+
+def answer(anomaly=True, box=None):
+    return '<answer>'+json.dumps(dict(is_anomaly=anomaly,bbox_2d=box if box is not None else [100,200,300,400] if anomaly else None,description='x'))+'</answer>'
+
+
+def full(anomaly=True):
+    return ('<understand>x</understand><compare>y</compare>'
+            '<ground>candidate_bbox_2d=null</ground>'
+            '<verify>discover; z</verify>'+answer(anomaly))
+
+
+def meta(anomaly=True):
+    return dict(is_anomaly=anomaly, orig_size=[100,100],gt_box_px=[10,20,30,40] if anomaly else None,image_path='fixture')
+
+
+def test_exact_bbox_gets_full_task_reward_without_rationale():
+    p = parse_output(answer())
+    assert p['task_valid'] and not p['protocol_core']
+    s = score_output(p, meta())
+    assert s['task'] == 1. and s['protocol'] == 0. and s['total'] == 1. and s['correct']
+    assert s['iou'] == 1. and s['raw_iou'] == 1. and s['loc_reward'] == 1.
+
+
+def test_one_character_prose_has_no_min_length_gate():
+    p = parse_output(full())
+    assert p['task_valid'] and p['protocol_core'] and p['protocol_strict']
+    assert score_output(p,meta())['total'] == 1.01
+
+
+@pytest.mark.parametrize('text', [answer()+answer(), answer()+'garbage', answer().replace('</answer>',''),
+    '<answer>{"is_anomaly":true,"is_anomaly":false,"bbox_2d":null}</answer>',
+    '<answer>{"is_anomaly":1,"bbox_2d":null}</answer>',
+    '<answer>{"is_anomaly":true,"bbox_2d":[0,0,NaN,20]}</answer>',
+    '<answer>{"is_anomaly":true,"bbox_2d":[false,0,20,20]}</answer>',
+    answer(box=[-1,0,20,20]), answer(box=[0,0,1001,20]), answer(box=[20,0,20,20]),
+    '<answer>{"is_anomaly":false}</answer>'])
+def test_ambiguous_truncated_or_invalid_final_is_failure(text):
+    p = parse_output(text)
+    assert not p['task_valid']
+    assert score_output(p,meta())['task'] == -1
+
+
+def test_duplicate_prose_only_affects_protocol():
+    p = parse_output('<understand>extra</understand>'+full())
+    assert p['task_valid'] and not p['protocol_core']
+    assert score_output(p,meta())['task'] == 1
+
+
+def test_protocol_core_is_lenient_but_strict_is_exact():
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>region is candidate_bbox_2d=[100,200,300,400] here</ground>'
+            '<verify>refine; tighten</verify>'
+            + answer(box=[100,200,300,400]))
+    p = parse_output(text)
+    assert p['task_valid']
+    assert p['protocol_core']
+    assert not p['protocol_strict']
+    # strict only requires the exact machine line, nothing else
+    exact = ('<understand>x</understand><compare>y</compare>'
+             '<ground>candidate_bbox_2d=[100,200,300,400]</ground>'
+             '<verify>refine; tighten</verify>'
+             + answer(box=[100,200,300,400]))
+    assert parse_output(exact)['protocol_strict']
+
+
+def test_normal_verify_none_passes_core():
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>candidate_bbox_2d=null</ground>'
+            '<verify>none; no defect</verify>'
+            + answer(False))
+    p = parse_output(text)
+    assert p['task_valid'] and p['protocol_core']
+    assert p['verify_action'] == 'none'
+
+
+def test_normal_rejection_and_misclassification():
+    assert score_output(parse_output(full(False)),meta(False))['task'] == 0
+    assert score_output(parse_output(full(False)),meta(True))['task'] == -1
+    assert score_output(parse_output(full(True)),meta(False))['task'] == -1
+
+
+def test_low_iou_dense_reward_breaks_zero_overlap_dead_zone():
+    m = dict(is_anomaly=True,orig_size=[1000,1000],gt_box_px=[100,100,110,110])
+    exact = score_output(parse_output(answer(box=[100,100,110,110])),m)
+    near = score_output(parse_output(answer(box=[111,100,121,110])),m)
+    far = score_output(parse_output(answer(box=[500,500,510,510])),m)
+    assert exact['task'] == 1.0
+    # Zero overlap no longer collapses to an identical 0: closer is graded higher.
+    assert near['task'] > 0 and far['task'] >= 0 and near['task'] > far['task']
+    # Raw IoU is still reported separately for the final metric.
+    assert near['iou'] == 0.0 and near['raw_iou'] == 0.0
+
+
+def test_gt_missing_fails_loudly():
+    with pytest.raises(ValueError):
+        validate_gt(dict(is_anomaly=True,orig_size=[100,100],gt_box_px=None))
+
+
+def test_localization_reward_is_iou_above_threshold():
+    from outcome.protocol import localization_reward
+    # Exact box: IoU=1 >= threshold, geometry is ignored.
+    assert localization_reward([100,100,200,200], [100,100,200,200], (1000,1000))['loc_reward'] == 1.0
+    # IoU=0.64 >= threshold returns the raw IoU, not a shaped value.
+    assert localization_reward([100,100,180,180], [100,100,200,200], (1000,1000),
+                               iou_threshold=0.3, geometry_weight=0.3)['loc_reward'] == pytest.approx(0.64)
+
+
+def test_full_image_box_cannot_hack_localization_reward():
+    from outcome.protocol import localization_reward
+    r_full = localization_reward([0,0,1000,1000], [100,100,110,110], (1000,1000))['loc_reward']
+    r_near = localization_reward([100,100,110,110], [100,100,110,110], (1000,1000))['loc_reward']
+    assert r_full < 0.01
+    assert r_near > r_full
+
+
+def test_localization_reward_same_center_same_area_wrong_aspect():
+    from outcome.protocol import localization_reward
+    gt = [300, 450, 700, 550]       # 400 x 100
+    bad = [450, 300, 550, 700]      # 100 x 400, same center and area
+    r = localization_reward(bad, gt, (1000,1000))['loc_reward']
+    assert r < 0.5
+
+
+def test_localization_reward_reports_internal_components():
+    from outcome.protocol import localization_reward
+    gt = [400, 400, 600, 600]
+    r = localization_reward([400, 400, 600, 600], gt, (1000, 1000))
+    for key in ('loc_reward', 'raw_iou', 's_center', 's_w', 's_h', 's_geo'):
+        assert key in r
+    # exact overlap => all geometry terms ~1
+    assert r['raw_iou'] == pytest.approx(1.0)
+    assert r['s_center'] > 0.9 and r['s_w'] == pytest.approx(1.0) and r['s_h'] == pytest.approx(1.0)
+
+
+def test_candidate_metrics_split_h_c_and_f():
+    from outcome.engine import make_record
+    from outcome.policy import Completion
+    m = dict(is_anomaly=True, orig_size=[1000,1000], gt_box_px=[100,100,200,200],
+             image_path='a', ref_path='r', class_name='a',
+             prior_candidates=[{'bbox_2d':[100,100,200,200]}, {'bbox_2d':[500,500,510,510]}])
+    text = ('<understand>x</understand><compare>y</compare>'
+            '<ground>candidate_bbox_2d=[110,110,190,190]</ground>'
+            '<verify>refine; z</verify>'
+            + answer(box=[100,100,200,200]))
+    parsed = parse_output(text)
+    score = score_output(parsed, m)
+    rec = make_record(parsed, score, m, Completion(torch.tensor([1]), '', 'answer'), 1, 0.)
+    assert rec['iou_h_top1'] == 1.0
+    assert rec['iou_h_bestk'] == 1.0
+    assert rec['iou_c'] == pytest.approx(0.64)
+    assert rec['iou_f'] == 1.0
+    assert rec['delta_refine'] == pytest.approx(0.36)
+
+
+def test_anomaly_loc_collapse_triggers_resampling(tmp_path, monkeypatch):
+    import outcome.engine as engine
+    from outcome.policy import Completion
+    state = {'calls': 0, 'optimized': 0}
+
+    def fake_generate(model, processor, batch, cfg, group=1, sample=False):
+        state['calls'] += 1
+        texts = ['invalid', 'invalid'] if state['calls'] == 1 else [answer(True), 'invalid']
+        return [Completion(torch.tensor([4, 1]), t, 'answer') for t in texts]
+
+    def fake_optimize(*args, **kwargs):
+        state['optimized'] += 1
+        return {}
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.weight = torch.nn.Parameter(torch.ones(1))
+        def save_pretrained(self, path):
+            pass
+
+    class Processor:
+        def save_pretrained(self, path):
+            pass
+
+    class Dataset:
+        samples = [{'image': 'anomaly-a'}]
+        def __len__(self): return 1
+        def __getitem__(self, i): return i
+
+    class Empty:
+        samples = []
+        def __len__(self): return 0
+
+    m = meta(True)
+    m.update(ref_path='ref', class_name='a', image_path='anomaly-a', prior_candidates=[],
+             prompt_tokens=1, visual_tokens=0, prior_hint_tokens=0)
+    batch = {'input_ids': torch.tensor([[4]]), 'prompt_len': torch.tensor([1]), '_meta': [m]}
+    monkeypatch.setattr(engine, 'OutcomeCollator', lambda *args: lambda items: batch)
+    monkeypatch.setattr(engine, 'generate_group', fake_generate)
+    monkeypatch.setattr(engine, 'optimize_group', fake_optimize)
+    cfg = {'outcome': {'protocol_weight': .05, 'eval_before_train': False, 'final_test': False},
+           'grpo': {'max_attempts': 1, 'group_size': 2, 'learning_rate': 1e-6, 'save_steps': 0},
+           'training': {'seed': 42, 'eval_every_n_steps': 0}}
+    engine.run_train(cfg, Model(), Processor(), None, Dataset(), Empty(), Empty(), tmp_path)
+    assert state['calls'] == 2
+    assert state['optimized'] == 1
+    summary = json.loads((tmp_path / 'training_summary.json').read_text())
+    assert summary == {'attempts': 1, 'updates': 1, 'skipped': 0}
+
+
+def test_single_patch_and_thin_component_use_cell_edges():
+    h = np.zeros((4,4));h[3,3]=1
+    ps,masks,_ = region_proposals(h,{})
+    assert len(ps)==1 and ps[0]['bbox_2d']==[750,750,1000,1000]
+    assert masks.shape==(1,4,4) and bool(masks[0][3,3])
+    h[0:4,3]=1
+    ps,masks,_ = region_proposals(h,{})
+    assert ps[0]['bbox_2d']==[750,0,1000,1000]
+    assert masks.shape==(1,4,4) and bool(masks[0,:,3].all())
+
+
+def test_flat_low_h_can_be_empty_without_forced_points():
+    assert region_proposals(np.zeros((4,4)),{})[0] == []
+    assert region_proposals(np.full((4,4),.01),{'raw_threshold':.2})[0] == []
+    assert len(region_proposals(np.full((4,4),.5),{'raw_threshold':.2})[0]) == 1
+
+
+def test_max_candidates_is_cap_not_target():
+    h=np.zeros((5,5));h[0,0]=1;h[4,4]=.9
+    assert len(region_proposals(h,{'max_candidates':3})[0])==2
+    assert len(region_proposals(h,{'max_candidates':1})[0])==1
+
+
+class Tokenizer:
+    def decode(self,tokens,skip_special_tokens=True):
+        return ''.join({1:'x',2:'</ans',3:'wer>',4:'extra',9:''}[int(t)] for t in tokens)
+
+
+def test_stop_string_spanning_tokens_and_batch_padding():
+    # Prefix token 4 is prompt and must never be part of completion loss.
+    rows=[torch.tensor([4,1,2,3,9,9]),torch.tensor([4,1,1,1,9,9])]
+    trimmed=[trim_completion(row,1,Tokenizer(),[9]) for row in rows]
+    assert trimmed[0].ids.tolist()==[4,1,2,3]
+    assert trimmed[1].ids.tolist()==[4,1,1,1,9]
+    assert [c.stop_reason for c in trimmed]==['answer','eos']
+    ids,attn,labels=padded_completion_tensors([c.ids for c in trimmed],1,9,torch.device('cpu'))
+    assert labels[0].tolist()==[-100,1,2,3,-100]
+    assert labels[1].tolist()==[-100,1,1,1,9]  # keep real EOS even if pad==EOS
+    assert attn[0].tolist()==[1,1,1,1,0]
+    logits=torch.randn(2,5,10,requires_grad=True)
+    lp,mask=token_logprobs(logits,labels)
+    assert mask.sum(dim=1).tolist()==[3,4]
+    lp.sum().backward()
+    assert torch.count_nonzero(logits.grad[0,3:])==0
+
+
+def test_no_termination_at_budget_is_truncated():
+    assert trim_completion(torch.tensor([4,1,1]),1,Tokenizer(),[9]).stop_reason=='length'
+
+
+def test_centered_advantage_does_not_amplify_format_noise():
+    reward=torch.tensor([1.,1.0001])
+    assert group_advantages(reward).abs().max() < .0001
+    assert torch.equal(group_advantages(torch.ones(8)),torch.zeros(8))
+    assert group_advantages(torch.tensor([-1.,1.])).tolist()==[-1.,1.]
+
+
+def test_metrics_count_invalid_normal_separately_from_true_negative():
+    common=dict(task_valid=True,protocol_core=False,protocol_strict=False,iou=0.,class_name='a',size_bin='normal',
+                iou_h_top1=None,iou_h_bestk=None,iou_c=None,iou_f=None,delta_refine=None,h_union_cov=None,
+                candidate_bbox_2d=None,bbox_2d=None,
+                new_tokens=5,seconds=1,stop_reason='eos')
+    rows=[dict(common,is_anomaly=False,pred=None,task_valid=False),
+          dict(common,is_anomaly=False,pred=True),
+          dict(common,is_anomaly=True,pred=True,iou=.8,size_bin='small')]
+    s=summarize(rows)
+    assert s['normal_fpr']==.5 and s['normal_correct_rate']==0
+    assert s['anomaly_recall']==1 and s['balanced_accuracy']==.5
+    assert s['anomaly_gated_miou']==.8 and s['invalid_decision_rate']==1/3
+    assert s['miou_large'] is None
+
+
+def test_prompt_region_tokens():
+    cfg = dict(prompt=dict(
+        template='Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.\n'
+                 'A set of region evidence tokens follows: {region_tokens}.\n'
+                 'Return these five SHORT blocks:\n<answer>\n{"is_anomaly": false, "bbox_2d": null}\n</answer>\n'
+                 'For anomaly=false, bbox_2d MUST be null.',
+    ))
+    p = render_prompt(cfg, 'bottle', region_tokens='<|region|> <|region|>')
+    assert 'region evidence tokens' in p
+    assert '<|region|>' in p
+    assert 'bottle' in p
+    assert 'ROI' not in p and 'Image 3' not in p
+
+
+def test_all_zero_groups_are_logged_and_consume_finite_budget(tmp_path, monkeypatch):
+    import outcome.engine as engine
+    from outcome.policy import Completion
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__();self.weight=torch.nn.Parameter(torch.ones(1))
+        def save_pretrained(self,path):
+            pass
+    class Processor:
+        def save_pretrained(self,path):
+            pass
+    class Dataset:
+        samples=[{'image':'normal-a'},{'image':'normal-b'}]
+        def __len__(self): return 2
+        def __getitem__(self,i): return i
+    class Empty:
+        samples=[]
+        def __len__(self): return 0
+    m=meta(False)
+    m.update(ref_path='ref',class_name='a',image_path='normal-a',prior_candidates=[],
+             prompt_tokens=1,visual_tokens=0,prior_hint_tokens=0)
+    batch={'input_ids':torch.tensor([[4]]),'prompt_len':torch.tensor([1]),'_meta':[m]}
+    monkeypatch.setattr(engine,'OutcomeCollator',lambda *args:lambda items:batch)
+    monkeypatch.setattr(engine,'generate_group',lambda *args,**kw:[Completion(torch.tensor([4,1]),'invalid','length')]*2)
+    monkeypatch.setattr(engine,'optimize_group',lambda *args:pytest.fail('zero group must not update'))
+    cfg={'outcome':{'protocol_weight':.05,'eval_before_train':False,'final_test':False},
+         'grpo':{'max_attempts':3,'group_size':2,'learning_rate':1e-6,'save_steps':0},
+         'training':{'seed':42,'eval_every_n_steps':0}}
+    engine.run_train(cfg,Model(),Processor(),None,Dataset(),Empty(),Empty(),tmp_path)
+    summary=json.loads((tmp_path/'training_summary.json').read_text())
+    assert summary=={'attempts':3,'updates':0,'skipped':3}
+    assert len((tmp_path/'rollouts.jsonl').read_text().splitlines())==3
+
+
+def test_evaluation_none_is_full_split(tmp_path,monkeypatch):
+    import outcome.engine as engine
+    from outcome.policy import Completion
+    class Dataset:
+        def __len__(self):return 5
+        def __getitem__(self,i):return i
+    m=meta(False);m.update(ref_path='r',class_name='a')
+    batch={'input_ids':torch.tensor([[4]]),'prompt_len':torch.tensor([1]),'_meta':[m]}
+    monkeypatch.setattr(engine,'OutcomeCollator',lambda *args:lambda items:batch)
+    monkeypatch.setattr(engine,'generate_group',lambda *args,**kwargs:[Completion(torch.tensor([4,1]),answer(False),'answer')])
+    cfg={'outcome':{'protocol_weight':.05}}
+    model=torch.nn.Linear(1,1)
+    assert engine.evaluate(cfg,model,None,None,Dataset(),tmp_path/'full.json',None)['n']==5
+    assert engine.evaluate(cfg,model,None,None,Dataset(),tmp_path/'subset.json',2)['n']==2
+
+
+def test_canonical_pair_uses_one_official_forward_and_removes_hooks():
+    from types import SimpleNamespace
+    from outcome.inputs import encode_pair_canonical
+    class Scale(torch.nn.Module):
+        def __init__(self,scale):super().__init__();self.scale=scale
+        def forward(self,x):return x*self.scale
+    class Visual(torch.nn.Module):
+        dtype=torch.float32
+        def __init__(self):
+            super().__init__();self.blocks=torch.nn.ModuleList([Scale(1),Scale(2)]);self.calls=0
+        def forward(self,x,grid_thw):
+            self.calls+=1
+            for block in self.blocks:x=block(x)
+            return SimpleNamespace(pooler_output=x)
+    visual=Visual()
+    prior=SimpleNamespace(visual=visual,block_indices=[0,1],spatial_merge_size=1,
+                          temperature=.5,neighborhood_radius=0,
+                          _nn_map=lambda ft,fr,ht,hr,radius:(ft-fr).abs().sum(-1).view(ht))
+    pixels=torch.arange(16,dtype=torch.float32).reshape(4,4)
+    encoded=encode_pair_canonical(prior,pixels,torch.tensor([[1,1,2],[1,1,2]]))
+    assert visual.calls==1
+    assert torch.equal(encoded['merged_embeddings'],pixels*2)
+    assert torch.allclose(encoded['patch_map'],torch.full((1,2),64.))
+    assert all(not block._forward_hooks for block in visual.blocks)
+
+
+def test_equal_noninteger_rewards_do_not_create_roundoff_advantage():
+    assert torch.equal(group_advantages(torch.full((3,),1.05)),torch.zeros(3))

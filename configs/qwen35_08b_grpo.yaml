@@ -1,0 +1,224 @@
+# Qwen3.5-0.8B 通路测试：同一套 prior + LoRA GRPO，视觉塔只有 12 层。
+# 单卡：CUDA_VISIBLE_DEVICES=4 python train.py --config configs/qwen35_08b_grpo.yaml --num-gpu 1
+# 正式实验请改回 configs/qwen35_2b_grpo.yaml。
+
+paths:
+  dataset_root: /root/data-fs/bljiao/datasets
+  output_dir: ./outputs/train/qwen35_08b_prior
+
+runtime:
+  mode: train
+  run_name: qwen35_08b_visa2mvtec
+  auto_create_output_dir: true
+
+tensorboard:
+  auto_start: true
+  host: 0.0.0.0
+  port: 5002
+  vis_every_n_steps: 10
+  vis_num_samples: 2
+  log_heatmap: true
+  log_case: true
+  log_grpo_cot: true
+  log_mvtec_probe: false
+
+model:
+  random_init_llm: false
+  arch: Qwen3.5-0.8B
+  name: /data2/zlt/anomaly_detection_llm/model_card/Qwen3.5-0.8B
+  local_files_only: true
+  freeze_vit: true
+  torch_dtype: bfloat16
+
+# 0.8B ViT depth=12，不能再用 2B 的 12/16/20/24。
+# 按 DualBrain 相对深度 50/67/83/100% → 1-based 层 6/8/10/12（blocks 5/7/9/11）。
+prior:
+  layer_index_base: 1
+  layer_indices: [6, 8, 10, 12]
+  softmax_temperature: 0.5
+  neighborhood_radius: 0
+  hint_topk: 5
+  hint_nms_radius: 2
+  prior_box_thresh: 0.5
+  prior_box_min_area: 0.0
+  render: colormap
+  overlay_alpha: 0.45
+
+lora:
+  enabled: true
+  skip_visual: true
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_qkv
+    - in_proj_z
+    - in_proj_a
+    - in_proj_b
+    - out_proj
+
+data:
+  train_layout: visa
+  train_root: /root/data-fs/bljiao/datasets/VisA
+  eval_layout: mvtec
+  eval_root: /root/data-fs/bljiao/datasets/mvtec_anomaly_detection
+  visa_max_normal_per_class: null
+  source_dirname: VisA
+  train_anomaly_only: false
+  random_train_ref: true
+  ref_topk: 5
+  normal_anomaly_ratio: 1.0
+  holdout_ratio: 0.1
+  max_samples: null
+  max_eval_samples: null
+  max_image_size: 448
+  factor: null
+  min_pixels: null
+  max_pixels: null
+
+prompt:
+  enable_thinking: false
+  user: |
+    Image 1 is a defect-free normal reference of a {class_name}.
+    Image 2 is the inspection image.
+
+    The <prior_hint> contains high-response spatial points from the
+    normal-reference/test feature discrepancy map H.
+    These points are only spatial hints, not defect labels.
+    Use them to decide where to inspect, but verify every candidate
+    by directly comparing Image 1 and Image 2.
+
+    Determine whether Image 2 contains a true anomaly.
+
+    Write an image-specific scene reading inside <understand>.
+    Write an image-specific comparison inside <compare>.
+    Write candidate_bbox_2d first, then image-specific evidence inside <ground>.
+    Write reference-based verification inside <verify>.
+    Write the final JSON decision inside <answer>.
+
+    Required structure:
+
+    <understand>
+    ...
+    </understand>
+
+    <compare>
+    ...
+    </compare>
+
+    <ground>
+    candidate_bbox_2d=[x1,y1,x2,y2]
+    ...
+    </ground>
+
+    <verify>
+    ...
+    </verify>
+
+    <answer>
+    ...
+    </answer>
+
+    Rules:
+    - Do not copy these instructions into the blocks.
+    - Coordinates are integers in [0,1000] for Image 2.
+    - candidate_bbox_2d is a proposal, not a confirmed defect; use null if nothing looks suspicious.
+    - Anomaly answer must be exactly:
+      {"is_anomaly": true, "bbox_2d": [x1,y1,x2,y2], "description": "..."}
+    - Normal answer must be exactly:
+      {"is_anomaly": false, "bbox_2d": null, "description": "..."}
+    - For an anomaly, candidate_bbox_2d and bbox_2d are valid boxes.
+    - For a normal image, bbox_2d=null (a candidate may be rejected during <verify>).
+    - Never skip a block.
+    - Never repeat an opening tag.
+    - After </answer>, stop.
+
+training:
+  max_length: 2048
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  seed: 42
+  eval_every_n_steps: 20
+  eval_num_samples: 16
+  final_eval_num_samples: 32
+
+grpo:
+  group_size: 8
+  policy_epochs: 3
+  epochs: 2
+  max_steps: null
+  learning_rate: 5.0e-6
+  gradient_accumulation_steps: 1
+  max_new_tokens: 384
+  # 0.8B 显存很宽，8 路一次 generate / logprob；actor 4 路带梯度
+  rollout_micro_batch_size: 4
+  logprob_micro_batch_size: 4
+  actor_micro_batch_size: 2
+  temperature: 0.9
+  top_p: 0.95
+  logging_steps: 1
+  save_steps: 50
+  max_grad_norm: 1.0
+  adv_eps: 1.0e-6
+  clip_low: 0.20
+  clip_high: 0.28
+  kl_beta: 2.0e-4
+  min_reward_std: 0.02
+  max_resample_attempts: 2
+  hard_resample_attempts: 4
+  small_area_thresh: 0.02
+  format_advantage_weight: 0.20
+  reward:
+    # R_reason = reason_dir_weight * R_dir + (1-w) * delta_dense
+    reason_dir_weight: 0.70
+    # R_final = final_iou_weight*IoU(B_f) + final_dense_weight*dense(B_f) + final_edge_weight*edge
+    # (weights are normalized to sum to 1). Raw IoU is plateau-free: it forces
+    # B_f to be refined, not copied from B_c.
+    final_iou_weight: 0.40
+    final_dense_weight: 0.50
+    final_edge_weight: 0.10
+    # dense geometry sharpening: s_w/s_h = (min/max)^gamma. Kills the
+    # "right-center-wrong-scale" plateau so imprecise boxes drop below precise ones.
+    dense_scale_gamma: 2.0
+    # H anchoring: R_ground = dense(B_c) + h_anchor_weight*(1-dense)*IoU(B_c, B_prior).
+    # B_prior is the H heatmap's largest-component box. Only shapes the candidate
+    # in the zero-IoU dead zone; GT truth always dominates via (1-dense) damping.
+    h_anchor_weight: 0.15
+    edge_beta: 8.0
+    edge_min_frac: 0.05
+    keep_tol_norm1000: 8.0
+    large_box_area_thresh: 0.80
+    normal_correct: 1.0
+    wrong_decision: -1.0
+    invalid_output: -1.0
+    format_weights:
+      understand: 0.10
+      compare: 0.15
+      ground: 0.30
+      verify: 0.15
+      answer: 0.30
+
+distributed:
+  num_gpu: 1
+  deepspeed: null
+  local_rank: -1
+  ddp_find_unused_parameters: false
+
+inference:
+  model_path: null
+  image_path: null
+  prompt: null
+  max_new_tokens: 384
+  temperature: 0.0
+  top_p: 0.9
+  do_sample: false
+  save_visualization: true
+  visual_output_dir: null

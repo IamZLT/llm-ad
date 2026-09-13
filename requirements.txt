@@ -1,0 +1,12 @@
+torch>=2.1
+transformers>=5.14.0,<5.15
+peft>=0.14
+accelerate>=0.30
+pyyaml
+pillow
+numpy
+scipy>=1.10
+opencv-python>=4.8
+tensorboard
+tqdm
+flask
