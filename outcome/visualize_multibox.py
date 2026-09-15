@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from outcome.protocol import to_pixels
+from outcome.thinking import thinking_trace
 from visualization.tensorboard import (
     _font,
     hstack_labeled,
@@ -70,6 +71,7 @@ def _fmt_boxes(boxes) -> str:
 
 
 def format_outcome_case_text(step, meta, response, parsed, union_iou, loc_reward, correct) -> str:
+    think, answer = thinking_trace(response or '')
     lines = [
         f"step={step}",
         f"image={meta.get('image_path')}",
@@ -78,11 +80,16 @@ def format_outcome_case_text(step, meta, response, parsed, union_iou, loc_reward
         f"pred={parsed.get('is_anomaly')} bboxes_2d={_fmt_boxes(parsed.get('bboxes_2d'))} "
         f"candidate_bboxes_2d={_fmt_boxes(parsed.get('candidate_bboxes_2d'))}",
         f"task_valid={parsed.get('task_valid')} core={parsed.get('protocol_core')} "
-        f"strict={parsed.get('protocol_strict')} action={parsed.get('action')}",
+        f"strict={parsed.get('protocol_strict')} action={parsed.get('action')} "
+        f"think_ok={parsed.get('think_ok')} think_filled={parsed.get('think_filled')}",
         f"num_boxes={parsed.get('num_boxes')} num_components={meta.get('num_components')}",
         f"description={parsed.get('description') or ''}",
         "",
-        response or "",
+        "=== think ===",
+        think if think else "(empty)",
+        "",
+        "=== answer ===",
+        answer if answer else (response or ""),
     ]
     return "\n".join(lines)
 
@@ -171,6 +178,13 @@ def log_outcome_eval_grid(writer, *, step, cases, overlay_alpha=0.45, max_cases=
     if rows:
         writer.add_image('eval/cases_grid', pil_to_tb(vstack_labeled(rows)), step)
     writer.add_text('eval/cases_cot', '\n\n'.join(cot_parts), step)
+    for ci, c in enumerate(cases):
+        cot = format_outcome_case_text(
+            step, c['meta'], c.get('response', ''), c['parsed'],
+            float(c.get('union_iou', 0.0)), float(c.get('loc_reward', 0.0)),
+            bool(c.get('correct', False)))
+        cls = str((c.get('meta') or {}).get('class_name') or '_')
+        writer.add_text(f'eval/think/{ci:03d}_{cls}', cot, step)
     writer.flush()
 
 
@@ -203,6 +217,9 @@ def log_outcome_train_grid(writer, *, step, cases, overlay_alpha=0.45, max_cases
     if rows:
         writer.add_image('train/samples_grid', pil_to_tb(vstack_labeled(rows)), step)
     writer.add_text('train/samples_cot', '\n\n'.join(cot_parts), step)
+    for ci, c in enumerate(cases[:max_cases]):
+        cls = str((c.get('meta') or {}).get('class_name') or '_')
+        writer.add_text(f'train/think/{ci:02d}_{cls}', cot_parts[ci], step)
     writer.flush()
 
 

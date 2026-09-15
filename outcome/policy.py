@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from transformers import GenerationConfig, StoppingCriteriaList, StopStringCriteria
@@ -20,6 +20,7 @@ class Completion:
     ids: torch.Tensor
     text: str
     stop_reason: str
+    sampled_mask: list = field(default_factory=list)
 
 
 def eos_ids(model, tokenizer):
@@ -104,6 +105,44 @@ def generate_group(model, processor, batch, cfg, group=1, sample=False):
     return result
 
 
+def _stop_reason_from_run(run) -> str:
+    if run.ok:
+        return 'answer'
+    return 'error' if run.error else 'length'
+
+
+def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
+    """GRPO rollout through the FSM (staged) decoder.
+
+    Each completion carries ``sampled_mask`` so ``optimize_group`` can mask the
+    controller-injected ``[stage]`` markers out of the logprob/advantage. Returns
+    the same ``Completion`` list contract as ``generate_group``.
+    """
+    from outcome.staged_decode import run_generate_stages
+
+    gcfg = cfg['grpo']
+    max_stage = int(gcfg.get('max_stage_tokens', 96))
+    max_answer = int(gcfg.get('max_answer_tokens', 192))
+    prompt_len = int(batch['prompt_len'][0])
+    prompt_ids = batch['input_ids']
+    if prompt_ids.ndim == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+    prompt_ids = prompt_ids[0]  # [seq]
+    device = prompt_ids.device
+    result = []
+    for _ in range(group):
+        run = run_generate_stages(model, processor, batch,
+                                  max_stage_tokens=max_stage,
+                                  max_answer_tokens=max_answer,
+                                  greedy=not sample, mode='cache')
+        new_ids = torch.tensor(run.new_ids or [], device=device, dtype=torch.long)
+        full = torch.cat([prompt_ids, new_ids], dim=-1)
+        comp = Completion(full, run.text, _stop_reason_from_run(run))
+        comp.sampled_mask = list(run.sampled_mask)
+        result.append(comp)
+    return result
+
+
 def optimize_group(model, processor, batch, completions, advantages, optimizer, cfg, skip=False):
     """On-policy group with multi-epoch PPO updates (clip engages after epoch 0).
 
@@ -129,7 +168,10 @@ def optimize_group(model, processor, batch, completions, advantages, optimizer, 
     device = next(model.parameters()).device
     prompt_len = int(batch['prompt_len'][0])
     seqs = [c.ids for c in completions]
-    outputs, attn, labels = padded_completion_tensors(seqs, prompt_len, pad, device)
+    masks = [c.sampled_mask for c in completions]
+    outputs, attn, labels = padded_completion_tensors(
+        seqs, prompt_len, pad, device,
+        sampled_masks=masks if any(masks) else None)
     gen_in = model_inputs(batch)
     cache = batch['image_embeds']
     group = len(completions)

@@ -1,0 +1,71 @@
+"""FSM for staged incremental decode (no GPU)."""
+import pytest
+
+from outcome.staged_decode import (
+    OPEN,
+    STAGES,
+    inject_after,
+    next_marker,
+    next_stage,
+    stage_finished,
+)
+
+
+def test_stage_order_cannot_skip():
+    chain = ['U']
+    while chain[-1] != 'ANSWER':
+        chain.append(next_stage(chain[-1]))
+    assert chain == ['U', 'C', 'L', 'V', 'ANSWER']
+    with pytest.raises(ValueError):
+        next_stage('DONE')
+
+
+def test_next_marker_aligns_with_sft_open_tags():
+    assert next_marker('U') == '[compare]'
+    assert next_marker('C') == '[localize]'
+    assert next_marker('L') == '[confirm]'
+    assert next_marker('V') == '</think>'
+
+
+def test_controller_injects_boundary_when_model_does_not_advance():
+    missed = inject_after('U', advanced=False)
+    assert '[compare]' in missed and '[understand]' not in missed
+    assert inject_after('U', advanced=True) == '\n'
+    to_answer = inject_after('V', advanced=False)
+    assert '</think>' in to_answer and '<answer>' in to_answer
+    assert to_answer.count('</think>') == 1
+    assert inject_after('V', advanced=True) == '\n\n<answer>\n'
+
+
+def test_stage_finishes_on_next_marker():
+    assert not stage_finished('I am still comparing the reference', 'C')
+    assert stage_finished('done [localize]', 'C')
+    assert stage_finished('{"is_anomaly":false}\n</answer>', 'ANSWER')
+    for s in STAGES:
+        assert OPEN[s].startswith('[')
+
+
+def test_padded_completion_tensors_masks_injected_tokens():
+    import torch
+
+    from rl.grpo import padded_completion_tensors
+
+    prompt_len = 3
+    seqs = [torch.tensor([10, 11, 12, 20, 21, 22, 30, 31])]
+    masks = [[0, 1, 1, 0, 1]]  # token 20 and 30 are controller-injected
+    outputs, attn, labels = padded_completion_tensors(seqs, prompt_len, 0,
+                                                      torch.device('cpu'), sampled_masks=masks)
+    # positions after prompt: 20(inj),21,22,30(inj),31
+    assert labels[0].tolist() == [-100, -100, -100, -100, 21, 22, -100, 31]
+
+
+def test_padded_completion_tensors_no_mask_supervises_all():
+    import torch
+
+    from rl.grpo import padded_completion_tensors
+
+    prompt_len = 2
+    seqs = [torch.tensor([1, 2, 3, 4, 5])]
+    outputs, attn, labels = padded_completion_tensors(seqs, prompt_len, 0,
+                                                      torch.device('cpu'))
+    assert labels[0].tolist() == [-100, -100, 3, 4, 5]

@@ -139,7 +139,8 @@ def parse_output(text: str) -> dict:
 
     # Canonical exact-format: nothing outside blocks, one occurrence each, and
     # ground/verify exactly in the machine line form.
-    ground_strict = bool(re.fullmatch(r'\s*candidate_bbox_2d\s*=\s*(null|\[[^\[\]]*\])\s*', ground_text, re.I))
+    ground_strict = bool(re.fullmatch(
+        r'\s*candidate_bbox_2d\s*=\s*(null|\[[^\[\]]*\])\s*(;\s*\S.*)?\s*', ground_text, re.I | re.S))
     verify_strict = bool(re.fullmatch(r'\s*(keep|refine|reject|discover|none)\s*;\s*\S.*', verify_text, re.I))
     answer_strict = (result['task_valid'] and set(result['answer_keys']) == {'is_anomaly', 'bbox_2d', 'description'}
                      and desc_ok)

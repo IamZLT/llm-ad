@@ -39,6 +39,9 @@ def test_parse_boxes_list_states():
     state, boxes = parse_boxes_list('[[100,100,200,200],[300,300,400,400]]')
     assert state == 'list' and boxes == [[100, 100, 200, 200], [300, 300, 400, 400]]
     assert parse_boxes_list('[[100,100,200]]')[0] == 'invalid'
+    state, boxes = parse_boxes_list(
+        'candidate_bboxes_2d=[[100,100,200,200],[300,300,400,400]]; in the upper left, near the center')
+    assert state == 'list' and boxes == [[100, 100, 200, 200], [300, 300, 400, 400]]
 
 
 def test_parse_verify_action():
@@ -59,6 +62,17 @@ def test_parse_output_multibox_anomaly():
     assert p['candidate_state'] == 'list'
     assert p['verify_action'] == 'keep'
     assert p['protocol_core'] and p['protocol_strict']
+
+
+def test_parse_output_ground_location_suffix_is_strict():
+    text = _output(
+        'candidate_bboxes_2d=[[100,100,200,200],[300,300,400,400]]; in the upper left, near the center',
+        'keep; both look anomalous',
+        '{"is_anomaly":true,"bboxes_2d":[[100,100,200,200],[300,300,400,400]],"description":"two defects"}',
+    )
+    p = parse_output(text)
+    assert p['protocol_strict']
+    assert p['candidate_bboxes_2d'] == [[100, 100, 200, 200], [300, 300, 400, 400]]
 
 
 def test_parse_output_normal_can_have_nonempty_hypothesis():
@@ -190,6 +204,26 @@ def test_score_output_wrong_decision_gets_negative_one():
                    '{"is_anomaly":false,"bboxes_2d":[],"description":"normal"}')
     p = parse_output(text)
     s = score_output(p, _anomaly_meta(), protocol_weight=0.01)
+    assert s['correct'] is False and s['task'] == -1.0
+
+
+def test_score_output_false_positive_gets_heavier_penalty():
+    # Normal image declared anomalous is a false positive: it must use
+    # false_positive_penalty (heavier) while a miss keeps wrong_decision.
+    text = _output('candidate_bboxes_2d=[[100,100,200,200]]', 'keep; evidence',
+                   '{"is_anomaly":true,"bboxes_2d":[[100,100,200,200]],"description":"d"}')
+    p = parse_output(text)
+    s = score_output(p, _normal_meta(), protocol_weight=0.01,
+                     localization={'false_positive_penalty': -2.0, 'wrong_decision': -1.0})
+    assert s['correct'] is False and s['task'] == -2.0
+
+
+def test_score_output_false_positive_defaults_to_wrong_decision():
+    # Without an explicit false_positive_penalty the FP penalty equals wrong_decision.
+    text = _output('candidate_bboxes_2d=[[100,100,200,200]]', 'keep; evidence',
+                   '{"is_anomaly":true,"bboxes_2d":[[100,100,200,200]],"description":"d"}')
+    p = parse_output(text)
+    s = score_output(p, _normal_meta(), protocol_weight=0.01)
     assert s['correct'] is False and s['task'] == -1.0
 
 

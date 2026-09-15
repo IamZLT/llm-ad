@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -193,8 +193,15 @@ def padded_completion_tensors(
     prompt_len: int,
     pad_id: int,
     device: torch.device,
+    sampled_masks: Optional[List[List[int]]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad by length, not by token identity, so pad_id==eos_id does not mask real EOS."""
+    """Pad by length, not by token identity, so pad_id==eos_id does not mask real EOS.
+
+    ``sampled_masks`` (one per sequence, length == number of completion tokens)
+    marks which completion tokens the policy actually sampled (1) vs. tokens a
+    controller injected (0, e.g. the ``[stage]`` headers in staged decode).
+    Injected tokens get ``label=-100`` so they never contribute a logprob/advantage.
+    """
     max_t = max(int(s.numel()) for s in seqs)
     group = len(seqs)
     outputs = torch.full((group, max_t), int(pad_id), device=device, dtype=torch.long)
@@ -206,6 +213,11 @@ def padded_completion_tensors(
         attn[i, :n] = 1
         if n > int(prompt_len):
             labels[i, int(prompt_len) : n] = s[int(prompt_len) :].to(device)
+        if sampled_masks is not None and i < len(sampled_masks) and sampled_masks[i]:
+            for j, flag in enumerate(sampled_masks[i]):
+                pos = int(prompt_len) + j
+                if pos < n and not flag:
+                    labels[i, pos] = -100
     return outputs, attn, labels
 
 

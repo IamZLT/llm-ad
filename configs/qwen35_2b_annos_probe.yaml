@@ -1,13 +1,14 @@
-# outcome-multibox-v1 GRPO 入口: python train_outcome_multibox.py --config configs/qwen35_2b_outcome_multibox.yaml
+# ANNOS-GT probe: SFT + short RL. Do not use this yaml to eval old hybrid adapters
+# (those must merge region_sft_multibox_2b). TensorBoard 5007.
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_outcome_multibox
+  run_name: qwen35_2b_annos_probe
   auto_create_output_dir: true
 tensorboard:
-  port: 5004
+  port: 5007
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -164,7 +165,7 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_multibox_2b
+  sft_adapter: outputs/train/region_sft_annos_probe
   final_test: false
   prior:
     condition: real

@@ -26,8 +26,8 @@ from PIL import Image
 from outcome.engine_multibox import datasets, load_model, run_train, validate_config
 from outcome.evaluate_multibox import evaluate
 from outcome.inputs_multibox import OutcomeMultiboxCollator
-from outcome.policy import generate_group
-from outcome.protocol_multibox import VERSION, parse_output, to_pixels
+from outcome.policy import generate_group, generate_group_staged
+from outcome.protocol_multibox import VERSION, parse_output_cfg, to_pixels
 from rl.grpo import move_batch
 from utils.common import is_main_process, set_seed
 from utils.config import load_yaml_config
@@ -73,6 +73,7 @@ def main():
     parser.add_argument('--mode', choices=['train','eval','predict'], default='train')
     parser.add_argument('--split', choices=['dev','test'], default='dev')
     parser.add_argument('--adapter', help='Evaluation/prediction LoRA; not an optimizer resume')
+    parser.add_argument('--resume-adapter', help='Train from this RL LoRA (weights only; optimizer resets)')
     parser.add_argument('--num-gpu', type=int, default=1)
     parser.add_argument('--max-attempts', type=int)
     parser.add_argument('--eval-limit', type=int, help='Diagnostic subset; omitted means complete split')
@@ -84,7 +85,11 @@ def main():
     cfg = load_yaml_config(args.config)
     cfg.setdefault('distributed', {})['num_gpu'] = args.num_gpu
     if args.adapter and args.mode == 'train':
-        parser.error('--adapter is evaluation only; use outcome.sft_adapter for an SFT reference')
+        parser.error('--adapter is evaluation only; use --resume-adapter to continue an RL LoRA')
+    if args.resume_adapter and args.mode != 'train':
+        parser.error('--resume-adapter is training only; use --adapter for eval/predict')
+    if args.resume_adapter and args.adapter:
+        parser.error('--resume-adapter and --adapter cannot be used together')
     if args.eval_limit is not None and args.eval_limit <= 0:
         parser.error('--eval-limit must be positive')
     if args.max_attempts is not None:
@@ -109,8 +114,13 @@ def main():
         (output/'provenance.json').write_text(json.dumps(dict(protocol_version=VERSION,
             source_hashes={str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
             reference_policy='merged_sft' if cfg['outcome'].get('sft_adapter') else 'frozen_base',
-            adapter=args.adapter, mode=args.mode, split=args.split, eval_limit=args.eval_limit), indent=2))
-    model, processor, prior = load_model(cfg, args.adapter)
+            adapter=args.adapter, resume_adapter=args.resume_adapter,
+            mode=args.mode, split=args.split, eval_limit=args.eval_limit), indent=2))
+    # Eval without --adapter uses the merged SFT as the policy (no random LoRA).
+    model, processor, prior = load_model(
+        cfg, args.adapter,
+        fresh_lora=not (args.mode == 'eval' and not args.adapter) and not args.resume_adapter,
+        resume_adapter=args.resume_adapter)
     if args.mode == 'predict':
         if not args.image or not args.reference:
             parser.error('predict requires --image and --reference')
@@ -124,7 +134,7 @@ def main():
         max_boxes = int(cfg['outcome'].get('max_boxes', 16))
         batch = move_batch(OutcomeMultiboxCollator(processor, prior, cfg)([item]), next(model.parameters()).device)
         completion = generate_group(model, processor, batch, cfg)[0]
-        result = parse_output(completion.text, max_boxes=max_boxes)
+        result = parse_output_cfg(completion.text, cfg, max_boxes=max_boxes)
         result.update(bboxes_original_px=[to_pixels(b, test.size) for b in result['bboxes_2d']],
                       text=completion.text, stop_reason=completion.stop_reason, input=batch['_meta'][0])
         result['input'].pop('is_anomaly', None); result['input'].pop('gt_box_px', None)
@@ -134,7 +144,22 @@ def main():
         train_set, dev_set, test_set = datasets(cfg, processor)
         if args.mode == 'eval':
             selected = dev_set if args.split == 'dev' else test_set
-            stats = evaluate(cfg, model, processor, prior, selected, output/f'{args.split}.json', args.eval_limit, namespace=args.split)
+            writer = None
+            if main_proc:
+                from torch.utils.tensorboard import SummaryWriter
+                sft_tb = Path(str(cfg.get('outcome', {}).get('sft_adapter') or '')) / 'tb'
+                if sft_tb.is_dir():
+                    tb_dir = sft_tb / f'eval_{args.split}'
+                else:
+                    tb_dir = output / 'tb'
+                    start_tensorboard(tb_dir, cfg)
+                tb_dir.mkdir(parents=True, exist_ok=True)
+                writer = SummaryWriter(str(tb_dir))
+                print(f'[eval] tensorboard logdir={tb_dir}', flush=True)
+            stats = evaluate(cfg, model, processor, prior, selected, output/f'{args.split}.json',
+                             args.eval_limit, writer=writer, namespace=args.split)
+            if writer is not None:
+                writer.close()
             if main_proc:
                 print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:

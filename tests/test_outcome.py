@@ -223,9 +223,23 @@ def test_single_patch_and_thin_component_use_cell_edges():
     assert len(ps)==1 and ps[0]['bbox_2d']==[750,750,1000,1000]
     assert masks.shape==(1,4,4) and bool(masks[0][3,3])
     h[0:4,3]=1
-    ps,masks,_ = region_proposals(h,{})
+    ps,masks,_ = region_proposals(h,{'box_mode':'full'})
     assert ps[0]['bbox_2d']==[750,0,1000,1000]
     assert masks.shape==(1,4,4) and bool(masks[0,:,3].all())
+
+
+def test_peak_core_shrinks_blob_to_peak_neighborhood():
+    h = np.zeros((4, 4))
+    h[0:4, 0:4] = 0.4
+    h[1, 1] = 1.0
+    h[1, 2] = 0.9
+    h[2, 1] = 0.5
+    ps, masks, _ = region_proposals(h, {'box_mode': 'peak_core', 'peak_radius': 1, 'peak_keep': 0.85})
+    assert len(ps) == 1
+    # peak (1,1) plus neighbour (1,2); (2,1)=0.5 is below 0.85
+    assert bool(masks[0][1, 1]) and bool(masks[0][1, 2])
+    assert not bool(masks[0][2, 1])
+    assert ps[0]['bbox_2d'] == [250, 250, 750, 500]
 
 
 def test_flat_low_h_can_be_empty_without_forced_points():

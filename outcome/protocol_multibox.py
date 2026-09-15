@@ -12,10 +12,12 @@ import re
 
 from outcome.metrics import component_metrics, hungarian_matching, mask_iou, set_giou, union_box
 from outcome.protocol import iou, load_object, localization_reward, to_pixels, valid_box
+from outcome.thinking import parse_think_stages, split_native_think, thinking_enabled as _thinking_enabled
 
 VERSION = 'outcome-multibox-v1'
 TAGS = ('understand', 'compare', 'ground', 'verify', 'answer')
-BLOCK = re.compile(r'<(understand|compare|ground|verify|answer)>(.*?)</\1>', re.S)
+ALL_TAGS = ('think',) + TAGS
+BLOCK = re.compile(r'<(think|understand|compare|ground|verify|answer)>(.*?)</\1>', re.S)
 VERIFY = re.compile(r'^\s*(keep|refine|reject|discover|none)\b\s*[;:,\-]?\s*(.*)$', re.I)
 VERIFY_ACTIONS = ('keep', 'refine', 'reject', 'discover', 'none')
 
@@ -26,11 +28,18 @@ DEFAULT_MAX_BOXES = 16  # VisA-train findContours GT: no-merge p95=9/p99=20/max=
 def parse_boxes_list(text: str):
     """Parse ``candidate_bboxes_2d=[[x1,y1,x2,y2],...]`` (or ``[]`` / ``null``).
 
+    An optional ``; upper left, center`` location suffix (or a location prefix)
+    is ignored; only the numeric list is returned.
+
     Returns ``(state, boxes)`` where state is one of 'list','empty','null',
     'invalid' and boxes is a list of validated [x1,y1,x2,y2] floats.
     """
     text = text.strip()
-    text = re.sub(r'^\s*candidate_bboxes_2d\s*=\s*', '', text, flags=re.I)
+    assigned = re.search(r'candidate_bboxes_2d\s*=\s*(null|\[.*\])', text, flags=re.I | re.S)
+    if assigned:
+        text = assigned.group(1).strip()
+    else:
+        text = re.sub(r'^\s*candidate_bboxes_2d\s*=\s*', '', text, flags=re.I)
     if text == '':
         return 'invalid', []
     if text.lower() == 'null':
@@ -67,12 +76,26 @@ def parse_verify(text: str):
     return None, stripped
 
 
-def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES) -> dict:
-    """Parse the 5-block multi-box output. Only <answer> is strict JSON."""
+def parse_output_cfg(text: str, cfg: dict, max_boxes=None) -> dict:
+    """parse_output using outcome.max_boxes / outcome.thinking.enabled from cfg."""
+    oc = cfg.get('outcome') or {}
+    n = int(max_boxes if max_boxes is not None else oc.get('max_boxes', DEFAULT_MAX_BOXES))
+    return parse_output(text, max_boxes=n, thinking_required=_thinking_enabled(cfg))
+
+
+def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_required: bool = False) -> dict:
+    """Parse multi-box output. Only <answer> is strict JSON.
+
+    Legacy: five XML blocks understand/compare/ground/verify/answer.
+    Thinking: Qwen native CoT, then a single visible ``<answer>`` JSON.
+    Optional ``[localize]``/``[confirm]`` inside think are parsed if present.
+    """
     result = dict(task_valid=False, decision_valid=False, final_geometry_valid=False,
                   is_anomaly=None, bboxes_2d=[], candidate_bboxes_2d=[], candidate_state='missing',
                   verify_action=None, verify_evidence='', action=None, description='', tags={},
-                  answer_keys=[], protocol_core=False, protocol_strict=False, num_boxes=0)
+                  answer_keys=[], protocol_core=False, protocol_strict=False, num_boxes=0,
+                  think_ok=False, think_filled=False, think_no_early_boxes=True,
+                  think_headers=[], think_bodies={})
     blocks = list(BLOCK.finditer(text))
     result['tags'] = {m[1]: m[2].strip() for m in blocks}
     answers = list(re.finditer(r'<answer>(.*?)</answer>', text, re.S))
@@ -101,40 +124,83 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES) -> dict:
             pass
     result['num_boxes'] = len(result['bboxes_2d'])
 
-    ground_text = result['tags'].get('ground', '')
-    cstate, cboxes = parse_boxes_list(ground_text)
-    if cstate == 'list' and len(cboxes) > max_boxes:
-        cstate = 'invalid'
-        cboxes = []
+    think_body, after_think = split_native_think(text)
+    if not think_body and result['tags'].get('think'):
+        think_body = result['tags']['think']
+    think_info = parse_think_stages(think_body)
+    n_open = len(re.findall(r'<think>', text, flags=re.I))
+    n_close = len(re.findall(r'</think>', text, flags=re.I))
+    answer_after_think = bool(re.fullmatch(r'\s*<answer>.*?</answer>\s*', after_think or '', re.S | re.I))
+    native_think = n_close == 1 and n_open in (0, 1) and answer_after_think
+    result['think_ok'] = bool(native_think)
+    result['think_filled'] = bool(think_body) and not re.match(r'^[\s.。…\-–—]*$', think_body)
+    result['think_no_early_boxes'] = bool(think_info['no_early_boxes'])
+    result['think_headers'] = list(think_info['headers'])
+    result['think_bodies'] = dict(think_info['bodies'])
+
+    names = [m[1] for m in blocks]
+    has_think = bool(names) and names[0] == 'think'
+    think_closed = n_open == n_close
+    think_once = (n_open == 1 and think_closed) if has_think else (n_open == 0)
+
+    if thinking_required:
+        ground_text = think_info['bodies'].get('localize', '')
+        verify_text = think_info['bodies'].get('confirm', '')
+        ordered = native_think
+        structure = native_think and text.count('<answer>') == text.count('</answer>') == 1
+    else:
+        ground_text = result['tags'].get('ground', '')
+        verify_text = result['tags'].get('verify', '')
+        ordered = names == (['think'] + list(TAGS) if has_think else list(TAGS))
+        structure = (ordered
+                     and not BLOCK.sub('', text).strip()
+                     and all(text.count(f'<{t}>') == text.count(f'</{t}>') == 1 for t in TAGS)
+                     and think_once)
+
+    if thinking_required and not ground_text.strip():
+        cstate, cboxes = 'missing', []
+    else:
+        cstate, cboxes = parse_boxes_list(ground_text)
+        if cstate == 'list' and len(cboxes) > max_boxes:
+            cstate = 'invalid'
+            cboxes = []
     result['candidate_state'] = cstate
     result['candidate_bboxes_2d'] = cboxes
 
-    verify_text = result['tags'].get('verify', '')
     vaction, vevidence = parse_verify(verify_text)
     result['verify_action'] = vaction
     result['action'] = vaction
     result['verify_evidence'] = vevidence
 
-    ordered = [m[1] for m in blocks] == list(TAGS)
-    structure = (ordered
-                 and not BLOCK.sub('', text).strip()
-                 and all(text.count(f'<{t}>') == text.count(f'</{t}>') == 1 for t in TAGS))
     candidate_ok = cstate in ('null', 'empty', 'list')
     verify_ok = vaction is not None
-    understand_ok = bool((result['tags'].get('understand') or '').strip())
-    compare_ok = bool((result['tags'].get('compare') or '').strip())
+    if thinking_required:
+        understand_ok = bool(think_info['bodies'].get('understand', '').strip())
+        compare_ok = bool(think_info['bodies'].get('compare', '').strip())
+    else:
+        understand_ok = bool((result['tags'].get('understand') or '').strip())
+        compare_ok = bool((result['tags'].get('compare') or '').strip())
     desc_ok = bool(result['description'].strip())
 
-    result['protocol_core'] = bool(ordered and result['task_valid'] and candidate_ok and verify_ok and desc_ok)
+    if thinking_required:
+        core = bool(native_think and result['task_valid'] and desc_ok)
+    else:
+        core = bool(ordered and result['task_valid'] and candidate_ok and verify_ok and desc_ok)
+    result['protocol_core'] = core
 
-    ground_strict = bool(re.fullmatch(r'\s*candidate_bboxes_2d\s*=\s*(null|\[.*\])\s*', ground_text, re.I))
+    ground_strict = bool(re.fullmatch(
+        r'\s*candidate_bboxes_2d\s*=\s*(null|\[.*\])\s*(;\s*\S.*)?\s*', ground_text, re.I | re.S))
     verify_strict = bool(re.fullmatch(r'\s*(keep|refine|reject|discover|none)\s*;\s*\S.*', verify_text, re.I))
     answer_strict = (result['task_valid']
                      and set(result['answer_keys']) == {'is_anomaly', 'bboxes_2d', 'description'}
                      and desc_ok)
-    result['protocol_strict'] = bool(
-        structure and result['task_valid'] and candidate_ok and verify_ok
-        and ground_strict and verify_strict and answer_strict and understand_ok and compare_ok)
+    if thinking_required:
+        result['protocol_strict'] = bool(
+            structure and answer_strict and think_info['ok'] and think_info['filled'])
+    else:
+        result['protocol_strict'] = bool(
+            structure and result['task_valid'] and candidate_ok and verify_ok
+            and ground_strict and verify_strict and answer_strict and understand_ok and compare_ok)
     return result
 
 
@@ -264,6 +330,7 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     geometry_weight = float(loc.get('geometry_weight', 0.30))
     normal_correct = float(loc.get('normal_correct', 1.0))
     wrong_decision = float(loc.get('wrong_decision', -1.0))
+    false_positive_penalty = float(loc.get('false_positive_penalty', wrong_decision))
     cls_weight = float(loc.get('cls_weight', 0.0))
     iou_weight = float(loc.get('iou_weight', 0.5))
     count_weight = float(loc.get('count_weight', 0.2))
@@ -304,7 +371,11 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     loc_reward = setd['reward']
     delta_refine = loc_reward - candd['reward']
     if not correct:
-        task = wrong_decision
+        # False positive (normal image declared anomalous) gets a heavier
+        # penalty than a miss (anomaly declared normal): in industrial QC a
+        # false alarm is costlier than a missed defect.
+        is_false_positive = (not meta['is_anomaly']) and parsed['is_anomaly'] is True
+        task = false_positive_penalty if is_false_positive else wrong_decision
     elif not meta['is_anomaly']:
         focus_val = float(focus_reward(len(cand_boxes), focus_max_candidates))
         task = normal_correct + focus_weight * focus_val

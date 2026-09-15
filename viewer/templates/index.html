@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ANNOS BBox 查看器</title>
+  <style>
+    :root {
+      --bg: #0f1218;
+      --panel: #171b24;
+      --panel2: #1e2430;
+      --line: #2a3140;
+      --text: #e8edf5;
+      --muted: #8b95a8;
+      --paper: #ff8c42;
+      --gt: #3ddc84;
+      --pred: #3ad0e8;
+      --h: #f472b6;
+      --cand: #c4b5fd;
+      --accent: #5b8cff;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: var(--bg); color: var(--text); font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+    button, select, input { font: inherit; color: inherit; }
+    .app { display: grid; grid-template-rows: 52px 1fr; height: 100%; }
+    header {
+      display: flex; align-items: center; gap: 14px; padding: 0 14px;
+      border-bottom: 1px solid var(--line); background: #12161e;
+    }
+    header h1 { font-size: 15px; font-weight: 650; }
+    header .sub { color: var(--muted); font-size: 12px; }
+    .gpu { margin-left: auto; font-size: 12px; color: var(--muted); }
+    .gpu.warn { color: #fbbf24; }
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 0; }
+    aside, .main { min-height: 0; }
+    aside { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); padding: 10px; min-height: 0; overflow: hidden; }
+    .filters label.cap { margin: 4px 0 2px; }
+    .filters select, .filters input { padding: 4px 6px; }
+    .samples { flex: 1 1 0; min-height: 80px; overflow: auto; margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+    .ref-block { flex: 0 0 auto; border-top: 1px solid var(--line); padding-top: 6px; margin-top: 8px; }
+    .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+    label.cap { display: block; font-size: 10px; color: var(--muted); margin: 8px 0 4px; letter-spacing: .06em; text-transform: uppercase; }
+    select, input[type=text], input[type=search] {
+      width: 100%; background: var(--panel2); border: 1px solid var(--line);
+      border-radius: 8px; padding: 6px 8px;
+    }
+    .sample {
+      text-align: left; background: transparent; border: 1px solid transparent;
+      border-radius: 8px; padding: 6px 8px; cursor: pointer; color: var(--text);
+    }
+    .sample:hover { background: var(--panel2); }
+    .sample.active { border-color: var(--accent); background: #1a2744; }
+    .sample .name { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sample .meta { color: var(--muted); font-size: 11px; }
+    .toolbar {
+      flex: 0 0 auto;
+      display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+      padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+    }
+    .toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .toolbar select { width: auto; min-width: 180px; }
+    .btn {
+      border: 0; border-radius: 8px; padding: 7px 12px; cursor: pointer;
+      background: var(--accent); color: white; font-weight: 650;
+    }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+    .canvas-wrap {
+      position: relative; background: #0b0e13; flex: 1 1 0; min-height: 0;
+      overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 8px;
+    }
+    #view { display: block; }
+    .empty {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: var(--muted); pointer-events: none;
+    }
+    .legend { flex: 0 0 auto; display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); padding: 6px 12px; }
+    .sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+    .status { flex: 0 0 auto; padding: 4px 12px 8px; }
+    .refs { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+    .refs button {
+      flex: 0 0 auto; width: 52px; padding: 0; border: 2px solid transparent;
+      border-radius: 8px; background: #0b0e13; cursor: pointer; overflow: hidden;
+    }
+    .refs button.active { border-color: var(--accent); }
+    .refs img { width: 52px; height: 52px; object-fit: cover; display: block; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .pill.yes { background: #3a1d1d; color: #ffa8a8; }
+    .pill.no { background: #163326; color: #8ef0b5; }
+    .pill.unk { background: var(--panel2); color: var(--muted); }
+    pre {
+      background: #0b0e13; border: 1px solid var(--line); border-radius: 8px;
+      padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word;
+      max-height: 120px; overflow: auto; color: #c9d4e5; margin-top: 6px;
+    }
+    .err { color: var(--danger); font-size: 12px; }
+    .hint { color: var(--muted); font-size: 12px; }
+    .stats { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 4px 0; }
+    details.out { color: var(--muted); font-size: 12px; }
+    @media (max-width: 900px) {
+      .toolbar select { min-width: 140px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div>
+      <h1>ANNOS BBox 查看器</h1>
+      <div class="sub">论文框 · GT 掩膜框 · 本地 hybrid 模型</div>
+    </div>
+    <div class="gpu" id="gpu">正在读取 GPU…</div>
+  </header>
+  <div class="layout">
+    <aside>
+      <div class="filters">
+        <label class="cap">数据源</label>
+        <select id="source"></select>
+        <label class="cap">列表模式</label>
+        <select id="mode">
+          <option value="annos">论文标注（ANNOS）</option>
+          <option value="local">本地 datasets 全部测试图</option>
+        </select>
+        <label class="cap">类别</label>
+        <select id="cls"></select>
+        <label class="cap">缺陷类型</label>
+        <select id="defect"><option value="">全部</option></select>
+        <label class="cap">搜索</label>
+        <input id="q" type="search" placeholder="文件名 / 标签" />
+      </div>
+      <div class="samples" id="samples"></div>
+      <div class="ref-block">
+        <label class="cap">参考图</label>
+        <div class="refs" id="refs"></div>
+      </div>
+    </aside>
+    <div class="main">
+      <div class="toolbar">
+        <label class="toggle"><input type="checkbox" id="showPaper" checked /> 论文</label>
+        <label class="toggle"><input type="checkbox" id="showGt" checked /> GT</label>
+        <label class="toggle"><input type="checkbox" id="showPred" checked /> 模型</label>
+        <label class="toggle"><input type="checkbox" id="showH" /> H先验</label>
+        <label class="toggle"><input type="checkbox" id="showCand" /> 候选</label>
+        <select id="adapter"></select>
+        <button class="btn" id="run">用当前模型推理</button>
+        <button class="btn ghost" id="reloadMeta">刷新 GPU</button>
+      </div>
+      <div class="canvas-wrap" id="canvasWrap">
+        <canvas id="view"></canvas>
+        <div class="empty" id="empty">选择左侧样本</div>
+      </div>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--paper)"></i>论文框</span>
+        <span><i class="sw" style="background:transparent;border:2px solid var(--gt)"></i>GT</span>
+        <span><i class="sw" style="background:transparent;border:2px solid var(--pred)"></i>模型</span>
+        <span><i class="sw" style="background:transparent;border:2px dashed var(--h)"></i>H</span>
+        <span><i class="sw" style="background:transparent;border:2px dashed var(--cand)"></i>候选</span>
+        <span class="hint" id="sampleMeta"></span>
+        <span class="hint" style="margin-left:auto">J / K</span>
+      </div>
+      <div class="status">
+        <div id="decision"></div>
+        <div class="stats" id="stats"></div>
+        <div class="err" id="err"></div>
+        <details class="out"><summary>模型输出</summary><pre id="out">尚未推理</pre></details>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const state = { meta: null, samples: [], sample: null, pred: null, image: null, ref: null };
+
+function fileUrl(path) { return "/api/file?path=" + encodeURIComponent(path); }
+async function jget(url) {
+  const r = await fetch(url);
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  return d;
+}
+function fmtGpu(gpus) {
+  if (!gpus || !gpus.length) return "未检测到 GPU";
+  return gpus.map(g => `GPU${g.index} ${g.free_mb.toFixed(0)}MB 空闲 / ${g.total_mb.toFixed(0)}`).join("  ·  ");
+}
+async function loadMeta() {
+  const m = await jget("/api/meta");
+  state.meta = m;
+  const src = $("source");
+  const cur = src.value;
+  src.innerHTML = m.sources.map(s => `<option value="${s.id}">${s.label}${s.has_images ? "" : "（无本地图）"}</option>`).join("");
+  if (cur && [...src.options].some(o => o.value === cur)) src.value = cur;
+  const ad = $("adapter");
+  const curA = ad.value || m.default_adapter;
+  ad.innerHTML = (m.adapters || []).map(a => `<option value="${a.id}">${a.label}</option>`).join("");
+  if (curA) ad.value = curA;
+  const gpuEl = $("gpu");
+  gpuEl.textContent = fmtGpu(m.gpus);
+  const tight = (m.gpus || []).every(g => g.free_mb < 18000);
+  gpuEl.className = "gpu" + (tight ? " warn" : "");
+  if (tight) gpuEl.textContent += "  · 显存紧张，推理可能失败；浏览标注不需要 GPU";
+}
+async function loadClasses() {
+  const source = $("source").value, mode = $("mode").value;
+  const data = await jget(`/api/classes?source=${encodeURIComponent(source)}&mode=${mode}`);
+  const sel = $("cls"), prev = sel.value;
+  sel.innerHTML = (data.classes || []).map(c => `<option>${c}</option>`).join("");
+  if (prev && data.classes.includes(prev)) sel.value = prev;
+  await loadSamples();
+}
+async function loadSamples() {
+  const source = $("source").value, cls = $("cls").value;
+  if (!cls) return;
+  const data = await jget(`/api/samples?source=${encodeURIComponent(source)}&cls=${encodeURIComponent(cls)}&mode=${$("mode").value}`);
+  state.samples = data.samples || [];
+  const defSel = $("defect"), prevD = defSel.value;
+  defSel.innerHTML = `<option value="">全部</option>` + (data.defects || []).map(d => `<option>${d}</option>`).join("");
+  if (prevD && (data.defects || []).includes(prevD)) defSel.value = prevD;
+  renderSampleList();
+  const rows = filteredSamples();
+  if (rows.length && (!state.sample || !rows.some(s => s.name === state.sample.name))) {
+    await selectSample(rows[0].name);
+  }
+}
+function filteredSamples() {
+  const d = $("defect").value, q = $("q").value.trim().toLowerCase();
+  return state.samples.filter(s => {
+    if (d && s.defect !== d) return false;
+    if (!q) return true;
+    return `${s.name} ${s.defect} ${(s.labels||[]).join(" ")}`.toLowerCase().includes(q);
+  });
+}
+function renderSampleList() {
+  const rows = filteredSamples();
+  $("samples").innerHTML = rows.slice(0, 400).map(s => {
+    const paper = s.has_paper === false ? "无论文框" : `${s.n_boxes || 0} 框`;
+    return `<button class="sample" data-name="${s.name}"><span class="name">${s.name}</span><span class="meta">${s.defect} · ${paper}</span></button>`;
+  }).join("") || `<div class="hint">没有样本</div>`;
+  $("samples").querySelectorAll(".sample").forEach(btn => { btn.onclick = () => selectSample(btn.dataset.name); });
+  markActive();
+}
+function markActive() {
+  const name = state.sample && state.sample.name;
+  $("samples").querySelectorAll(".sample").forEach(b => b.classList.toggle("active", b.dataset.name === name));
+}
+async function selectSample(name) {
+  $("err").textContent = "";
+  state.pred = null;
+  $("out").textContent = "尚未推理";
+  $("decision").innerHTML = "";
+  $("stats").innerHTML = "";
+  const d = await jget(`/api/sample?source=${encodeURIComponent($("source").value)}&cls=${encodeURIComponent($("cls").value)}&name=${encodeURIComponent(name)}`);
+  state.sample = d;
+  state.ref = (d.refs && d.refs[0]) || null;
+  markActive();
+  $("sampleMeta").textContent = `${d.class_name} / ${d.name}  ·  ${d.size[0]}×${d.size[1]}  ·  ANNOS 短边448 → ${(d.canvas_size||[d.canvas,d.canvas]).map(v=>Math.round(v)).join("×")}`;
+  renderRefs();
+  await loadImage();
+}
+function renderRefs() {
+  const refs = (state.sample && state.sample.refs) || [];
+  $("refs").innerHTML = refs.map(p => `<button class="${p === state.ref ? "active" : ""}" data-path="${p}"><img src="${fileUrl(p)}" /></button>`).join("")
+    || `<span class="hint">没有参考图（该数据源可能没有本地图像）</span>`;
+  $("refs").querySelectorAll("button").forEach(b => { b.onclick = () => { state.ref = b.dataset.path; renderRefs(); }; });
+}
+function drawBox(ctx, box, color, dash, label) {
+  if (!box || box.length < 4) return;
+  const [x1,y1,x2,y2] = box;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.setLineDash(dash ? [8, 5] : []);
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  if (label) {
+    ctx.setLineDash([]);
+    ctx.font = "14px ui-sans-serif";
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = color;
+    ctx.fillRect(x1, Math.max(0, y1 - 18), tw + 8, 18);
+    ctx.fillStyle = "#111";
+    ctx.fillText(label, x1 + 4, Math.max(13, y1 - 4));
+  }
+  ctx.restore();
+}
+function paint() {
+  const canvas = $("view"), empty = $("empty"), s = state.sample;
+  if (!s) { empty.style.display = "flex"; return; }
+  empty.style.display = "none";
+  const w = s.size[0], h = s.size[1];
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#10141c";
+  ctx.fillRect(0, 0, w, h);
+  if (state.image) ctx.drawImage(state.image, 0, 0, w, h);
+  if ($("showPaper").checked) (s.paper || []).forEach((b, i) => drawBox(ctx, b.bbox_px, "#ff8c42", false, b.label || `论文${i+1}`));
+  if ($("showGt").checked) (s.gt_boxes_px || []).forEach((b, i) => drawBox(ctx, b, "#3ddc84", false, `GT${i+1}`));
+  if (state.pred) {
+    if ($("showPred").checked) (state.pred.bboxes_px || []).forEach((b, i) => drawBox(ctx, b, "#3ad0e8", false, `模型${i+1}`));
+    if ($("showH").checked) (state.pred.h_boxes || []).forEach(b => drawBox(ctx, b.bbox_px, "#f472b6", true, b.id || "H"));
+    if ($("showCand").checked) (state.pred.candidate_px || []).forEach((b, i) => drawBox(ctx, b, "#c4b5fd", true, `候选${i+1}`));
+  }
+  fitCanvas();
+}
+function fitCanvas() {
+  const wrap = $("canvasWrap"), canvas = $("view");
+  const maxW = Math.max(50, wrap.clientWidth - 16);
+  const maxH = Math.max(50, wrap.clientHeight - 16);
+  const s = Math.min(maxW / Math.max(canvas.width, 1), maxH / Math.max(canvas.height, 1));
+  canvas.style.width = Math.round(canvas.width * s) + "px";
+  canvas.style.height = Math.round(canvas.height * s) + "px";
+}
+async function loadImage() {
+  const s = state.sample;
+  state.image = null;
+  if (s && s.image) {
+    await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => { state.image = img; resolve(); };
+      img.onerror = reject;
+      img.src = fileUrl(s.image);
+    });
+  }
+  paint();
+}
+function iou(a, b) {
+  const x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]);
+  const x1 = Math.min(a[2], b[2]), y1 = Math.min(a[3], b[3]);
+  const inter = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const u = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter;
+  return u > 0 ? inter / u : 0;
+}
+function meanBestIou(pred, gt) {
+  if (!pred.length || !gt.length) return 0;
+  return pred.reduce((s, p) => s + Math.max(...gt.map(g => iou(p, g))), 0) / pred.length;
+}
+async function runPredict() {
+  $("err").textContent = "";
+  const s = state.sample;
+  if (!s) return;
+  if (!s.image || !state.ref) {
+    $("err").textContent = "没有本地图像或参考图，无法推理。请选 MVTec / VisA。";
+    return;
+  }
+  $("run").disabled = true;
+  $("run").textContent = "推理中（首次加载较慢）…";
+  try {
+    const r = await fetch("/api/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source: $("source").value, cls: $("cls").value, name: s.name, ref: state.ref, adapter: $("adapter").value }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    state.pred = d;
+    const pill = d.is_anomaly === true ? "yes" : d.is_anomaly === false ? "no" : "unk";
+    const lab = d.is_anomaly === true ? "异常" : d.is_anomaly === false ? "正常" : "未解析";
+    $("decision").innerHTML = `<span class="pill ${pill}">${lab}</span> ${d.description || ""}`;
+    const paper = (s.paper || []).map(b => b.bbox_px);
+    const gt = s.gt_boxes_px || [];
+    const pred = d.bboxes_px || [];
+    $("stats").innerHTML = `<span>论文 ${paper.length}</span><span>GT ${gt.length}</span><span>预测 ${pred.length}</span><span>H ${(d.h_boxes||[]).length}</span><span>vs论文 ${meanBestIou(pred, paper).toFixed(3)}</span><span>vsGT ${meanBestIou(pred, gt).toFixed(3)}</span>`;
+    $("out").textContent = d.text || "";
+    paint();
+  } catch (e) {
+    $("err").textContent = e.message;
+  } finally {
+    $("run").disabled = false;
+    $("run").textContent = "用当前模型推理";
+  }
+}
+function neighbor(delta) {
+  const rows = filteredSamples();
+  if (!rows.length) return;
+  let i = rows.findIndex(s => s.name === (state.sample && state.sample.name));
+  i = i < 0 ? 0 : (i + delta + rows.length) % rows.length;
+  selectSample(rows[i].name);
+}
+["showPaper","showGt","showPred","showH","showCand"].forEach(id => $(id).onchange = paint);
+$("source").onchange = loadClasses;
+$("mode").onchange = loadClasses;
+$("cls").onchange = loadSamples;
+$("defect").onchange = () => { renderSampleList(); const rows = filteredSamples(); if (rows[0]) selectSample(rows[0].name); };
+$("q").oninput = renderSampleList;
+$("run").onclick = runPredict;
+$("reloadMeta").onclick = loadMeta;
+document.addEventListener("keydown", e => {
+  if (["INPUT","SELECT","TEXTAREA"].includes(e.target.tagName)) return;
+  if (e.key === "j" || e.key === "J") neighbor(1);
+  if (e.key === "k" || e.key === "K") neighbor(-1);
+});
+(async () => { await loadMeta(); await loadClasses(); })();
+window.addEventListener("resize", () => { if (state.sample) fitCanvas(); });
+</script>
+</body>
+</html>

@@ -1,13 +1,16 @@
-# outcome-multibox-v1 GRPO 入口: python train_outcome_multibox.py --config configs/qwen35_2b_outcome_multibox.yaml
+# ANNOS-GT probe v2: new protocol (understand→compare→ground+location→verify;
+# description = location + reason). Fresh SFT, do not reuse region_sft_annos_probe.
+# Do not use this yaml to eval old hybrid adapters (those must merge region_sft_multibox_2b).
+# TensorBoard 5009 = thinking SFT; RL uses 5010.
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_outcome_multibox
+  run_name: qwen35_2b_annos_probe_v2
   auto_create_output_dir: true
 tensorboard:
-  port: 5004
+  port: 5010
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -72,33 +75,17 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: false
+  enable_thinking: true
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, grouped by H candidate: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. hK@[x,y] marks the H peak on Image 2 in [0,1000] for the first token of that group; tokens after it describe the same H region, not only the peak cell. Hints are noisy, not labels: a marked location may be a false alarm (reflection, texture, print), and real defects may be unmarked. Start from these regions when proposing boxes, expand to the full differing structure, and search beyond the marked locations too.
-    Return these five SHORT blocks, in this exact order. Reason as: understand the reference, compare differences and why, then localize with position and coordinates. Do not name a dataset defect type.
-    <understand>
-    Image 1 first: what the defect-free {class_name} looks like (material, structure, texture, print, lighting) as the normal baseline. Then Image 2 as the same object to inspect. No anomaly decision, no coordinates.
-    </understand>
-    <compare>
-    What differs vs Image 1, and why: true defect vs normal variation (reflection, texture, print). No boxes or coordinates.
-    </compare>
-    <ground>
-    candidate_bboxes_2d=[[x1,y1,x2,y2],[x1,y1,x2,y2]]; upper left, center
-    </ground>
-    <verify>
-    action; keep, refine, reject, or discover the candidates against the Image 1 baseline (no coordinates)
-    </verify>
-    <answer>
-    {"is_anomaly": false, "bboxes_2d": [], "description": "brief result; if anomalous, approximate location and why it is a defect vs normal variation"}
-    </answer>
-    Replace examples with your observations.
-    candidate_bboxes_2d is a provisional list of boxes, or [] if nothing suspicious. It is a hypothesis set. After a non-empty list, name each candidate's approximate position (upper left, center, lower right, ...); do not put extra brackets in the position text.
-    Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and short evidence.
+    bboxes_2d is a list of boxes, and each box is itself a list [x1,y1,x2,y2]. A single defect must be written as [[x1,y1,x2,y2]] (a list containing one box), never as the flat list [x1,y1,x2,y2].
+    Example (anomalous): <answer>{"is_anomaly": true, "bboxes_2d": [[120, 200, 480, 620]], "description": "a defect on the upper-left"}</answer>
+    Example (normal): <answer>{"is_anomaly": false, "bboxes_2d": [], "description": "no defect; appearance matches the reference"}</answer>
     For anomaly=true, bboxes_2d contains one box per spatially disconnected anomalous region, with no duplicates and at most {max_boxes} boxes.
     For anomaly=false, bboxes_2d MUST be [].
-    All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
-    Do not repeat blocks. Stop immediately after </answer>.
+    All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2 (x1=left, y1=top, x2=right, y2=bottom).
+    Stop immediately after </answer>.
 training:
   max_length: 4096
   gradient_checkpointing: true
@@ -116,7 +103,7 @@ grpo:
   max_attempts: null
   learning_rate: 5.0e-06
   gradient_accumulation_steps: 1
-  max_new_tokens: 512
+  max_new_tokens: 768
   # 大显存服务器：micro batch = group_size，整组一次前向/生成，不再拆小批
   rollout_micro_batch_size: 8
   logprob_micro_batch_size: 8
@@ -140,6 +127,8 @@ outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
   max_boxes: 16   # findContours GT p95=9 / p99=20 on VisA-train (see data.scan.compute_max_boxes)
+  thinking:
+    enabled: true   # native <think>; SFT supervises [understand]/[compare]/[localize]/[confirm] then JSON
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -164,7 +153,7 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_multibox_2b
+  sft_adapter: outputs/train/region_sft_annos_think   # native CoT + JSON; old 5-block XML: region_sft_annos_v2
   final_test: false
   prior:
     condition: real

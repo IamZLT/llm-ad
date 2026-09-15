@@ -19,7 +19,7 @@ from outcome.inputs_multibox import OutcomeMultiboxCollator
 from outcome.metrics import component_metrics, detection_metrics, union_iou
 from outcome.policy import generate_group
 from outcome.protocol import iou, to_pixels
-from outcome.protocol_multibox import parse_output, score_output
+from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.visualize_multibox import log_outcome_eval_grid
 from rl.grpo import move_batch
 
@@ -73,6 +73,7 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes)
     rec = dict(image_path=meta['image_path'], ref_path=meta['ref_path'], class_name=meta['class_name'],
         is_anomaly=anomaly, pred=parsed['is_anomaly'], task_valid=parsed['task_valid'],
         protocol_core=parsed['protocol_core'], protocol_strict=parsed['protocol_strict'],
+        think_ok=parsed.get('think_ok'), think_filled=parsed.get('think_filled'),
         candidate_state=parsed['candidate_state'], verify_action=parsed['verify_action'],
         reward=score['total'], loc_reward=score['loc_reward'], set_c_reward=score['set_c_reward'],
         set_f_reward=score['set_f_reward'], delta_refine=score['delta_refine'],
@@ -93,6 +94,8 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes)
         prior_candidates=candidates, prior_condition=meta.get('prior_condition'),
         image_count=meta.get('image_count'), prompt_tokens=meta.get('prompt_tokens'),
         visual_tokens=meta.get('visual_tokens'), prior_hint_tokens=meta.get('prior_hint_tokens'),
+        zoom_enabled=meta.get('zoom_enabled'), zoom_h_size=meta.get('zoom_h_size'),
+        zoom_n_crops=meta.get('zoom_n_crops'),
         stop_reason=completion.stop_reason, new_tokens=len(completion.ids)-prompt_len,
         seconds=elapsed, text=completion.text)
     if cm is not None:
@@ -117,6 +120,8 @@ def summarize(rows):
         task_valid_rate=mean(r['task_valid'] for r in rows),
         protocol_core_rate=mean(r['protocol_core'] for r in rows),
         protocol_strict_rate=mean(r['protocol_strict'] for r in rows),
+        think_ok_rate=mean(bool(r.get('think_ok')) for r in rows),
+        think_filled_rate=mean(bool(r.get('think_filled')) for r in rows),
         anomaly_recall=recall, normal_fpr=mean(r['pred'] is True for r in normal),
         normal_correct_rate=tnr,
         invalid_decision_rate=mean(r['pred'] is None for r in rows),
@@ -181,7 +186,7 @@ def summarize(rows):
         out[f'recall_at_05_{cb}'] = mean(r['recall_at_05'] for r in subset if r.get('recall_at_05') is not None)
         out[f'det_f1_at_50_{cb}'] = mean(r['det_f1_at_50'] for r in subset if r.get('det_f1_at_50') is not None)
         out[f'det_f1_at_75_{cb}'] = mean(r['det_f1_at_75'] for r in subset if r.get('det_f1_at_75') is not None)
-    for key in ('image_count','prompt_tokens','visual_tokens','prior_hint_tokens'):
+    for key in ('image_count','prompt_tokens','visual_tokens','prior_hint_tokens','zoom_n_crops'):
         out[f'mean_{key}'] = mean(r[key] for r in rows if r.get(key) is not None)
     by_class = defaultdict(list)
     for r in rows:
@@ -287,7 +292,7 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
             started = time.perf_counter()
             batch = move_batch(collator([dataset[index]]), device)
             completion = generate_group(model, processor, batch, cfg)[0]
-            parsed = parse_output(completion.text, max_boxes=max_boxes)
+            parsed = parse_output_cfg(completion.text, cfg, max_boxes=max_boxes)
             meta = batch['_meta'][0]
             reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),
                                   {**cfg['outcome'].get('localization', {}),

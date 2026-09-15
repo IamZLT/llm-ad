@@ -97,3 +97,24 @@ python train_outcome_multibox.py \
   --mode train
 
   python train_outcome_multibox.py --config configs/qwen35_4b_outcome_multibox.yaml --mode train --num-gpu 2
+
+  CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=. /root/miniconda3/envs/zlt/bin/python train_outcome_multibox.py \
+  --config configs/qwen35_2b_outcome_multibox.yaml \
+  --mode train \
+  --num-gpu 2 \
+  --resume-adapter outputs/train/qwen35_2b_outcome_multibox/train_peak_rl_a400/checkpoint-400 \
+  --output-dir outputs/train/qwen35_2b_outcome_multibox/train_peak_rl_from400
+
+
+
+  python train_region_sft.py \
+  --config configs/qwen35_2b_annos_probe_v2.yaml \
+  --output-dir outputs/train/region_sft_annos_think \
+  --epochs 2 --lr 1e-4 --num-gpu 2 --save-steps 100
+
+python train_outcome_multibox.py \
+  --config configs/qwen35_2b_annos_probe_v2.yaml \
+  --mode train \
+  --num-gpu 2 \
+  --max-attempts 4000 \
+  --output-dir outputs/train/qwen35_2b_outcome_multibox/train_annos_rl_think768_a1000

@@ -60,6 +60,8 @@ data:
   visa_max_normal_per_class: null
   min_contour_area: 5   # findContours 去噪阈值(px)，MDPI Algorithms 2026 论文默认 5
   merge_kernel_ratio: 0.01   # AD-FM(AAAI'26) 式碎片合并：膨胀核 = 短边*ratio，0=不合并；0.01≈7-10px
+  gt_source: annos
+  annos_root: /root/data-fs/bljiao/anomaly_llm/datasets/ANNOS
   source_dirname: VisA
   train_anomaly_only: false
   random_train_ref: true
@@ -73,35 +75,19 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: false
+  enable_thinking: true
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, one per candidate location: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. They are noisy hints, not labels: a marked location may be a false alarm caused by the object's own properties (reflections on glossy or transparent material, natural texture, print patterns), and real defects may be unmarked. Consider what normal {class_name} material and appearance variation looks like; trust a hint only when the reference confirms a true structural difference, and search beyond the marked locations too.
-    Return these five SHORT blocks, in this exact order:
-    <understand>
-    brief object/structure observation, including material properties and normal appearance variation
-    </understand>
-    <compare>
-    brief reference-test difference
-    </compare>
-    <ground>
-    candidate_bboxes_2d=[[x1,y1,x2,y2],[x1,y1,x2,y2]]
-    </ground>
-    <verify>
-    action; brief reference-based evidence
-    </verify>
     <answer>
-    {"is_anomaly": false, "bboxes_2d": [], "description": "brief result"}
+    {"is_anomaly": false, "bboxes_2d": [], "description": "brief result; if anomalous, approximate location and why it is a defect vs normal variation"}
     </answer>
-    Replace examples with your observations.
-    candidate_bboxes_2d is a provisional list of boxes, or [] if nothing suspicious. It is a hypothesis set.
-    Verification action is one of: keep, refine, reject, discover, none, followed by a semicolon and short evidence.
     For anomaly=true, bboxes_2d contains one box per spatially disconnected anomalous region, with no duplicates and at most {max_boxes} boxes.
     For anomaly=false, bboxes_2d MUST be [].
     All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2.
-    Do not repeat blocks. Stop immediately after </answer>.
+    Stop immediately after </answer>.
 training:
-  max_length: 3072
+  max_length: 4096
   gradient_checkpointing: true
   gradient_checkpointing_kwargs:
     use_reentrant: false
@@ -117,7 +103,7 @@ grpo:
   max_attempts: null
   learning_rate: 5.0e-06
   gradient_accumulation_steps: 1
-  max_new_tokens: 512
+  max_new_tokens: 2048
   # 大显存服务器：micro batch = group_size，整组一次前向/生成，不再拆小批
   rollout_micro_batch_size: 8
   logprob_micro_batch_size: 8
@@ -141,6 +127,8 @@ outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
   max_boxes: 16   # findContours GT p95=9 / p99=20 on VisA-train (see data.scan.compute_max_boxes)
+  thinking:
+    enabled: true   # native <think>; SFT supervises [understand]/[compare]/[localize]/[confirm] then JSON
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -185,3 +173,10 @@ outcome:
     hstat_dim: 2
     activation: gelu
     max_cells: 12
+    token_mode: grid
+  zoom:
+    enabled: false
+    h_image_size: 768
+    crop_image_size: 448
+    expand: 1.5
+    max_crops: 3

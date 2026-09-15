@@ -324,6 +324,10 @@ def load_prior_split(cfg: dict) -> tuple[List[dict], List[dict]]:
     train = _scan(train_layout, train_root)
     evals = _scan(eval_layout, eval_root)
 
+    from data.annos_gt import apply_gt_source
+    train = apply_gt_source(train, cfg, split="train")
+    evals = apply_gt_source(evals, cfg, split="eval")
+
     max_train = _optional_int(data_cfg.get("max_samples"))
     if max_train is not None:
         train = train[: max_train]

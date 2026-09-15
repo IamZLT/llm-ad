@@ -47,6 +47,7 @@ from models.vision_cache import bind_cached_image_features
 from outcome.inputs import OutcomeCollator, OutcomeDataset
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
 from outcome.protocol_multibox import candidate_hits_comp
+from outcome.thinking import thinking_enabled, staged_sft_target, staged_sft_labels
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
 from utils.config import load_yaml_config
@@ -198,6 +199,55 @@ def _plural(n: int, singular: str, plural: str) -> str:
     return singular if int(n) == 1 else plural
 
 
+def _box_where(box_1000) -> str:
+    """Coarse image-frame location from a 0-1000 box. Not a defect-type label.
+
+    Sample-specific spatial words belong in <ground> (next to the candidate
+    coordinates) and the answer description, not in <understand>/<compare>.
+    """
+    x1, y1, x2, y2 = [float(v) for v in box_1000]
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1) / 1e6
+    if area >= 0.40:
+        return 'across a large area'
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    left, right = 1000.0 / 3.0, 2000.0 / 3.0
+    if cx < left:
+        horiz = 'left'
+    elif cx > right:
+        horiz = 'right'
+    else:
+        horiz = None
+    if cy < left:
+        vert = 'upper'
+    elif cy > right:
+        vert = 'lower'
+    else:
+        vert = None
+    if vert is None and horiz is None:
+        return 'near the center'
+    if vert is None:
+        return f'on the {horiz}'
+    if horiz is None:
+        return f'in the {vert} portion'
+    return f'in the {vert} {horiz}'
+
+
+def _where_join(boxes_1000) -> str:
+    """Deduped location phrase for one or more boxes, e.g. 'in the upper left'."""
+    seen = []
+    for box in boxes_1000:
+        phrase = _box_where(box)
+        if phrase not in seen:
+            seen.append(phrase)
+    if not seen:
+        return 'somewhere on the object'
+    if len(seen) == 1:
+        return seen[0]
+    if len(seen) == 2:
+        return f'{seen[0]} and {seen[1]}'
+    return ', '.join(seen[:-1]) + f', and {seen[-1]}'
+
+
 # Candidate-hit rules for the multibox <ground>/<verify> targets, in the 0-1000
 # system. H candidates are patch-aligned boxes that usually sit *inside* a GT
 # component (matched cand-GT IoU ~0.17 on VisA train), so a hit is IoU>=bar OR
@@ -230,16 +280,24 @@ def _prior_candidate_boxes(meta: dict) -> list:
     return out
 
 
-def build_sft_target(meta: dict, multibox: bool = False) -> str:
+def _ground_multibox(cands: list) -> str:
+    """H-hint boxes plus coarse location; empty list has no location suffix."""
+    if not cands:
+        return 'candidate_bboxes_2d=[]'
+    return f'candidate_bboxes_2d={cands}; {_where_join(cands)}'
+
+
+def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False) -> str:
     """Five-block target; category/boxes come from GT, process blocks summarize the chain.
 
     The process blocks and the answer ``description`` are sample-aware templates built
-    from GT meta (class name, component count): the description restates the
-    understand -> compare -> verify conclusion in one sentence instead of a bare
-    label, so the cold-start policy learns to summarize its own reasoning. The folder
-    ``defect_type`` is deliberately NOT verbalized: it is a coarse dataset label that
-    never appears in the prompt, so teaching it would only encourage hallucinating
-    dataset-specific vocabulary on unseen classes.
+    from GT meta (class name, component count, coarse box location): the description
+    restates the understand -> compare -> verify conclusion in one sentence instead of
+    a bare label, so the cold-start policy learns to summarize its own reasoning.
+    When ``thinking=True``, stages go inside native think as
+    ``[understand]/[compare]/[localize]/[confirm]``, then ``</think>`` and
+    ``<answer>`` JSON. The chat template already opened ``<think>``; SFT
+    supervises the four stages and the JSON (no extra XML blocks).
 
     ``multibox=True`` emits the outcome-multibox-v1 answer schema (``bboxes_2d`` as a
     list of one box per disconnected GT component, empty list for normal) instead of
@@ -248,11 +306,11 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
 
     Multibox ground/verify semantics (cold-start for the coarse-to-fine loop):
 
-    * ``<ground>`` reads out the H region hints verbatim
-      (``candidate_bboxes_2d`` = ``prior_candidates`` boxes, for BOTH normal and
-      anomalous samples) — a label-agnostic "hints -> coordinates" task, so the
-      candidate stage is a high-recall proposal step rather than a copy of the
-      final answer.
+    * ``<ground>`` reads out the H region hints (``candidate_bboxes_2d`` =
+      ``prior_candidates`` boxes, for BOTH normal and anomalous samples) and
+      names each candidate's approximate image-frame location after a semicolon.
+      This is a label-agnostic "hints -> coordinates" task, so the candidate
+      stage is a high-recall proposal step rather than a copy of the final answer.
     * ``<verify>`` adjudicates the candidates against GT coverage: ``keep`` when
       they already bound the defect tightly, ``refine`` when bounds need
       tightening or spurious candidates must be dropped, ``discover`` when GT
@@ -263,13 +321,15 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
     is_anom = bool(meta['is_anomaly'])
     cls = str(meta.get('class_name') or 'object').replace('_', ' ')
     understand = (
-        f'the inspection image shows a {cls}; account for its normal material and '
-        'appearance variation (reflections, texture, print), and weigh the candidate '
-        'region evidence as fallible hints before drawing any conclusion'
+        f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
+        'material, structure, texture, print, and lighting as expected appearance. '
+        f'Image 2 shows the same {cls} under inspection and should match that '
+        'baseline aside from a true defect. Weigh later region hints as fallible; '
+        'do not decide anomaly or coordinates yet'
     )
     if multibox:
         cands = _prior_candidate_boxes(meta)
-        ground = f'candidate_bboxes_2d={cands}'
+        ground = _ground_multibox(cands)
         if is_anom:
             comps = list(meta.get('component_bboxes') or [])
             if not comps and meta.get('gt_box_px') is not None:
@@ -277,10 +337,12 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
             boxes = _boxes_to_1000(comps, meta['orig_size'])
             n = len(boxes)
             n_txt = _region_count(n)
+            where = _where_join(boxes)
             compare = (
-                f'against the defect-free reference, {n_txt} of the {cls} '
-                f'{_plural(n, "differs", "differ")} locally, indicating a real defect '
-                'rather than normal variation'
+                f'against that Image 1 baseline, {n_txt} of the {cls} '
+                f'{_plural(n, "differs", "differ")} locally in a way material or '
+                'appearance variation on the reference cannot explain, so this is a '
+                'true defect rather than normal variation'
             )
             comp_hit = [max((_box_iou_1000(c, g) for c in cands), default=0.0) for g in boxes]
             covered = [any(candidate_hits_comp(c, g, CAND_HIT_IOU) for c in cands) for g in boxes]
@@ -290,34 +352,30 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
             if not cands:
                 verify = ('discover; the region evidence is silent, but direct reference '
                           f'comparison localizes {n_txt} of defect on the {cls}')
-                confirm = 'confirmed by direct reference comparison beyond the region hints'
             elif n_missed > 0:
                 verify = (f'discover; {_region_count(n_missed)} '
                           f'{_plural(n_missed, "lies", "lie")} beyond the marked candidates, '
                           'and the rest are tightened to the defect extent')
-                confirm = 'confirmed by reference comparison beyond the marked hints'
             elif n_spurious > 0:
                 verify = (f'refine; dropped {_region_count(n_spurious)} matching the reference '
                           'and tightened the remaining candidates to the defect extent')
-                confirm = 'confirmed by the region evidence after pruning false alarms'
             elif all(v >= CAND_TIGHT_IOU for v in comp_hit):
                 verify = ('keep; the candidate bounds already match the observed difference '
                           'and are absent from the reference')
-                confirm = 'confirmed by the region evidence'
             else:
                 verify = ('refine; tightened the candidate bounds to the exact defect extent, '
                           'confirmed against the reference')
-                confirm = 'confirmed by the region evidence'
             description = (
-                f'A localized defect is present on the {cls}: {n_txt} '
-                f'{_plural(n, "differs", "differ")} from the defect-free reference and '
-                f'{_plural(n, "is", "are")} {confirm}.'
+                f'A localized defect is present on the {cls} {where}: {n_txt} '
+                f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
+                f'material or appearance variation cannot explain.'
             )
             answer = json.dumps({'is_anomaly': True, 'bboxes_2d': boxes, 'description': description})
         else:
             compare = (
-                f'against the defect-free reference, the {cls} shows no localized '
-                'difference beyond normal variation'
+                f'against that Image 1 baseline, Image 2 matches the reference {cls}; '
+                'any apparent change is material or appearance variation rather than '
+                'a true defect'
             )
             k = len(cands)
             if k:
@@ -327,10 +385,12 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
             else:
                 verify = f'none; no candidate region confirms a true defect on the {cls}'
             description = (
-                f'The {cls} inspection image is consistent with the defect-free '
-                'reference; no true defect is observed.'
+                f'The {cls} inspection image is consistent with the Image 1 baseline; '
+                'apparent changes are material or appearance variation rather than a true defect.'
             )
             answer = json.dumps({'is_anomaly': False, 'bboxes_2d': [], 'description': description})
+        if thinking:
+            return staged_sft_target(understand, compare, ground, verify, answer)
         return (
             f'<understand>\n{understand}\n</understand>\n'
             f'<compare>\n{compare}\n</compare>\n'
@@ -340,29 +400,34 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
         )
     if is_anom:
         box = _bbox_to_1000(meta['gt_box_px'], meta['orig_size'])
+        where = _box_where(box)
         compare = (
-            f'against the defect-free reference, one region of the {cls} differs locally, '
-            'indicating a real defect rather than normal variation'
+            f'against that Image 1 baseline, one region of the {cls} differs locally '
+            'in a way material or appearance variation on the reference cannot explain, '
+            'so this is a true defect rather than normal variation'
         )
         verify = 'keep; the grounded region matches the observed difference and is absent from the reference'
         description = (
-            f'A localized defect is present on the {cls}: the grounded region differs '
-            'from the defect-free reference and is confirmed by the region evidence.'
+            f'A localized defect is present on the {cls} {where}: the region differs '
+            'from the Image 1 baseline in a way material or appearance variation cannot explain.'
         )
         answer = json.dumps({'is_anomaly': True, 'bbox_2d': box, 'description': description})
-        ground = f'candidate_bbox_2d={box}'
+        ground = f'candidate_bbox_2d={box}; {where}'
     else:
         compare = (
-            f'against the defect-free reference, the {cls} shows no localized '
-            'difference beyond normal variation'
+            f'against that Image 1 baseline, Image 2 matches the reference {cls}; '
+            'any apparent change is material or appearance variation rather than '
+            'a true defect'
         )
         verify = f'none; no candidate region confirms a true defect on the {cls}'
         description = (
-            f'The {cls} inspection image is consistent with the defect-free '
-            'reference; no true defect is observed.'
+            f'The {cls} inspection image is consistent with the Image 1 baseline; '
+            'apparent changes are material or appearance variation rather than a true defect.'
         )
         answer = json.dumps({'is_anomaly': False, 'bbox_2d': None, 'description': description})
         ground = 'candidate_bbox_2d=null'
+    if thinking:
+        return staged_sft_target(understand, compare, ground, verify, answer)
     return (
         f'<understand>\n{understand}\n</understand>\n'
         f'<compare>\n{compare}\n</compare>\n'
@@ -372,13 +437,20 @@ def build_sft_target(meta: dict, multibox: bool = False) -> str:
     )
 
 
-def build_labels(prompt_ids, target_ids):
-    """Teacher-forced labels: mask the prompt, supervise the whole target.
+def build_labels(prompt_ids, target_ids, target_text=None, tokenizer=None, thinking=False):
+    """Teacher-forced labels: mask the prompt, supervise the target.
 
-    The process blocks use fixed filler text, so supervising them is free and teaches
-    the five-block scaffold that RL rollouts must start from; masking them would leave
-    the cold-start policy untrained on emitting those blocks at all.
+    For thinking SFT the ``[stage]`` headers / ``</think>`` / ``<answer>``
+    wrappers are FSM-controlled markers (``outcome.staged_decode`` injects them,
+    the model never samples them), so they are masked to keep teacher-forcing
+    aligned with the staged decoder. Non-thinking SFT supervises the whole target.
     """
+    if thinking and target_text is not None and tokenizer is not None:
+        labels = staged_sft_labels(tokenizer, target_text)
+        if len(labels) != len(target_ids):
+            # Offset-mapping mismatch (should not happen); fall back to full sup.
+            labels = list(target_ids)
+        return [-100] * len(prompt_ids) + labels
     return [-100] * len(prompt_ids) + list(target_ids)
 
 
@@ -444,15 +516,16 @@ def _stack_gen_in(singles, max_len):
     return out
 
 
-def pack_sft_batch(collator, device, samples, tokenizer, multibox):
+def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False):
     """Collate one-at-a-time (vision cache is per-pair), then pad a language batch."""
     singles, seqs, labels_list, targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         prompt_ids = batch['input_ids'][0].tolist()
-        target = build_sft_target(batch['_meta'][0], multibox=multibox)
+        target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking)
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
-        labels_list.append(build_labels(prompt_ids, target_ids))
+        labels_list.append(build_labels(prompt_ids, target_ids, target_text=target,
+                                        tokenizer=tokenizer, thinking=thinking))
         seqs.append(prompt_ids + target_ids)
         targets.append(target)
         singles.append(batch)
@@ -526,7 +599,7 @@ def batch_loss(model, packed, backward_scale=None):
     return loss
 
 
-def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch):
+def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False):
     """Mean teacher-forced loss on the holdout split (no update).
 
     Every rank evaluates an equal-length disjoint shard using the unwrapped module
@@ -551,7 +624,7 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     total = 0.0
     with torch.no_grad():
         for i in shard:
-            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox)
+            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking)
             total += float(batch_loss(raw, packed))
     count = len(shard)
     if world > 1:
@@ -630,6 +703,7 @@ def main():
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
                     find_unused_parameters=False)
     tokenizer = getattr(processor, 'tokenizer', processor)
+    thinking = thinking_enabled(cfg)
 
     train, test = load_prior_split(cfg)
     train, dev = split_holdout_by_class(train, float(cfg['data']['holdout_ratio']),
@@ -682,7 +756,7 @@ def main():
             for start in range(0, len(indices), batch_size):
                 started = time.perf_counter()
                 samples = [dataset[i] for i in indices[start:start + batch_size]]
-                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox)
+                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking)
                 loss = batch_loss(model, packed, backward_scale=1.0 / accum)
                 running_loss += float(loss.detach())
                 running_supervised += n_sup
@@ -726,7 +800,8 @@ def main():
                         dist.barrier()
             if dev_dataset is not None:
                 dev_loss, n_dev = evaluate_dev(model, collator, dev_dataset, device, tokenizer,
-                                               multibox, int(args.dev_eval_samples), seed, epoch)
+                                               multibox, int(args.dev_eval_samples), seed, epoch,
+                                               thinking=thinking)
                 writer.add_scalar('dev/loss', dev_loss, step)
                 writer.add_scalar('dev/n', n_dev, step)
                 writer.flush()

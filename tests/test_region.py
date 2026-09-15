@@ -71,11 +71,39 @@ def test_extract_region_cells_full_region_splits_into_2x2():
     ref_f = torch.zeros_like(test_f)
     hmap = torch.tensor([[0.2, 0.8], [0.9, 0.3]])
     masks = np.ones((1, Ht, Wt), dtype=bool)
-    out = extract_region_cells(masks, test_f, ref_f, hmap, {})
+    out = extract_region_cells(masks, test_f, ref_f, hmap, {'token_mode': 'grid'})
     assert out['test'].shape == (1, 4, D)
     assert out['geom'].shape == (1, 4, 5)
     assert out['hstat'].shape == (1, 4, 2)
     assert out['valid'].tolist() == [[True, True, True, True]]
+
+
+def test_extract_region_cells_peak_mode_one_token_at_argmax():
+    Ht, Wt, D = 2, 2, 3
+    test_f = torch.arange(Ht * Wt * D, dtype=torch.float32).reshape(Ht * Wt, D)
+    ref_f = torch.zeros_like(test_f)
+    hmap = torch.tensor([[0.2, 0.8], [0.9, 0.3]])
+    masks = np.ones((1, Ht, Wt), dtype=bool)
+    out = extract_region_cells(masks, test_f, ref_f, hmap, {'token_mode': 'peak'})
+    assert out['test'].shape == (1, 1, D)
+    # peak is (1,0) -> flattened index 2
+    assert torch.allclose(out['test'][0, 0], test_f[2])
+    assert out['valid'].tolist() == [[True]]
+    assert out['owner'].tolist() == [[0]]
+
+
+def test_extract_region_cells_hybrid_peak_then_grid():
+    Ht, Wt, D = 2, 2, 3
+    test_f = torch.arange(Ht * Wt * D, dtype=torch.float32).reshape(Ht * Wt, D)
+    ref_f = torch.zeros_like(test_f)
+    hmap = torch.tensor([[0.2, 0.8], [0.9, 0.3]])
+    masks = np.ones((1, Ht, Wt), dtype=bool)
+    out = extract_region_cells(masks, test_f, ref_f, hmap, {'token_mode': 'hybrid'})
+    assert out['test'].shape == (1, 5, D)
+    assert torch.allclose(out['test'][0, 0], test_f[2])
+    assert out['owner'].tolist() == [[0, 0, 0, 0, 0]]
+    grid = extract_region_cells(masks, test_f, ref_f, hmap, {'token_mode': 'grid'})
+    assert torch.allclose(out['test'][0, 1:], grid['test'][0])
 
 
 # --------------------------------------------------------------------------- #
@@ -146,6 +174,17 @@ def test_region_scatter_embedding_replaces_placeholder_positions():
 # --------------------------------------------------------------------------- #
 # SFT target construction
 # --------------------------------------------------------------------------- #
+def test_box_where_bins():
+    from train_region_sft import _box_where, _where_join
+
+    assert _box_where([50, 50, 150, 150]) == 'in the upper left'
+    assert _box_where([800, 800, 950, 950]) == 'in the lower right'
+    assert _box_where([400, 400, 600, 600]) == 'near the center'
+    assert _box_where([50, 50, 950, 950]) == 'across a large area'
+    assert _where_join([[50, 50, 150, 150], [800, 800, 950, 950]]) == (
+        'in the upper left and in the lower right')
+
+
 def test_sft_target_is_parseable_with_gt_category_and_bbox():
     from train_region_sft import build_sft_target
     from outcome.protocol import parse_output, score_output
@@ -160,7 +199,17 @@ def test_sft_target_is_parseable_with_gt_category_and_bbox():
     assert score_output(parsed, anomaly_meta)['task'] == 1.0
     # description summarizes the reasoning chain, not a bare label; the coarse folder
     # defect_type must NOT leak into the text (it is never given in the prompt)
-    assert 'bottle' in parsed['description'] and 'reference' in parsed['description']
+    assert 'bottle' in parsed['description']
+    assert 'cannot explain' in parsed['description']
+    understand = parsed['tags']['understand']
+    compare = parsed['tags']['compare']
+    assert understand.startswith('Image 1') and 'Image 2' in understand
+    assert 'coordinates' in understand
+    assert 'true defect' in compare and 'normal variation' in compare
+    assert 'on the left' not in understand and 'on the left' not in compare
+    assert 'on the left' in parsed['tags']['ground']
+    assert 'on the left' in parsed['description']
+    assert 'on the left' not in parsed['verify_evidence']
     assert 'scratch' not in target
     assert parsed['verify_action'] == 'keep'
 
@@ -172,6 +221,7 @@ def test_sft_target_is_parseable_with_gt_category_and_bbox():
     assert parsed_normal['verify_action'] == 'none'
     assert 'consistent' in parsed_normal['description']
     assert 'good' not in parsed_normal['description']
+    assert parsed_normal['tags']['understand'].startswith('Image 1')
 
 
 def test_sft_target_multibox_parseable_and_descriptive():
@@ -192,8 +242,13 @@ def test_sft_target_multibox_parseable_and_descriptive():
     assert parsed['protocol_strict']
     assert score_mb(parsed, meta)['task'] > 0.0
     assert 'metal nut' in parsed['description']
+    assert 'cannot explain' in parsed['description']
     assert 'broken' not in target and 'teeth' not in target
     assert '2 regions' in target
+    assert parsed['tags']['understand'].startswith('Image 1')
+    assert 'upper left' not in parsed['tags']['compare']
+    assert 'upper left' in parsed['description']
+    assert 'upper left' not in parsed['verify_evidence']
 
     normal = dict(is_anomaly=False, orig_size=[1000, 1000], class_name='metal_nut',
                   defect_type='good', gt_box_px=None, component_bboxes=None)
@@ -221,6 +276,7 @@ def test_sft_target_multibox_ground_reads_out_h_hints():
     assert parsed['candidate_bboxes_2d'] == [[100.0, 100.0, 200.0, 200.0], [300.0, 300.0, 500.0, 500.0]]
     assert parsed['verify_action'] == 'keep'
     assert parsed['protocol_strict']
+    assert 'upper left' in parsed['tags']['ground']
 
     # loose candidates hitting both components below the tight bar -> refine
     meta = _mb_meta([[110, 110, 150, 150], [320, 320, 400, 400]])

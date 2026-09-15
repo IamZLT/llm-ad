@@ -30,6 +30,7 @@ from models.qwen35 import setup_model_and_processor
 from models.region_injection import attach_region_adapter, ensure_region_token
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
 from train_region_sft import batch_loss, pack_sft_batch
+from outcome.thinking import thinking_enabled
 from utils.config import load_yaml_config
 
 
@@ -63,7 +64,8 @@ def eval_ckpt(model, collator, dataset, device, tokenizer, indices, batch_size):
     total, count = 0.0, 0
     for start in range(0, len(indices), batch_size):
         samples = [dataset[i] for i in indices[start:start + batch_size]]
-        packed, _ = pack_sft_batch(collator, device, samples, tokenizer, True)
+        packed, _ = pack_sft_batch(collator, device, samples, tokenizer, True,
+                                  thinking=thinking_enabled(cfg))
         n = len(samples)
         total += float(batch_loss(model, packed)) * n
         count += n

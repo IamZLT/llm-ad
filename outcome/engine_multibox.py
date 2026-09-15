@@ -28,8 +28,9 @@ from models.qwen35 import setup_model_and_processor, freeze_vision_encoder, forc
 from models.region_injection import attach_region_adapter, ensure_region_token, save_region_adapter
 from outcome.evaluate_multibox import evaluate, make_record
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.policy import generate_group, group_advantages, optimize_group
-from outcome.protocol_multibox import VERSION, parse_output, score_output
+from outcome.policy import generate_group, generate_group_staged, group_advantages, optimize_group
+from outcome.protocol_multibox import VERSION, parse_output_cfg, score_output
+from outcome.thinking import thinking_enabled as _thinking_enabled
 from outcome.visualize_multibox import log_outcome_train_grid
 from rl.grpo import avg_across_ranks, move_batch
 from utils.common import is_main_process, set_seed
@@ -38,8 +39,13 @@ from utils.common import is_main_process, set_seed
 def validate_config(cfg):
     if cfg.get('outcome', {}).get('version') != VERSION:
         raise ValueError(f'expected outcome.version={VERSION}')
-    if cfg.get('prompt', {}).get('enable_thinking', False):
-        raise ValueError('outcome-multibox-v1 uses short explicit output: enable_thinking must be false')
+    think_on = _thinking_enabled(cfg)
+    enable_thinking = bool(cfg.get('prompt', {}).get('enable_thinking', False))
+    if think_on != enable_thinking:
+        raise ValueError(
+            'outcome.thinking.enabled and prompt.enable_thinking must match '
+            '(true = Qwen native CoT; false = five-block XML)'
+        )
     if not cfg['model'].get('freeze_vit', True) or not cfg['lora'].get('enabled', False):
         raise ValueError('outcome-multibox-v1 requires frozen ViT and language LoRA')
     gc = cfg['grpo']
@@ -60,16 +66,22 @@ def validate_config(cfg):
         raise ValueError('model.name must be the base model; use outcome.sft_adapter or --adapter explicitly')
 
 
-def load_model(cfg, adapter=None):
+def load_model(cfg, adapter=None, fresh_lora=True, resume_adapter=None):
     from peft import PeftModel
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
     ensure_region_token(processor, model)
     sft = cfg.get('outcome', {}).get('sft_adapter')
     if sft:
         model = PeftModel.from_pretrained(model, sft, is_trainable=False).merge_and_unload()
+    if adapter and resume_adapter:
+        raise ValueError('adapter and resume_adapter cannot be used together')
     if adapter:
         model = PeftModel.from_pretrained(model, adapter, is_trainable=False)
-    else:
+    elif resume_adapter:
+        # Continue the existing RL LoRA. Optimizer / attempt counter still start fresh.
+        model = PeftModel.from_pretrained(model, resume_adapter, is_trainable=True)
+        print(f'[multibox] resume RL LoRA from {resume_adapter} (optimizer resets)', flush=True)
+    elif fresh_lora:
         model = apply_lora(model, cfg)
     freeze_vision_encoder(model)
     local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
@@ -182,8 +194,10 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 completions = parsed = scores = None
                 task_std = loc_std = loc_range = 0.0
                 for resamples in range(max_group_resamples + 1):
-                    completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
-                    parsed = [parse_output(c.text, max_boxes=max_boxes) for c in completions]
+                    completions = generate_group_staged(model, processor, batch, cfg, group=int(gc['group_size']), sample=True) \
+                        if bool(gc.get('staged_rollout', False)) else \
+                        generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
+                    parsed = [parse_output_cfg(c.text, cfg, max_boxes=max_boxes) for c in completions]
                     scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg, max_boxes=max_boxes) for p in parsed]
                     task_rewards = torch.tensor([s['task'] for s in scores], device=device)
                     loc_rewards = torch.tensor([s['loc_reward'] for s in scores], device=device)
@@ -220,6 +234,8 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     task_valid_rate=sum(p['task_valid'] for p in parsed)/len(parsed),
                     protocol_core_rate=sum(p['protocol_core'] for p in parsed)/len(parsed),
                     protocol_strict_rate=sum(p['protocol_strict'] for p in parsed)/len(parsed),
+                    think_ok_rate=sum(bool(p.get('think_ok')) for p in parsed)/len(parsed),
+                    think_filled_rate=sum(bool(p.get('think_filled')) for p in parsed)/len(parsed),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
                                prior_hint_tokens=meta['prior_hint_tokens'],
@@ -284,7 +300,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                           f'maskiou={_f(mean_maskiou)} delta={_f(mean_delta)} ccov={_f(mean_cand_cov)} iou_h={_f(mean_iou_h)} '
                           f'rs={resamples} tv={metrics["task_valid_rate"]:.2f} '
                           f'pc={metrics["protocol_core_rate"]:.2f} ps={metrics["protocol_strict_rate"]:.2f} '
-                          f'tok={metrics["mean_new_tokens"]:.0f} '
+                          f'tk={metrics["think_ok_rate"]:.2f} tok={metrics["mean_new_tokens"]:.0f} '
                           f'{loss_part} '
                           f'({time.perf_counter()-started:.1f}s)', flush=True)
                 every = int(cfg['training'].get('eval_every_n_steps', 0))
