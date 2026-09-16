@@ -308,12 +308,16 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
                 input_ids = torch.full((group, max_len), pad_id, device=device, dtype=torch.long)
                 attn = torch.zeros((group, max_len), device=device, dtype=torch.long)
                 mm_batch = torch.zeros((group, max_len), dtype=mm_prompt.dtype, device=device)
+                mlen = int(mm_prompt.shape[-1])
                 for i, p in enumerate(prefixes):
                     n = int(p.shape[-1])
-                    input_ids[i, :n] = p
-                    attn[i, :n] = 1
-                    mlen = int(mm_prompt.shape[-1])
-                    mm_batch[i, :min(n, mlen)] = mm_prompt[:min(n, mlen)]
+                    off = max_len - n
+                    input_ids[i, off:] = p
+                    attn[i, off:] = 1
+                    # mm_token_type_ids: prompt multimodal types right-aligned, generated
+                    # tail is text (0). Left padding keeps image tokens' relative
+                    # positions intact so M-RoPE computes correct positions.
+                    mm_batch[i, off:off + mlen] = mm_prompt
 
                 generation = GenerationConfig(
                     max_new_tokens=budget, do_sample=not greedy, temperature=1.0,
@@ -326,7 +330,13 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
                 kwargs['input_ids'] = input_ids
                 kwargs['attention_mask'] = attn
                 kwargs['mm_token_type_ids'] = mm_batch
-                kwargs['pixel_values'] = None
+                # Re-prefill re-embeds the FULL sequence (image tokens included)
+                # every stage, so pixel_values + image_grid_thw must be present on
+                # EVERY stage. The _vision_ctx bind swaps get_image_features for a
+                # frozen cache keyed off image_grid_thw, so this stays cheap; dropping
+                # pixel_values here is what previously made stages 2+ see garbage
+                # image embeddings (the batched rollout degraded FPR -> 1.0).
+                kwargs['pixel_values'] = gen_in_group.get('pixel_values')
 
                 out = core.generate(
                     generation_config=generation, stopping_criteria=stops, **kwargs)

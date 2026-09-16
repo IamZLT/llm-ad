@@ -17,7 +17,7 @@ import torch
 
 from outcome.inputs_multibox import OutcomeMultiboxCollator
 from outcome.metrics import component_metrics, detection_metrics, union_iou
-from outcome.policy import generate_group
+from outcome.policy import generate_group, generate_group_staged
 from outcome.protocol import iou, to_pixels
 from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.visualize_multibox import log_outcome_eval_grid
@@ -287,11 +287,14 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
     max_boxes = int(cfg['outcome'].get('max_boxes', 16))
     indices = stratified_eval_indices(dataset, count, seed=int(cfg['training']['seed']))
     t_start = time.perf_counter()
+    staged = bool((cfg.get('grpo') or {}).get('staged_rollout', False))
     with output_path.with_suffix('.jsonl').open('w') as stream:
         for pos, index in enumerate(indices):
             started = time.perf_counter()
             batch = move_batch(collator([dataset[index]]), device)
-            completion = generate_group(model, processor, batch, cfg)[0]
+            completion = (generate_group_staged(model, processor, batch, cfg, group=1, sample=False)[0]
+                          if staged else
+                          generate_group(model, processor, batch, cfg)[0])
             parsed = parse_output_cfg(completion.text, cfg, max_boxes=max_boxes)
             meta = batch['_meta'][0]
             reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),

@@ -92,7 +92,7 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 100
+  eval_every_n_steps: 20
   eval_split: test
   eval_num_samples: 200
   final_eval_num_samples: null

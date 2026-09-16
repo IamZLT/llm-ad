@@ -16,5 +16,5 @@ __pycache__/
 .vscode/
 *.swp
 
-# Vendored third-party dump (not part of this pipeline)
-docs/Anomaly-OneVision-main/
+# Local docs & reference dumps (not tracked in git)
+docs/

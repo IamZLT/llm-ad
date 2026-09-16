@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from models.qwen35 import unwrap_model
 from models.region_injection import REGION_INPUT_KEYS
-from reasoning.segments import completion_segment_ids, mix_segment_advantage
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -219,44 +218,6 @@ def padded_completion_tensors(
                 if pos < n and not flag:
                     labels[i, pos] = -100
     return outputs, attn, labels
-
-
-def build_segment_advantages(
-    tokenizer,
-    seqs: List[torch.Tensor],
-    prompt_len: int,
-    max_t: int,
-    a_ground: torch.Tensor,
-    a_reason: torch.Tensor,
-    a_final: torch.Tensor,
-    a_fmt: torch.Tensor,
-    is_anomaly: bool,
-    device: torch.device,
-    fmt_mix: float = 0.20,
-) -> torch.Tensor:
-    adv = torch.zeros(len(seqs), max(max_t - 1, 1), device=device, dtype=torch.float32)
-    for i, s in enumerate(seqs):
-        comp = s[prompt_len:]
-        segs = completion_segment_ids(tokenizer, comp)
-        ag, ar, af, afmt = (
-            float(a_ground[i]),
-            float(a_reason[i]),
-            float(a_final[i]),
-            float(a_fmt[i]),
-        )
-        for k, seg in enumerate(segs):
-            j = prompt_len - 1 + k
-            if 0 <= j < adv.shape[1]:
-                adv[i, j] = mix_segment_advantage(
-                    seg,
-                    ag,
-                    ar,
-                    af,
-                    afmt,
-                    is_anomaly,
-                    fmt_mix=fmt_mix,
-                )
-    return adv
 
 
 def grpo_param_map(gcfg: dict, *, lr: float, accum: int, group: int, temperature: float, top_p: float, max_new: int) -> Dict[str, float]:
