@@ -14,7 +14,7 @@ import torch
 from models.qwen35 import unwrap_model
 from models.region_injection import bind_region_injection, has_region, region_raw_from_batch
 from models.vision_cache import bind_cached_image_features
-from rl.grpo import model_inputs
+from rl.grpo import expand_gen_in_for_group, model_inputs
 
 STAGES = ('U', 'C', 'L', 'V')
 # Bracket-style markers are used because they are familiar to the model from
@@ -235,6 +235,133 @@ def run_cached(model, processor, batch, **kw) -> StagedRun:
 
 def run_naive(model, processor, batch, **kw) -> StagedRun:
     return run_generate_stages(model, processor, batch, mode='naive', **kw)
+
+
+def _trim_new_at_stop(tokenizer, new_ids: torch.Tensor, stop: str, device) -> torch.Tensor:
+    """Keep tokens up to and including the first occurrence of ``stop``.
+
+    Batch ``generate`` runs until *every* sequence hits the stop string, so
+    trajectories that finish early carry garbage tokens after their stop; trim
+    them so each trajectory keeps only its own stage content (matching the
+    single-trajectory ``StopStringCriteria`` semantics).
+    """
+    ids = new_ids.tolist()
+    kept = []
+    for t in ids:
+        kept.append(t)
+        if stop in tokenizer.decode(kept, skip_special_tokens=False):
+            break
+    return torch.tensor(kept, dtype=torch.long, device=device)
+
+
+@torch.no_grad()
+def run_generate_stages_batch(model, processor, batch, *, group=1,
+                              max_stage_tokens=96, max_answer_tokens=192,
+                              greedy=False) -> list:
+    """Batched FSM rollout: all ``group`` trajectories advance stage-by-stage.
+
+    ``group`` trajectories share one prompt/image, so each stage packs them into
+    a single ``batch=group`` forward. Per-stage re-prefill is used instead of
+    cross-stage KV-cache continuation: the benchmark showed re-prefill is ~10%
+    *faster* than cache continuation (vision is already cached), and it avoids
+    the variable-length-cache stacking problem entirely. Returns one ``StagedRun``
+    per trajectory, each carrying ``sampled_mask`` / ``new_ids`` for RL.
+    """
+    from transformers import GenerationConfig, StoppingCriteriaList, StopStringCriteria
+
+    tokenizer = getattr(processor, 'tokenizer', processor)
+    device = batch['input_ids'].device
+    gen_in = dict(model_inputs(batch))
+    prompt_ids = batch['input_ids']
+    if prompt_ids.ndim == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+    prompt_len = int(prompt_ids.shape[-1])
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    ends = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else None
+
+    mm_prompt = gen_in.pop('mm_token_type_ids', None)
+    if mm_prompt is None:
+        mm_prompt = torch.zeros_like(prompt_ids)
+    if mm_prompt.ndim == 1:
+        mm_prompt = mm_prompt.unsqueeze(0)
+    mm_prompt = mm_prompt[0]  # [L_prompt]
+
+    # Prompt-side multimodal metadata to group (image_grid_thw -> [group, 3]) so
+    # the cached vision features expand to cover every trajectory.
+    gen_in_group = expand_gen_in_for_group(gen_in, group)
+
+    open_u = encode_ids(tokenizer, OPEN['U'], device)[0]  # [n_open]
+    prefixes = [torch.cat([prompt_ids[0], open_u], dim=-1) for _ in range(group)]
+    masks = [[0] * int(open_u.shape[-1]) for _ in range(group)]
+    traces_per = [[] for _ in range(group)]
+
+    core = unwrap_model(model)
+    was_training = core.training
+    core.eval()
+    try:
+        with _vision_ctx(model, batch):
+            for stage in STAGES + ('ANSWER',):
+                stop = ANSWER_STOP if stage == 'ANSWER' else next_marker(stage)
+                budget = max_answer_tokens if stage == 'ANSWER' else max_stage_tokens
+
+                max_len = max(int(p.shape[-1]) for p in prefixes)
+                input_ids = torch.full((group, max_len), pad_id, device=device, dtype=torch.long)
+                attn = torch.zeros((group, max_len), device=device, dtype=torch.long)
+                mm_batch = torch.zeros((group, max_len), dtype=mm_prompt.dtype, device=device)
+                for i, p in enumerate(prefixes):
+                    n = int(p.shape[-1])
+                    input_ids[i, :n] = p
+                    attn[i, :n] = 1
+                    mlen = int(mm_prompt.shape[-1])
+                    mm_batch[i, :min(n, mlen)] = mm_prompt[:min(n, mlen)]
+
+                generation = GenerationConfig(
+                    max_new_tokens=budget, do_sample=not greedy, temperature=1.0,
+                    top_p=1.0, top_k=0, eos_token_id=ends, pad_token_id=pad_id,
+                    use_cache=True, num_beams=1)
+                stops = StoppingCriteriaList(
+                    [StopStringCriteria(tokenizer=tokenizer, stop_strings=[stop])])
+
+                kwargs = dict(gen_in_group)
+                kwargs['input_ids'] = input_ids
+                kwargs['attention_mask'] = attn
+                kwargs['mm_token_type_ids'] = mm_batch
+                kwargs['pixel_values'] = None
+
+                out = core.generate(
+                    generation_config=generation, stopping_criteria=stops, **kwargs)
+                seqs = out.sequences if hasattr(out, 'sequences') else out
+                new_all = seqs[:, max_len:]
+
+                for i in range(group):
+                    kept = _trim_new_at_stop(tokenizer, new_all[i], stop, device)
+                    n_kept = int(kept.shape[-1])
+                    body = tokenizer.decode(kept.tolist(), skip_special_tokens=False)
+                    advanced = stage_finished(body, stage)
+                    masks[i].extend([1] * n_kept)
+                    prefixes[i] = torch.cat([prefixes[i], kept], dim=-1)
+                    forced = 0
+                    if stage != 'ANSWER':
+                        extra = inject_after(stage, advanced=advanced)
+                        inj = encode_ids(tokenizer, extra, device)[0]
+                        forced = int(inj.shape[-1])
+                        masks[i].extend([0] * forced)
+                        prefixes[i] = torch.cat([prefixes[i], inj], dim=-1)
+                    traces_per[i].append(StageTrace(stage, n_kept, forced, advanced, body, 0.0))
+    finally:
+        core.train(was_training)
+
+    runs = []
+    for i in range(group):
+        new_ids = prefixes[i][prompt_len:].tolist()
+        names = [t.name for t in traces_per[i]]
+        ok = names[-1] == 'ANSWER' and all(s in names for s in STAGES)
+        runs.append(StagedRun(
+            ok, 'cache', prompt_len, len(new_ids), 0.0, traces_per[i],
+            tokenizer.decode(new_ids, skip_special_tokens=False),
+            notes={'kv_cache': False, 'stages': names}, sampled_mask=masks[i],
+            new_ids=new_ids))
+    return runs
 
 
 @torch.no_grad()

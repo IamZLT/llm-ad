@@ -112,13 +112,13 @@ def _stop_reason_from_run(run) -> str:
 
 
 def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
-    """GRPO rollout through the FSM (staged) decoder.
+    """GRPO rollout through the FSM (staged) decoder, batched per stage.
 
     Each completion carries ``sampled_mask`` so ``optimize_group`` can mask the
     controller-injected ``[stage]`` markers out of the logprob/advantage. Returns
     the same ``Completion`` list contract as ``generate_group``.
     """
-    from outcome.staged_decode import run_generate_stages
+    from outcome.staged_decode import run_generate_stages_batch
 
     gcfg = cfg['grpo']
     max_stage = int(gcfg.get('max_stage_tokens', 96))
@@ -129,12 +129,12 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
         prompt_ids = prompt_ids.unsqueeze(0)
     prompt_ids = prompt_ids[0]  # [seq]
     device = prompt_ids.device
+    runs = run_generate_stages_batch(model, processor, batch, group=group,
+                                     max_stage_tokens=max_stage,
+                                     max_answer_tokens=max_answer,
+                                     greedy=not sample)
     result = []
-    for _ in range(group):
-        run = run_generate_stages(model, processor, batch,
-                                  max_stage_tokens=max_stage,
-                                  max_answer_tokens=max_answer,
-                                  greedy=not sample, mode='cache')
+    for run in runs:
         new_ids = torch.tensor(run.new_ids or [], device=device, dtype=torch.long)
         full = torch.cat([prompt_ids, new_ids], dim=-1)
         comp = Completion(full, run.text, _stop_reason_from_run(run))
