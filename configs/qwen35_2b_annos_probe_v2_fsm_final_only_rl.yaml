@@ -7,10 +7,10 @@ paths:
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2
+  run_name: qwen35_2b_annos_probe_v2_fsm_final_only
   auto_create_output_dir: true
 tensorboard:
-  port: 5010
+  port: 5014
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -150,11 +150,11 @@ outcome:
     iou_weight: 0.5        # AD-Copilot BBox-Mask IoU (primary localization term)
     count_weight: 0.2      # explicit box-count reward (|m-n|=0 -> 1, 1 -> 0.5, >=2 -> -0.1)
     dense_weight: 0.3      # DCLR dense term (early non-zero gradient)
-    focus_weight: 0.2      # normal-sample focus reward (localize-then-reject)
+    focus_weight: 0.0      # normal-sample focus reward (localize-then-reject)
     focus_max_candidates: 3   # focus band: 1..3 candidates -> +0.5, >3 -> -0.1
-    refine_weight: 0.1     # two-sided clipped refine term (improving candidate earns capped bonus)
+    refine_weight: 0.0     # two-sided clipped refine term (improving candidate earns capped bonus)
     refine_clip: 0.2       # clip on delta_refine -> max +-refine_weight*clip = +-0.02
-    cand_weight: 0.2       # candidate-stage GT coverage recall @IoU>=cand_iou_threshold (no count penalty)
+    cand_weight: 0.0       # candidate-stage GT coverage recall @IoU>=cand_iou_threshold (no count penalty)
     cand_iou_threshold: 0.1
     cand_max_area_frac: 0.1   # anti giant-box hack: bigger candidates don't count for coverage/focus
   resampling:

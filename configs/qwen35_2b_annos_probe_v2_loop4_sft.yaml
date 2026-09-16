@@ -1,20 +1,21 @@
-# ANNOS-GT probe v2: new protocol (understand→compare→ground+location→verify;
-# description = location + reason). Fresh SFT, do not reuse region_sft_annos_probe.
-# Do not use this yaml to eval old hybrid adapters (those must merge region_sft_multibox_2b).
-# TensorBoard 5009 = thinking SFT; RL uses 5010.
+# Internal-Loop (latent-space recurrent-depth) SFT.
+# Loop-4 = F_theta applied 4x inside the language stack, no external FSM stages.
+# Only the <answer> JSON is supervised (answer_only); U/C/L/V are NOT trained.
+# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_sft.yaml \
+#        --output-dir outputs/train/region_sft_loop4 --epochs 1 --num-gpu 1
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2
+  run_name: qwen35_2b_annos_probe_v2_loop4
   auto_create_output_dir: true
 tensorboard:
-  port: 5010
+  port: 5011
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
-  vis_num_samples: 5   # 每 vis_every_n_steps 从缓冲随机抽 N 个训练样本可视化
+  vis_num_samples: 5
 model:
   random_init_llm: false
   arch: Qwen3.5-2B
@@ -58,9 +59,9 @@ data:
   eval_layout: mvtec
   eval_root: /root/data-fs/bljiao/datasets/mvtec_anomaly_detection
   visa_max_normal_per_class: null
-  min_contour_area: 5   # findContours 去噪阈值(px)，MDPI Algorithms 2026 论文默认 5
-  merge_kernel_ratio: 0.01   # AD-FM(AAAI'26) 式碎片合并：膨胀核 = 短边*ratio，0=不合并；0.01≈7-10px
-  gt_source: annos   # mask=官方像素mask轮廓框；annos=MMR-AD 人标框（缺省回退 mask）
+  min_contour_area: 5
+  merge_kernel_ratio: 0.01
+  gt_source: annos
   annos_root: /root/data-fs/bljiao/anomaly_llm/datasets/ANNOS
   source_dirname: VisA
   train_anomaly_only: false
@@ -75,7 +76,7 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: true
+  enable_thinking: false   # loop/direct: no native <think>; answer-only supervision
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, grouped by H candidate: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. hK@[x,y] marks the H peak on Image 2 in [0,1000] for the first token of that group; tokens after it describe the same H region, not only the peak cell. Hints are noisy, not labels: a marked location may be a false alarm (reflection, texture, print), and real defects may be unmarked. Start from these regions when proposing boxes, expand to the full differing structure, and search beyond the marked locations too.
@@ -92,7 +93,7 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 20
+  eval_every_n_steps: 100
   eval_split: test
   eval_num_samples: 200
   final_eval_num_samples: null
@@ -100,17 +101,10 @@ grpo:
   group_size: 8
   policy_epochs: 3
   epochs: 2
-  max_attempts: 800
+  max_attempts: null
   learning_rate: 5.0e-06
   gradient_accumulation_steps: 1
-  max_new_tokens: 768
-  # FSM staged decode rollout (KV-cached U→C→L→V→answer). Controller-injected
-  # [stage] markers are masked out of logprob/advantage.
-  staged_rollout: true
-  max_stage_tokens: 96
-  max_localize_tokens: 256
-  max_answer_tokens: 192
-  # 大显存服务器：micro batch = group_size，整组一次前向/生成，不再拆小批
+  max_new_tokens: 512
   rollout_micro_batch_size: 8
   logprob_micro_batch_size: 8
   actor_micro_batch_size: 8
@@ -132,35 +126,35 @@ distributed:
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
-  max_boxes: 16   # findContours GT p95=9 / p99=20 on VisA-train (see data.scan.compute_max_boxes)
+  max_boxes: 16
+  reasoning_mode: loop   # direct | loop | fsm
   thinking:
-    enabled: true   # native <think>; SFT supervises [understand]/[compare]/[localize]/[confirm] then JSON
+    enabled: false
+  loop:
+    enabled: true
+    steps: 4
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
   reward:
-    # Fine-grained reward (AD-FM style):
-    #   wrong_decision | normal_correct + focus_weight*focus | cls_weight + iou_weight*mask_iou
-    #   + count_weight*count + dense_weight*loc + cand_weight*cand_coverage
-    #   + refine_weight*clip(delta_refine, +-refine_clip)
-    normal_correct: 1.0    # positive attractor for correct rejections
+    normal_correct: 1.0
     wrong_decision: -1.0
-    false_positive_penalty: -2.0   # normal image declared anomalous is penalized twice as hard as a miss
-    cls_weight: 0.0        # extra base reward for correct anomaly decision
-    iou_weight: 0.5        # AD-Copilot BBox-Mask IoU (primary localization term)
-    count_weight: 0.2      # explicit box-count reward (|m-n|=0 -> 1, 1 -> 0.5, >=2 -> -0.1)
-    dense_weight: 0.3      # DCLR dense term (early non-zero gradient)
-    focus_weight: 0.2      # normal-sample focus reward (localize-then-reject)
-    focus_max_candidates: 3   # focus band: 1..3 candidates -> +0.5, >3 -> -0.1
-    refine_weight: 0.1     # two-sided clipped refine term (improving candidate earns capped bonus)
-    refine_clip: 0.2       # clip on delta_refine -> max +-refine_weight*clip = +-0.02
-    cand_weight: 0.2       # candidate-stage GT coverage recall @IoU>=cand_iou_threshold (no count penalty)
+    false_positive_penalty: -2.0
+    cls_weight: 0.0
+    iou_weight: 0.5
+    count_weight: 0.2
+    dense_weight: 0.3
+    focus_weight: 0.0
+    focus_max_candidates: 3
+    refine_weight: 0.0
+    refine_clip: 0.2
+    cand_weight: 0.0
     cand_iou_threshold: 0.1
-    cand_max_area_frac: 0.1   # anti giant-box hack: bigger candidates don't count for coverage/focus
+    cand_max_area_frac: 0.1
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_annos_think_fsm   # FSM-aligned staged SFT (markers masked)
+  sft_adapter: outputs/train/region_sft_loop4
   final_test: false
   prior:
     condition: real
@@ -168,18 +162,10 @@ outcome:
     raw_threshold: null
     max_candidates: 3
     min_cells: 1
-    # peak_core was A/B'd on MVTec-200: box precision ↑ but IoU ↓ (boxes too small).
-    # Keep full CC boxes. Peak coords + hybrid tokens mark the hottest cell
-    # without shrinking the proposal used by SFT <ground>.
     box_mode: full
     peak_radius: 1
     peak_keep: 0.85
-    # Which vision block (0-based, must be one of the layer_indices block indices)
-    # supplies per-patch features for region contrast tokens. Default: last block.
     region_feature_index: 23
-  # H-guided region contrast tokens (the only prior channel). H candidates are turned
-  # into <|region|> placeholder tokens whose embeddings come from models/region_adapter.py.
-  # The adapter is trained by train_region_sft.py and loaded from outcome.sft_adapter.
   region:
     intermediate_dim: 256
     geometry_dim: 5
@@ -187,7 +173,6 @@ outcome:
     activation: gelu
     max_cells: 15
     token_mode: hybrid
-    # Crops off. Hybrid = peak cell + 2x2 extent; SFT is the original grid recipe.
   zoom:
     enabled: false
     h_image_size: 768

@@ -18,8 +18,8 @@ from transformers import GenerationConfig, StoppingCriteriaList, StopStringCrite
 
 from models.qwen35 import unwrap_model
 from rl.grpo import model_inputs
-from outcome.staged_decode import (STAGES, OPEN, ANSWER_STOP, next_marker,
-                                   stage_finished, inject_after, _vision_ctx, encode_ids)
+from outcome.staged_decode import (STAGES, OPEN, stage_stop, inject_after,
+                                   _vision_ctx, encode_ids)
 from outcome.engine_multibox import datasets, load_model, validate_config
 from outcome.inputs_multibox import OutcomeMultiboxCollator
 from outcome.policy import generate_group_staged
@@ -61,8 +61,8 @@ def run_serial_reprefill(model, processor, batch, max_stage_tokens=96, max_answe
     core.eval()
     try:
         with _vision_ctx(model, batch):
-            for stage_i, stage in enumerate(STAGES + ('ANSWER',)):
-                stop = ANSWER_STOP if stage == 'ANSWER' else next_marker(stage)
+            for stage in STAGES + ('ANSWER',):
+                stop = stage_stop(stage)
                 budget = max_answer_tokens if stage == 'ANSWER' else max_stage_tokens
                 generation = GenerationConfig(
                     max_new_tokens=budget, do_sample=False, temperature=1.0,
@@ -79,15 +79,11 @@ def run_serial_reprefill(model, processor, batch, max_stage_tokens=96, max_answe
                 # EVERY stage (the cached get_image_features provides the frozen
                 # image embeddings). Dropping them only breaks stage 1+.
                 kwargs['pixel_values'] = gen_in.get('pixel_values')
-                old_len = int(prefix.shape[-1])
                 out = core.generate(generation_config=generation, stopping_criteria=stops, **kwargs)
                 seqs = out.sequences if hasattr(out, 'sequences') else out
-                new = seqs[0, old_len:]
-                body = tokenizer.decode(new.tolist(), skip_special_tokens=False)
-                advanced = stage_finished(body, stage)
                 prefix = seqs
                 if stage != 'ANSWER':
-                    extra = inject_after(stage, advanced=advanced)
+                    extra = inject_after(stage)
                     prefix = torch.cat([prefix, encode_ids(tokenizer, extra, device)], dim=-1)
     finally:
         core.train(was_training)

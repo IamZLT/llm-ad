@@ -23,6 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from data.prior_dataset import build_train_ref_pool
 from data.scan import load_prior_split, split_holdout_by_class
 from models.anomaly_prior import AnomalyPrior
+from models.looped_qwen import enable_looped_qwen, loop_enabled, loop_stats
 from models.lora import apply_lora
 from models.qwen35 import setup_model_and_processor, freeze_vision_encoder, force_vision_eval, unwrap_model
 from models.region_injection import attach_region_adapter, ensure_region_token, save_region_adapter
@@ -83,6 +84,7 @@ def load_model(cfg, adapter=None, fresh_lora=True, resume_adapter=None):
         print(f'[multibox] resume RL LoRA from {resume_adapter} (optimizer resets)', flush=True)
     elif fresh_lora:
         model = apply_lora(model, cfg)
+    enable_looped_qwen(model, cfg)
     freeze_vision_encoder(model)
     local_rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', '0')))
     if torch.cuda.is_available():
@@ -237,6 +239,19 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     think_ok_rate=sum(bool(p.get('think_ok')) for p in parsed)/len(parsed),
                     think_filled_rate=sum(bool(p.get('think_filled')) for p in parsed)/len(parsed),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
+                for s in ('U', 'C', 'L', 'V', 'ANSWER'):
+                    hits = [float(c.stage_hits.get(s, False)) for c in completions]
+                    lens = [float(c.stage_lengths.get(s, 0)) for c in completions]
+                    metrics[f'stage_{s.lower()}_hit_rate'] = (sum(hits) / len(hits))
+                    metrics[f'stage_{s.lower()}_tokens'] = (sum(lens) / len(lens))
+                if loop_enabled(cfg):
+                    lstats = loop_stats(model) or {}
+                    for i, d in enumerate(lstats.get('relative_deltas') or [], start=2):
+                        metrics[f'loop_delta_{i}'] = float(d)
+                    for i, n in enumerate(lstats.get('norms') or [], start=2):
+                        metrics[f'loop_norm_{i}'] = float(n)
+                    for i, c in enumerate(lstats.get('cosines') or [], start=2):
+                        metrics[f'loop_cosine_{i}'] = float(c)
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
                                prior_hint_tokens=meta['prior_hint_tokens'],
                                mean_new_tokens=sum(len(c.ids)-int(batch['prompt_len'][0]) for c in completions)/len(completions),

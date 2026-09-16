@@ -8,6 +8,7 @@ from outcome.staged_decode import (
     next_marker,
     next_stage,
     stage_finished,
+    stage_stop,
 )
 
 
@@ -27,22 +28,27 @@ def test_next_marker_aligns_with_sft_open_tags():
     assert next_marker('V') == '</think>'
 
 
-def test_controller_injects_boundary_when_model_does_not_advance():
-    missed = inject_after('U', advanced=False)
-    assert '[compare]' in missed and '[understand]' not in missed
-    assert inject_after('U', advanced=True) == '\n'
-    to_answer = inject_after('V', advanced=False)
-    assert '</think>' in to_answer and '<answer>' in to_answer
-    assert to_answer.count('</think>') == 1
-    assert inject_after('V', advanced=True) == '\n\n<answer>\n'
-
-
-def test_stage_finishes_on_next_marker():
-    assert not stage_finished('I am still comparing the reference', 'C')
-    assert stage_finished('done [localize]', 'C')
-    assert stage_finished('{"is_anomaly":false}\n</answer>', 'ANSWER')
+def test_stage_stop_matches_current_sft():
     for s in STAGES:
-        assert OPEN[s].startswith('[')
+        assert stage_stop(s) == '\n'
+
+    assert stage_stop('ANSWER') == '</answer>'
+
+
+def test_stage_finishes_on_newline():
+    assert not stage_finished('still reasoning', 'C')
+
+    assert stage_finished('comparison finished\n', 'C')
+
+    assert stage_finished('{"is_anomaly": false}\n</answer>', 'ANSWER')
+
+
+def test_controller_owns_next_marker():
+    assert inject_after('U') == '[compare]\n'
+    assert inject_after('C') == '[localize]\n'
+    assert inject_after('L') == '[confirm]\n'
+
+    assert inject_after('V') == '</think>\n\n<answer>\n'
 
 
 def test_padded_completion_tensors_masks_injected_tokens():

@@ -45,36 +45,47 @@ def next_stage(stage: str) -> str:
 
 
 def next_marker(stage: str) -> str:
-    """The token text that ends ``stage``: the next stage's opening marker.
-
-    ``V`` ends at ``</think>``. Mirrors ``thinking.staged_sft_target``, where a
-    stage body is followed directly by the next ``[xxx]`` header.
-    """
+    """The next stage's opening marker (an FSM transition, NOT a stop signal)."""
     nxt = next_stage(stage)
     if nxt == 'ANSWER':
         return THINK_CLOSE
     return OPEN[nxt].strip()
 
 
-def stage_finished(decoded: str, stage: str) -> bool:
+STAGE_STOP = '\n'
+
+
+def stage_stop(stage: str) -> str:
+    """Model-owned stop signal.
+
+    U/C/L/V bodies are single-line in the current staged SFT, so they terminate
+    with a newline. ANSWER still terminates with ``</answer>``.
+    """
     if stage == 'ANSWER':
-        return ANSWER_STOP in decoded
-    return next_marker(stage) in decoded
+        return ANSWER_STOP
+    return STAGE_STOP
 
 
-def inject_after(stage: str, advanced: bool) -> str:
-    """Token text the controller appends when ``stage`` ends.
+def stage_finished(decoded: str, stage: str) -> bool:
+    return stage_stop(stage) in decoded
 
-    ``advanced`` is True when the model already emitted the next stage's marker
-    (or ``</think>`` for V); then only the separator / answer opener is inserted.
-    Otherwise the controller injects the missing boundary marker itself.
+
+def inject_after(stage: str) -> str:
+    """Controller-owned transition marker injected when ``stage`` ends.
+
+    The model only samples ``body + '\\n'``; the controller appends the next
+    ``[xxx]`` header (or ``</think>\\n\\n<answer>\\n`` after V). This matches
+    ``thinking.staged_sft_target``, where markers are masked in SFT.
     """
     nxt = next_stage(stage)
+
     if nxt == 'DONE':
         return ''
+
     if nxt == 'ANSWER':
-        return '\n\n<answer>\n' if advanced else CLOSE_THINK
-    return '\n' if advanced else '\n' + next_marker(stage) + '\n'
+        return CLOSE_THINK
+
+    return OPEN[nxt]
 
 
 @dataclass
@@ -107,6 +118,34 @@ def encode_ids(tokenizer, text: str, device) -> torch.Tensor:
     return ids.to(device)
 
 
+def _eos_ids(model, tokenizer):
+    """All EOS ids (generation_config eos_token_id + tokenizer eos_token_id).
+
+    Qwen's generation config carries several end tokens (``<|im_end|>`` etc.);
+    the staged decoder must suppress them in U/C/L/V so the model only stops on
+    the FSM newline, not on an early EOS.
+    """
+    core = unwrap_model(model)
+
+    value = getattr(
+        getattr(core, 'generation_config', None),
+        'eos_token_id',
+        None,
+    )
+
+    ids = set()
+
+    if isinstance(value, (list, tuple)):
+        ids.update(int(x) for x in value if x is not None)
+    elif value is not None:
+        ids.add(int(value))
+
+    if tokenizer.eos_token_id is not None:
+        ids.add(int(tokenizer.eos_token_id))
+
+    return sorted(ids)
+
+
 def _vision_ctx(model, batch):
     from contextlib import nullcontext, ExitStack
     stack = ExitStack()
@@ -122,7 +161,7 @@ def _vision_ctx(model, batch):
 
 @torch.no_grad()
 def run_generate_stages(model, processor, batch, *, max_stage_tokens=96, max_answer_tokens=192,
-                        greedy=True, mode='staged') -> StagedRun:
+                        max_localize_tokens=None, greedy=True, mode='staged') -> StagedRun:
     """FSM U→C→L→V→answer via a single prefill + KV-cache continuation.
 
     Stage 1 uses ``core.generate`` to do the vision prefill.  Each subsequent
@@ -141,7 +180,7 @@ def run_generate_stages(model, processor, batch, *, max_stage_tokens=96, max_ans
         prompt_ids = prompt_ids.unsqueeze(0)
     prompt_len = int(prompt_ids.shape[-1])
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    ends = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else None
+    ends = _eos_ids(model, tokenizer)
 
     mm_type = gen_in.pop('mm_token_type_ids', None)
     if mm_type is None:
@@ -170,12 +209,23 @@ def run_generate_stages(model, processor, batch, *, max_stage_tokens=96, max_ans
         with _vision_ctx(model, batch):
             for stage in STAGES + ('ANSWER',):
                 st0 = time.perf_counter()
-                stop = ANSWER_STOP if stage == 'ANSWER' else next_marker(stage)
-                budget = max_answer_tokens if stage == 'ANSWER' else max_stage_tokens
+                is_answer = stage == 'ANSWER'
+                stop = stage_stop(stage)
+                if is_answer:
+                    budget = max_answer_tokens
+                elif stage == 'L' and max_localize_tokens is not None:
+                    budget = max_localize_tokens
+                else:
+                    budget = max_stage_tokens
 
                 generation = GenerationConfig(
                     max_new_tokens=budget, do_sample=not greedy, temperature=1.0,
-                    top_p=1.0, top_k=0, eos_token_id=ends, pad_token_id=pad,
+                    top_p=1.0, top_k=0,
+                    # Only ANSWER may terminate by EOS.
+                    eos_token_id=ends if is_answer else None,
+                    # U/C/L/V are FSM-controlled and may not emit EOS.
+                    suppress_tokens=None if is_answer else ends,
+                    pad_token_id=pad,
                     use_cache=True, num_beams=1,
                     return_dict_in_generate=(cache is None))
                 stops = StoppingCriteriaList(
@@ -200,19 +250,19 @@ def run_generate_stages(model, processor, batch, *, max_stage_tokens=96, max_ans
                 new = seqs[0, old_len:]
                 mask.extend([1] * int(new.numel()))  # model-sampled tokens
                 body = tokenizer.decode(new.tolist(), skip_special_tokens=False)
-                advanced = stage_finished(body, stage)
+                hit_end = stage_finished(body, stage)
                 prefix = seqs
 
                 forced = 0
                 if stage != 'ANSWER':
-                    extra = inject_after(stage, advanced=advanced)
+                    extra = inject_after(stage)
                     inj = encode_ids(tokenizer, extra, device)
                     forced = int(inj.shape[-1])
                     mask.extend([0] * forced)  # controller-injected tokens
                     prefix = torch.cat([prefix, inj], dim=-1)
 
                 traces.append(StageTrace(
-                    stage, int(new.numel()), forced, advanced, body, time.perf_counter() - st0))
+                    stage, int(new.numel()), forced, hit_end, body, time.perf_counter() - st0))
     except Exception as exc:
         core.train(was_training)
         return StagedRun(False, mode, prompt_len, int(prefix.shape[-1]) - prompt_len,
@@ -221,8 +271,13 @@ def run_generate_stages(model, processor, batch, *, max_stage_tokens=96, max_ans
                          error=f'{type(exc).__name__}: {exc}', sampled_mask=mask)
     core.train(was_training)
     new_ids = prefix[0, prompt_len:].tolist()
+    expected = list(STAGES) + ['ANSWER']
     names = [t.name for t in traces]
-    ok = names[-1] == 'ANSWER' and all(s in names for s in STAGES)
+    ok = (
+        names == expected
+        and len(traces) == len(expected)
+        and all(t.hit_end for t in traces)
+    )
     return StagedRun(ok, mode, prompt_len, len(new_ids), time.perf_counter() - t0,
                      traces, tokenizer.decode(new_ids, skip_special_tokens=False),
                      notes={'kv_cache': True, 'stages': names}, sampled_mask=mask,
@@ -237,27 +292,72 @@ def run_naive(model, processor, batch, **kw) -> StagedRun:
     return run_generate_stages(model, processor, batch, mode='naive', **kw)
 
 
-def _trim_new_at_stop(tokenizer, new_ids: torch.Tensor, stop: str, device) -> torch.Tensor:
-    """Keep tokens up to and including the first occurrence of ``stop``.
+def _trim_new_at_stop(
+    tokenizer,
+    new_ids: torch.Tensor,
+    stop: str,
+    device,
+    end_ids=(),
+):
+    """Trim at the first expected stop or real EOS.
 
     Batch ``generate`` runs until *every* sequence hits the stop string, so
     trajectories that finish early carry garbage tokens after their stop; trim
-    them so each trajectory keeps only its own stage content (matching the
-    single-trajectory ``StopStringCriteria`` semantics).
+    them so each trajectory keeps only its own stage content.
+
+    Returns ``(kept, hit_stop, hit_eos)``.
     """
     ids = new_ids.tolist()
     kept = []
+
+    end_ids = set(int(x) for x in end_ids)
+
     for t in ids:
         kept.append(t)
-        if stop in tokenizer.decode(kept, skip_special_tokens=False):
-            break
-    return torch.tensor(kept, dtype=torch.long, device=device)
+
+        text = tokenizer.decode(
+            kept,
+            skip_special_tokens=False,
+        )
+
+        # Expected FSM stop has priority.
+        if stop in text:
+            return (
+                torch.tensor(
+                    kept,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                True,
+                False,
+            )
+
+        if int(t) in end_ids:
+            return (
+                torch.tensor(
+                    kept,
+                    dtype=torch.long,
+                    device=device,
+                ),
+                False,
+                True,
+            )
+
+    return (
+        torch.tensor(
+            kept,
+            dtype=torch.long,
+            device=device,
+        ),
+        False,
+        False,
+    )
 
 
 @torch.no_grad()
 def run_generate_stages_batch(model, processor, batch, *, group=1,
                               max_stage_tokens=96, max_answer_tokens=192,
-                              greedy=False) -> list:
+                              max_localize_tokens=None, greedy=False) -> list:
     """Batched FSM rollout: all ``group`` trajectories advance stage-by-stage.
 
     ``group`` trajectories share one prompt/image, so each stage packs them into
@@ -277,7 +377,7 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
         prompt_ids = prompt_ids.unsqueeze(0)
     prompt_len = int(prompt_ids.shape[-1])
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    ends = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else None
+    ends = _eos_ids(model, tokenizer)
 
     mm_prompt = gen_in.pop('mm_token_type_ids', None)
     if mm_prompt is None:
@@ -301,8 +401,14 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
     try:
         with _vision_ctx(model, batch):
             for stage in STAGES + ('ANSWER',):
-                stop = ANSWER_STOP if stage == 'ANSWER' else next_marker(stage)
-                budget = max_answer_tokens if stage == 'ANSWER' else max_stage_tokens
+                is_answer = stage == 'ANSWER'
+                stop = stage_stop(stage)
+                if is_answer:
+                    budget = max_answer_tokens
+                elif stage == 'L' and max_localize_tokens is not None:
+                    budget = max_localize_tokens
+                else:
+                    budget = max_stage_tokens
 
                 max_len = max(int(p.shape[-1]) for p in prefixes)
                 input_ids = torch.full((group, max_len), pad_id, device=device, dtype=torch.long)
@@ -321,7 +427,12 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
 
                 generation = GenerationConfig(
                     max_new_tokens=budget, do_sample=not greedy, temperature=1.0,
-                    top_p=1.0, top_k=0, eos_token_id=ends, pad_token_id=pad_id,
+                    top_p=1.0, top_k=0,
+                    # Only ANSWER may terminate by EOS.
+                    eos_token_id=ends if is_answer else None,
+                    # U/C/L/V are FSM-controlled and may not emit EOS.
+                    suppress_tokens=None if is_answer else ends,
+                    pad_token_id=pad_id,
                     use_cache=True, num_beams=1)
                 stops = StoppingCriteriaList(
                     [StopStringCriteria(tokenizer=tokenizer, stop_strings=[stop])])
@@ -344,28 +455,38 @@ def run_generate_stages_batch(model, processor, batch, *, group=1,
                 new_all = seqs[:, max_len:]
 
                 for i in range(group):
-                    kept = _trim_new_at_stop(tokenizer, new_all[i], stop, device)
+                    kept, hit_end, hit_eos = _trim_new_at_stop(
+                        tokenizer,
+                        new_all[i],
+                        stop,
+                        device,
+                        end_ids=ends if is_answer else (),
+                    )
                     n_kept = int(kept.shape[-1])
                     body = tokenizer.decode(kept.tolist(), skip_special_tokens=False)
-                    advanced = stage_finished(body, stage)
                     masks[i].extend([1] * n_kept)
                     prefixes[i] = torch.cat([prefixes[i], kept], dim=-1)
                     forced = 0
                     if stage != 'ANSWER':
-                        extra = inject_after(stage, advanced=advanced)
+                        extra = inject_after(stage)
                         inj = encode_ids(tokenizer, extra, device)[0]
                         forced = int(inj.shape[-1])
                         masks[i].extend([0] * forced)
                         prefixes[i] = torch.cat([prefixes[i], inj], dim=-1)
-                    traces_per[i].append(StageTrace(stage, n_kept, forced, advanced, body, 0.0))
+                    traces_per[i].append(StageTrace(stage, n_kept, forced, hit_end, body, 0.0))
     finally:
         core.train(was_training)
 
     runs = []
+    expected = list(STAGES) + ['ANSWER']
     for i in range(group):
         new_ids = prefixes[i][prompt_len:].tolist()
         names = [t.name for t in traces_per[i]]
-        ok = names[-1] == 'ANSWER' and all(s in names for s in STAGES)
+        ok = (
+            names == expected
+            and len(traces_per[i]) == len(expected)
+            and all(t.hit_end for t in traces_per[i])
+        )
         runs.append(StagedRun(
             ok, 'cache', prompt_len, len(new_ids), 0.0, traces_per[i],
             tokenizer.decode(new_ids, skip_special_tokens=False),

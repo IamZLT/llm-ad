@@ -35,7 +35,8 @@ def _run_dict(r):
 
 
 def dry_run() -> dict:
-    from outcome.staged_decode import OPEN, STAGES, inject_after, next_marker, next_stage, stage_finished
+    from outcome.staged_decode import (OPEN, STAGES, inject_after, next_marker,
+                                       next_stage, stage_finished, stage_stop)
     chain = ['U']
     while chain[-1] != 'ANSWER':
         chain.append(next_stage(chain[-1]))
@@ -48,17 +49,17 @@ def dry_run() -> dict:
         skipped = True
     assert skipped
     assert not stage_finished('still thinking', 'U')
-    assert stage_finished('... [compare]', 'U')
-    inj_miss = inject_after('U', advanced=False)
-    inj_hit = inject_after('U', advanced=True)
-    assert '[compare]' in inj_miss
-    assert inj_hit == '\n'
-    assert '</think>' in inject_after('V', advanced=False)
+    assert stage_finished('understand body\n', 'U')
+    assert stage_stop('U') == '\n'
+    assert stage_stop('ANSWER') == '</answer>'
+    inj_u = inject_after('U')
+    assert inj_u == '[compare]\n'
+    assert inject_after('V') == '</think>\n\n<answer>\n'
     return dict(
         ok=True, mode='dry-run',
         chain=chain, cannot_skip=True,
-        markers={s: dict(open=OPEN[s], next=next_marker(s)) for s in STAGES},
-        inject_if_missing_U=inj_miss, inject_if_model_advanced_U=inj_hit,
+        markers={s: dict(open=OPEN[s], next=next_marker(s), stop=stage_stop(s)) for s in STAGES},
+        inject_after_U=inj_u,
     )
 
 

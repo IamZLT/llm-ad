@@ -80,10 +80,17 @@ def parse_output_cfg(text: str, cfg: dict, max_boxes=None) -> dict:
     """parse_output using outcome.max_boxes / outcome.thinking.enabled from cfg."""
     oc = cfg.get('outcome') or {}
     n = int(max_boxes if max_boxes is not None else oc.get('max_boxes', DEFAULT_MAX_BOXES))
-    return parse_output(text, max_boxes=n, thinking_required=_thinking_enabled(cfg))
+    mode = str(oc.get('reasoning_mode', 'fsm'))
+    return parse_output(
+        text,
+        max_boxes=n,
+        thinking_required=(mode == 'fsm' and _thinking_enabled(cfg)),
+        answer_only=(mode in ('loop', 'direct')),
+    )
 
 
-def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_required: bool = False) -> dict:
+def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_required: bool = False,
+                 answer_only: bool = False) -> dict:
     """Parse multi-box output. Only <answer> is strict JSON.
 
     Legacy: five XML blocks understand/compare/ground/verify/answer.
@@ -194,6 +201,20 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     answer_strict = (result['task_valid']
                      and set(result['answer_keys']) == {'is_anomaly', 'bboxes_2d', 'description'}
                      and desc_ok)
+    if answer_only:
+        structure = (
+            text.count('<answer>') == 1
+            and text.count('</answer>') == 1
+        )
+        core = bool(structure and result['task_valid'] and desc_ok)
+        result['protocol_core'] = core
+        result['protocol_strict'] = bool(
+            core
+            and answer_strict
+            and not text[:answers[0].start()].strip()
+            and not text[answers[0].end():].strip()
+        )
+        return result
     if thinking_required:
         result['protocol_strict'] = bool(
             structure and answer_strict and think_info['ok'] and think_info['filled'])

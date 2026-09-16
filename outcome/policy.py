@@ -8,6 +8,7 @@ import torch
 from transformers import GenerationConfig, StoppingCriteriaList, StopStringCriteria
 
 from models.qwen35 import force_vision_eval, unwrap_model
+from models.looped_qwen import loop_enabled
 from models.vision_cache import bind_cached_image_features
 from models.region_injection import bind_region_injection, has_region, region_raw_from_batch
 from rl.grpo import (clipped_pg_kl, disable_adapter_ctx, dropout_eval, expand_gen_in_for_group,
@@ -21,6 +22,9 @@ class Completion:
     text: str
     stop_reason: str
     sampled_mask: list = field(default_factory=list)
+
+    stage_hits: dict = field(default_factory=dict)
+    stage_lengths: dict = field(default_factory=dict)
 
 
 def eos_ids(model, tokenizer):
@@ -83,9 +87,10 @@ def generate_group(model, processor, batch, cfg, group=1, sample=False):
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else ends[0]
     # A fresh config removes inherited top-k/penalties/forced tokens. Raw-policy
     # categorical sampling is exactly the distribution used by all logprobs.
+    use_cache = not loop_enabled(cfg)
     generation = GenerationConfig(max_new_tokens=limit, do_sample=sample,
         temperature=1.0, top_p=1.0, top_k=0, typical_p=1.0, repetition_penalty=1.0,
-        eos_token_id=ends or None, pad_token_id=pad, use_cache=True, num_beams=1)
+        eos_token_id=ends or None, pad_token_id=pad, use_cache=use_cache, num_beams=1)
     stops = StoppingCriteriaList([StopStringCriteria(tokenizer=tokenizer, stop_strings=['</answer>'])])
     core = unwrap_model(model)
     was_training = core.training
@@ -123,6 +128,9 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
     gcfg = cfg['grpo']
     max_stage = int(gcfg.get('max_stage_tokens', 96))
     max_answer = int(gcfg.get('max_answer_tokens', 192))
+    max_localize = gcfg.get('max_localize_tokens', None)
+    if max_localize is not None:
+        max_localize = int(max_localize)
     prompt_len = int(batch['prompt_len'][0])
     prompt_ids = batch['input_ids']
     if prompt_ids.ndim == 1:
@@ -132,6 +140,7 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
     runs = run_generate_stages_batch(model, processor, batch, group=group,
                                      max_stage_tokens=max_stage,
                                      max_answer_tokens=max_answer,
+                                     max_localize_tokens=max_localize,
                                      greedy=not sample)
     result = []
     for run in runs:
@@ -139,6 +148,17 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
         full = torch.cat([prompt_ids, new_ids], dim=-1)
         comp = Completion(full, run.text, _stop_reason_from_run(run))
         comp.sampled_mask = list(run.sampled_mask)
+
+        comp.stage_hits = {
+            t.name: bool(t.hit_end)
+            for t in run.stages
+        }
+
+        comp.stage_lengths = {
+            t.name: int(t.n_sampled)
+            for t in run.stages
+        }
+
         result.append(comp)
     return result
 

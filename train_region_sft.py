@@ -38,6 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 from data.prior_dataset import build_train_ref_pool
 from data.scan import load_prior_split, split_holdout_by_class
 from models.anomaly_prior import AnomalyPrior
+from models.looped_qwen import enable_looped_qwen
 from models.lora import apply_lora
 from models.qwen35 import (setup_model_and_processor, freeze_vision_encoder, force_vision_eval,
                            unwrap_model, print_trainable_params)
@@ -287,7 +288,7 @@ def _ground_multibox(cands: list) -> str:
     return f'candidate_bboxes_2d={cands}; {_where_join(cands)}'
 
 
-def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False) -> str:
+def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False, answer_only: bool = False) -> str:
     """Five-block target; category/boxes come from GT, process blocks summarize the chain.
 
     The process blocks and the answer ``description`` are sample-aware templates built
@@ -389,6 +390,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False)
                 'apparent changes are material or appearance variation rather than a true defect.'
             )
             answer = json.dumps({'is_anomaly': False, 'bboxes_2d': [], 'description': description})
+        if answer_only:
+            return f'<answer>\n{answer}\n</answer>'
         if thinking:
             return staged_sft_target(understand, compare, ground, verify, answer)
         return (
@@ -426,6 +429,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False)
         )
         answer = json.dumps({'is_anomaly': False, 'bbox_2d': None, 'description': description})
         ground = 'candidate_bbox_2d=null'
+    if answer_only:
+        return f'<answer>\n{answer}\n</answer>'
     if thinking:
         return staged_sft_target(understand, compare, ground, verify, answer)
     return (
@@ -516,13 +521,14 @@ def _stack_gen_in(singles, max_len):
     return out
 
 
-def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False):
+def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False, answer_only=False):
     """Collate one-at-a-time (vision cache is per-pair), then pad a language batch."""
     singles, seqs, labels_list, targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         prompt_ids = batch['input_ids'][0].tolist()
-        target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking)
+        target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking,
+                                  answer_only=answer_only)
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
         labels_list.append(build_labels(prompt_ids, target_ids, target_text=target,
                                         tokenizer=tokenizer, thinking=thinking))
@@ -566,6 +572,7 @@ def load_sft_model(cfg, device):
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
     ensure_region_token(processor, model)
     model = apply_lora(model, cfg)
+    enable_looped_qwen(model, cfg)
     freeze_vision_encoder(model)
     model.to(device)
     if cfg['training'].get('gradient_checkpointing', True):
@@ -599,7 +606,7 @@ def batch_loss(model, packed, backward_scale=None):
     return loss
 
 
-def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False):
+def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False):
     """Mean teacher-forced loss on the holdout split (no update).
 
     Every rank evaluates an equal-length disjoint shard using the unwrapped module
@@ -624,7 +631,7 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     total = 0.0
     with torch.no_grad():
         for i in shard:
-            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking)
+            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking, answer_only)
             total += float(batch_loss(raw, packed))
     count = len(shard)
     if world > 1:
@@ -704,6 +711,8 @@ def main():
                     find_unused_parameters=False)
     tokenizer = getattr(processor, 'tokenizer', processor)
     thinking = thinking_enabled(cfg)
+    reasoning_mode = str((cfg.get('outcome') or {}).get('reasoning_mode', 'fsm'))
+    answer_only = reasoning_mode in ('loop', 'direct')
 
     train, test = load_prior_split(cfg)
     train, dev = split_holdout_by_class(train, float(cfg['data']['holdout_ratio']),
@@ -756,7 +765,7 @@ def main():
             for start in range(0, len(indices), batch_size):
                 started = time.perf_counter()
                 samples = [dataset[i] for i in indices[start:start + batch_size]]
-                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking)
+                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking, answer_only)
                 loss = batch_loss(model, packed, backward_scale=1.0 / accum)
                 running_loss += float(loss.detach())
                 running_supervised += n_sup
@@ -801,7 +810,7 @@ def main():
             if dev_dataset is not None:
                 dev_loss, n_dev = evaluate_dev(model, collator, dev_dataset, device, tokenizer,
                                                multibox, int(args.dev_eval_samples), seed, epoch,
-                                               thinking=thinking)
+                                               thinking=thinking, answer_only=answer_only)
                 writer.add_scalar('dev/loss', dev_loss, step)
                 writer.add_scalar('dev/n', n_dev, step)
                 writer.flush()
