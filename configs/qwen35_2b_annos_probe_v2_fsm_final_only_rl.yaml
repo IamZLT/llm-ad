@@ -98,7 +98,7 @@ training:
   final_eval_num_samples: null
 grpo:
   group_size: 8
-  policy_epochs: 3
+  policy_epochs: 2
   epochs: 2
   max_attempts: 800
   learning_rate: 5.0e-06

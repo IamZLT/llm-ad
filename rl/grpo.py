@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.qwen35 import unwrap_model
+from models.looped_qwen import is_looped
 from models.region_injection import REGION_INPUT_KEYS
 
 
@@ -81,6 +82,10 @@ def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_
             elif cur > seq:
                 v = v[..., :seq]
         kwargs[k] = v
+    # Teacher-forcing on the looped (recurrent-depth) stack must not build a
+    # per-depth K/V cache: it would allocate K full caches for no benefit.
+    if is_looped(model):
+        kwargs["use_cache"] = False
     return model(**kwargs)
 
 

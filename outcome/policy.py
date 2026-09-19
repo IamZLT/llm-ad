@@ -1,6 +1,7 @@
 """Finite rollouts, genuine completion lengths and one outcome advantage."""
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 
@@ -8,7 +9,6 @@ import torch
 from transformers import GenerationConfig, StoppingCriteriaList, StopStringCriteria
 
 from models.qwen35 import force_vision_eval, unwrap_model
-from models.looped_qwen import loop_enabled
 from models.vision_cache import bind_cached_image_features
 from models.region_injection import bind_region_injection, has_region, region_raw_from_batch
 from rl.grpo import (clipped_pg_kl, disable_adapter_ctx, dropout_eval, expand_gen_in_for_group,
@@ -82,15 +82,18 @@ def _region_bind(model, batch):
 def generate_group(model, processor, batch, cfg, group=1, sample=False):
     tokenizer = getattr(processor, 'tokenizer', processor)
     gcfg = cfg['grpo']
+    if bool(gcfg.get('shared_prefill', False)):
+        return generate_group_shared_prefill(model, processor, batch, cfg, group=group, sample=sample)
     limit = int(gcfg['max_new_tokens'])
     ends = eos_ids(model, tokenizer)
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else ends[0]
     # A fresh config removes inherited top-k/penalties/forced tokens. Raw-policy
     # categorical sampling is exactly the distribution used by all logprobs.
-    use_cache = not loop_enabled(cfg)
+    # Looped models use a per-depth LoopDepthCache (use_cache=True); plain models
+    # use the vanilla cache.
     generation = GenerationConfig(max_new_tokens=limit, do_sample=sample,
         temperature=1.0, top_p=1.0, top_k=0, typical_p=1.0, repetition_penalty=1.0,
-        eos_token_id=ends or None, pad_token_id=pad, use_cache=use_cache, num_beams=1)
+        eos_token_id=ends or None, pad_token_id=pad, use_cache=True, num_beams=1)
     stops = StoppingCriteriaList([StopStringCriteria(tokenizer=tokenizer, stop_strings=['</answer>'])])
     core = unwrap_model(model)
     was_training = core.training
@@ -107,6 +110,80 @@ def generate_group(model, processor, batch, cfg, group=1, sample=False):
     finally:
         core.train(was_training)
         force_vision_eval(core)
+    return result
+
+
+def _sample_tokens(logits: torch.Tensor, sample: bool) -> torch.Tensor:
+    """Raw categorical sampling (temperature=1, top_p=1, top_k=0) or greedy argmax."""
+    if sample:
+        probs = torch.softmax(logits.float(), dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return logits.argmax(dim=-1)
+
+
+def generate_group_shared_prefill(model, processor, batch, cfg, group=1, sample=False):
+    """GRPO rollout with one shared prompt prefill (B=1) + batched decode (B=group).
+
+    All ``group`` trajectories share the same prompt/image/region, so the prompt is
+    prefilled once at B=1, the per-depth cache is batch-repeated to ``group``, and a
+    manual decode loop (raw categorical / greedy) drives the batch. HF ``generate``
+    is intentionally NOT used here: after a cache exactly covers the prompt, it would
+    treat the input as a re-prefill (``next_sequence_length=0``) and recompute the
+    whole prefix. We instead reuse the model's own ``compute_3d_position_ids`` decode
+    path (``position_ids=None`` + ``attention_mask=None``) so M-RoPE positions are
+    computed by the model, not reimplemented here.
+    """
+    tokenizer = getattr(processor, 'tokenizer', processor)
+    gcfg = cfg['grpo']
+    limit = int(gcfg['max_new_tokens'])
+    ends = eos_ids(model, tokenizer)
+    ends_set = set(ends)
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else ends[0]
+    core = unwrap_model(model)
+    prompt_len = int(batch['prompt_len'][0])
+    prompt_ids = batch['input_ids']
+    if prompt_ids.ndim == 1:
+        prompt_ids = prompt_ids.unsqueeze(0)
+    device = prompt_ids.device
+
+    was_training = core.training
+    core.eval()
+    result = []
+    try:
+        with torch.no_grad(), bind_cached_image_features(core, batch['image_embeds']), _region_bind(model, batch):
+            # Phase 1: single prefill at B=1.
+            out = core(**dict(model_inputs(batch)), use_cache=True)
+            cache = out.past_key_values
+            first_logits = out.logits[:, -1:, :].repeat(group, 1, 1)  # [group, 1, vocab]
+
+            # Phase 2: repeat the per-depth cache to the group, then batched decode.
+            cache.batch_repeat_interleave(group)
+            gen_ids = [[] for _ in range(group)]
+            finished = torch.zeros(group, dtype=torch.bool, device=device)
+            cur = _sample_tokens(first_logits[:, 0, :], sample)  # [group]
+
+            for _ in range(limit):
+                for i in range(group):
+                    if finished[i]:
+                        continue
+                    tok = int(cur[i].item())
+                    gen_ids[i].append(tok)
+                    if tok in ends_set or '</answer>' in tokenizer.decode(gen_ids[i], skip_special_tokens=True):
+                        finished[i] = True
+                if bool(finished.all()):
+                    break
+                out = core(input_ids=cur.unsqueeze(-1), attention_mask=None, position_ids=None,
+                           past_key_values=cache, use_cache=True)
+                nxt = _sample_tokens(out.logits[:, -1, :], sample)
+                cur = torch.where(finished, torch.tensor(pad, device=device, dtype=cur.dtype), nxt)
+    finally:
+        core.train(was_training)
+        force_vision_eval(core)
+
+    for i in range(group):
+        new = torch.tensor(gen_ids[i], device=device, dtype=torch.long)
+        full = torch.cat([prompt_ids[0], new], dim=-1)
+        result.append(trim_completion(full, prompt_len, tokenizer, ends))
     return result
 
 
@@ -195,6 +272,7 @@ def optimize_group(model, processor, batch, completions, advantages, optimizer, 
     gen_in = model_inputs(batch)
     cache = batch['image_embeds']
     group = len(completions)
+    t_start = time.perf_counter()
     if skip:
         old_lp = ref_lp = None
     else:
@@ -211,12 +289,14 @@ def optimize_group(model, processor, batch, completions, advantages, optimizer, 
             old_parts.append(old)
             ref_parts.append(ref)
         old_lp, ref_lp = torch.cat(old_parts), torch.cat(ref_parts)
+    t_oldref = time.perf_counter()
     totals = dict(loss=0., pg=0., kl=0., ratio=0., clip_fraction=0., logprob_max_error=0.)
     model.train()
     force_vision_eval(model)
     last_grad_norm = 0.0
     err_tol = float(gc.get('logprob_error_tolerance', .1))
     for pe in range(policy_epochs):
+        t_pe = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         pe_totals = dict(loss=0., pg=0., kl=0., ratio=0., clip_fraction=0., logprob_max_error=0.)
         for start, end in micro_batch_ranges(group, int(gc.get('actor_micro_batch_size', 1))):
@@ -252,10 +332,13 @@ def optimize_group(model, processor, batch, completions, advantages, optimizer, 
         params = [p for p in model.parameters() if p.requires_grad]
         last_grad_norm = float(torch.nn.utils.clip_grad_norm_(params, float(gc['max_grad_norm']), error_if_nonfinite=True))
         optimizer.step()
+        totals[f'seconds_actor_epoch_{pe}'] = time.perf_counter() - t_pe
         for key in ('loss', 'pg', 'kl', 'ratio', 'clip_fraction', 'logprob_max_error'):
             totals[key] += pe_totals[key]
     for key in ('loss', 'pg', 'kl', 'ratio', 'clip_fraction', 'logprob_max_error'):
         totals[key] /= policy_epochs
     totals['grad_norm'] = last_grad_norm
     totals['effective_tokens'] = sum(len(c.ids)-prompt_len for c in completions)
+    totals['seconds_old_ref'] = t_oldref - t_start
+    totals['seconds_optimize'] = time.perf_counter() - t_start
     return totals

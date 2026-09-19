@@ -195,10 +195,13 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 is_anomaly = bool(meta.get('is_anomaly'))
                 completions = parsed = scores = None
                 task_std = loc_std = loc_range = 0.0
+                rollout_sec = 0.0
                 for resamples in range(max_group_resamples + 1):
+                    t_gen = time.perf_counter()
                     completions = generate_group_staged(model, processor, batch, cfg, group=int(gc['group_size']), sample=True) \
                         if bool(gc.get('staged_rollout', False)) else \
                         generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
+                    rollout_sec += time.perf_counter() - t_gen
                     parsed = [parse_output_cfg(c.text, cfg, max_boxes=max_boxes) for c in completions]
                     scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg, max_boxes=max_boxes) for p in parsed]
                     task_rewards = torch.tensor([s['task'] for s in scores], device=device)
@@ -283,6 +286,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 writer.add_scalar('train/collapsed_but_updated', metrics['collapsed_but_updated'], attempt)
                 writer.add_scalar('train/updates_after', updates, attempt)
                 writer.add_scalar('train/seconds_per_attempt', time.perf_counter()-started, attempt)
+                writer.add_scalar('train/seconds_rollout', rollout_sec, attempt)
 
                 def _mean(key, rows):
                     vals = [r[key] for r in rows if r.get(key) is not None]

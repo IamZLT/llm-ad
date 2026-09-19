@@ -89,18 +89,18 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 20
+  eval_every_n_steps: 100
   eval_split: test
-  eval_num_samples: 200
-  final_eval_num_samples: null
+  eval_num_samples: 20
+  final_eval_num_samples: 200
 grpo:
   group_size: 8
-  policy_epochs: 3
+  policy_epochs: 2
   epochs: 2
   max_attempts: 800
   learning_rate: 5.0e-06
   gradient_accumulation_steps: 1
-  max_new_tokens: 512
+  max_new_tokens: 128
   staged_rollout: false
   rollout_micro_batch_size: 8
   logprob_micro_batch_size: 8
