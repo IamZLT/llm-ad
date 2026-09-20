@@ -1,14 +1,18 @@
-# Internal-Loop (latent-space recurrent-depth) SFT.
-# Loop-4 = F_theta applied 4x inside the language stack, no external FSM stages.
-# Only the <answer> JSON is supervised (answer_only); U/C/L/V are NOT trained.
-# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_sft.yaml \
-#        --output-dir outputs/train/region_sft_loop4 --epochs 1 --num-gpu 1
+# Zoom-SFT v1 (minimal proof-of-concept): does a paired local high-res view,
+# after minimal LoRA adaptation, improve small-defect detection?
+#
+# Baseline  : FSM-SFT (region_sft_annos_think_fsm), H@768, zoom off.
+# Zoom-v1   : same FSM-SFT start, H@768, top-1 paired crop (Image3=inspection
+#             local crop, Image4=reference local crop), LoRA-only continuation.
+#
+# Frozen: ViT / RegionAdapter / Qwen base. Trainable: LoRA. FSM U->C->L->V unchanged.
+# Reference crop is SAME-COORDINATE (not matched) to keep variables minimal.
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2_loop4
+  run_name: qwen35_2b_annos_probe_v2_fsm_zoom_v1
   auto_create_output_dir: true
 tensorboard:
   port: 5011
@@ -76,7 +80,7 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: false   # loop/direct: no native <think>; answer-only supervision
+  enable_thinking: true
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, grouped by H candidate: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. hK@[x,y] marks the H peak on Image 2 in [0,1000] for the first token of that group; tokens after it describe the same H region, not only the peak cell. Hints are noisy, not labels: a marked location may be a false alarm (reflection, texture, print), and real defects may be unmarked. Start from these regions when proposing boxes, expand to the full differing structure, and search beyond the marked locations too.
@@ -93,74 +97,20 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 100
-  eval_split: test
+  eval_every_n_steps: 20
+  eval_split: dev
   eval_num_samples: 200
   final_eval_num_samples: null
-grpo:
-  group_size: 8
-  policy_epochs: 3
-  epochs: 2
-  max_attempts: null
-  learning_rate: 5.0e-06
-  gradient_accumulation_steps: 1
-  max_new_tokens: 512
-  rollout_micro_batch_size: 8
-  logprob_micro_batch_size: 8
-  actor_micro_batch_size: 8
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 0
-  scale_rewards: true
-  clip_low: 0.2
-  clip_high: 0.28
-  kl_beta: 0.0002
-  max_grad_norm: 1.0
-  save_steps: 100
-  logprob_error_tolerance: 0.1
-distributed:
-  num_gpu: 1
-  deepspeed: null
-  local_rank: -1
-  ddp_find_unused_parameters: false
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
   max_boxes: 16
-  reasoning_mode: loop   # direct | loop | fsm
   thinking:
-    enabled: false
-  loop:
     enabled: true
-    steps: 4
-    curriculum:
-      enabled: true
-      schedule:
-      - 1
-      - 2
-      - 4
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
-  reward:
-    normal_correct: 1.0
-    wrong_decision: -1.0
-    false_positive_penalty: -2.0
-    cls_weight: 0.0
-    iou_weight: 0.5
-    count_weight: 0.2
-    dense_weight: 0.3
-    focus_weight: 0.0
-    focus_max_candidates: 3
-    refine_weight: 0.0
-    refine_clip: 0.2
-    cand_weight: 0.0
-    cand_iou_threshold: 0.1
-    cand_max_area_frac: 0.1
-  resampling:
-    min_loc_range: 0.001
-    max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_loop4
+  sft_adapter: outputs/train/region_sft_annos_think_fsm   # Zoom-SFT continues from this LoRA
   final_test: false
   prior:
     condition: real
@@ -172,6 +122,9 @@ outcome:
     peak_radius: 1
     peak_keep: 0.85
     region_feature_index: 23
+    # H map computed at 768 (decoupled from the 448 global images). This is the
+    # single H-resolution change; the frozen RegionAdapter is the one trained at 448.
+    h_image_size: 768
   region:
     intermediate_dim: 256
     geometry_dim: 5
@@ -180,8 +133,12 @@ outcome:
     max_cells: 15
     token_mode: hybrid
   zoom:
-    enabled: false
-    h_image_size: 768
+    enabled: true
+    source: peaks        # H local-max + NMS (top-1), not CC bbox
+    max_crops: 1         # first version: single candidate only
+    nms_radius: 2
+    crop_fraction: 0.20
     crop_image_size: 448
     expand: 1.5
-    max_crops: 3
+    include_reference: true
+    reference_mode: same # SAME-coordinate reference crop (matched-ref is a later variable)

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -67,16 +67,26 @@ def group_advantages(rewards, scale=False, eps=1e-6):
 
 
 def _region_bind(model, batch):
-    """Region-token injection context for one forward; no-op without a mounted adapter.
+    """Region-token + H-memory injection context for one forward; no-op without adapters.
 
     Returns a FRESH context manager on every call so it can be reused across the
     multiple ``with`` blocks inside ``optimize_group`` (a generator-based context
     manager cannot be re-entered).
     """
     adapter = getattr(unwrap_model(model), 'region_adapter', None)
-    if adapter is None or not has_region(batch):
+    h_mem = getattr(unwrap_model(model), 'h_memory', None)
+    has_r = adapter is not None and has_region(batch)
+    has_h = h_mem is not None and batch.get('h_map') is not None
+    if not has_r and not has_h:
         return nullcontext()
-    return bind_region_injection(model, adapter, region_raw_from_batch(batch), int(batch['region_token_id']))
+    stack = ExitStack()
+    if has_r:
+        stack.enter_context(bind_region_injection(
+            model, adapter, region_raw_from_batch(batch), int(batch['region_token_id'])))
+    if has_h:
+        from models.h_memory import bind_h_cross_attn
+        stack.enter_context(bind_h_cross_attn(model, h_mem, batch['h_map']))
+    return stack
 
 
 def generate_group(model, processor, batch, cfg, group=1, sample=False):

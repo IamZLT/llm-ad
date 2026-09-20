@@ -1,17 +1,22 @@
-# Internal-Loop (latent-space recurrent-depth) SFT.
-# Loop-4 = F_theta applied 4x inside the language stack, no external FSM stages.
-# Only the <answer> JSON is supervised (answer_only); U/C/L/V are NOT trained.
-# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_sft.yaml \
-#        --output-dir outputs/train/region_sft_loop4 --epochs 1 --num-gpu 1
+# H-Region Fusion PoC: a gated HPriorAdapter side channel on top of the frozen
+# FSM baseline (H@768 + Global@448 + RegionAdapter + FSM). Mechanism probe.
+#
+# Frozen: ViT / Qwen base / FSM LoRA (--freeze-lora) / RegionAdapter
+#         (--freeze-region-adapter). Trainable: HPriorAdapter + alpha only.
+#
+# The HPriorAdapter sees a 7x7 sample-normalized H patch around each region
+# token's center and adds a tanh(alpha)-gated residual to the region embedding:
+#     R_i' = R_i + tanh(alpha) * HPriorAdapter(H_local_i)
+# alpha=0 -> exact baseline. No prompt/text/decoder change, same <|region|> tokens.
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2_loop4
+  run_name: qwen35_2b_annos_probe_v2_fsm_h_prior
   auto_create_output_dir: true
 tensorboard:
-  port: 5011
+  port: 5017
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -76,7 +81,7 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: false   # loop/direct: no native <think>; answer-only supervision
+  enable_thinking: true
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, grouped by H candidate: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. hK@[x,y] marks the H peak on Image 2 in [0,1000] for the first token of that group; tokens after it describe the same H region, not only the peak cell. Hints are noisy, not labels: a marked location may be a false alarm (reflection, texture, print), and real defects may be unmarked. Start from these regions when proposing boxes, expand to the full differing structure, and search beyond the marked locations too.
@@ -93,74 +98,20 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 100
-  eval_split: test
+  eval_every_n_steps: 20
+  eval_split: dev
   eval_num_samples: 200
   final_eval_num_samples: null
-grpo:
-  group_size: 8
-  policy_epochs: 3
-  epochs: 2
-  max_attempts: null
-  learning_rate: 5.0e-06
-  gradient_accumulation_steps: 1
-  max_new_tokens: 512
-  rollout_micro_batch_size: 8
-  logprob_micro_batch_size: 8
-  actor_micro_batch_size: 8
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 0
-  scale_rewards: true
-  clip_low: 0.2
-  clip_high: 0.28
-  kl_beta: 0.0002
-  max_grad_norm: 1.0
-  save_steps: 100
-  logprob_error_tolerance: 0.1
-distributed:
-  num_gpu: 1
-  deepspeed: null
-  local_rank: -1
-  ddp_find_unused_parameters: false
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
   max_boxes: 16
-  reasoning_mode: loop   # direct | loop | fsm
   thinking:
-    enabled: false
-  loop:
     enabled: true
-    steps: 4
-    curriculum:
-      enabled: true
-      schedule:
-      - 1
-      - 2
-      - 4
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
-  reward:
-    normal_correct: 1.0
-    wrong_decision: -1.0
-    false_positive_penalty: -2.0
-    cls_weight: 0.0
-    iou_weight: 0.5
-    count_weight: 0.2
-    dense_weight: 0.3
-    focus_weight: 0.0
-    focus_max_candidates: 3
-    refine_weight: 0.0
-    refine_clip: 0.2
-    cand_weight: 0.0
-    cand_iou_threshold: 0.1
-    cand_max_area_frac: 0.1
-  resampling:
-    min_loc_range: 0.001
-    max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_loop4
+  sft_adapter: outputs/train/region_sft_annos_think_fsm   # frozen FSM baseline start point
   final_test: false
   prior:
     condition: real
@@ -172,6 +123,9 @@ outcome:
     peak_radius: 1
     peak_keep: 0.85
     region_feature_index: 23
+    # H map computed at 768 (decoupled from the 448 global images), matching the
+    # current FSM baseline. The frozen RegionAdapter is the one trained at 448.
+    h_image_size: 768
   region:
     intermediate_dim: 256
     geometry_dim: 5
@@ -185,3 +139,16 @@ outcome:
     crop_image_size: 448
     expand: 1.5
     max_crops: 3
+  # H-Region Fusion PoC: gated residual side channel. Kept off by default in other
+  # configs (parity); enable here to build/train HPriorAdapter.
+  h_prior_adapter:
+    enabled: true
+    patch_size: 7
+    intermediate_dim: 256
+    init_gate: 0.0
+    # Side-channel ablation (independent of prior.condition): proposals/geom/hstat
+    # always come from real H; only the H patch fed to HPriorAdapter is perturbed.
+    #   real     -> patch from real H
+    #   shuffled -> patch from a fixed per-sample shuffled H (spatial structure gone)
+    #   zero     -> patch all zeros
+    condition: real

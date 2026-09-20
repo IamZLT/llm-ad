@@ -1,17 +1,25 @@
-# Internal-Loop (latent-space recurrent-depth) SFT.
-# Loop-4 = F_theta applied 4x inside the language stack, no external FSM stages.
-# Only the <answer> JSON is supervised (answer_only); U/C/L/V are NOT trained.
-# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_sft.yaml \
-#        --output-dir outputs/train/region_sft_loop4 --epochs 1 --num-gpu 1
+# Spatial H-Memory Cross-Attention PoC: H -> structured spatial memory -> cross-attn.
+#
+# The frozen vision-comparison module already produced H. This config turns H into a
+# multi-channel spatial memory (gradients / multi-scale / local contrast / PE), condenses
+# it to K=64 memory tokens via a small CNN, and injects it into Qwen with a residual
+# cross-attention on selected decoder layers:
+#     Y_l = QwenBlock_l(X_l);  C_l = CrossAttn(Q=LN(Y_l), K=Z_H, V=Z_H);  X = Y + tanh(g_l) C_l.
+#
+# Mechanism probe: freeze ViT / Qwen base / FSM LoRA (--freeze-lora) / RegionAdapter
+# (--freeze-region-adapter). Trainable: HMemory (encoder + cross-attn) only.
+# [localize] target is GT-anchored (outcome.sft.localize_target=gt) so H is only a
+# conditioning prior, never the supervision -- otherwise cross-attn just learns to
+# read H back out of the memory (the shortcut).
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2_loop4
+  run_name: qwen35_2b_annos_probe_v2_fsm_h_mem
   auto_create_output_dir: true
 tensorboard:
-  port: 5011
+  port: 5017
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -76,7 +84,7 @@ data:
   min_pixels: null
   max_pixels: null
 prompt:
-  enable_thinking: false   # loop/direct: no native <think>; answer-only supervision
+  enable_thinking: true
   template: |
     Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
     A set of region evidence tokens follows, grouped by H candidate: {region_tokens}. Each token encodes the inspection content at that location, its matched normal counterpart, and the discrepancy between them. hK@[x,y] marks the H peak on Image 2 in [0,1000] for the first token of that group; tokens after it describe the same H region, not only the peak cell. Hints are noisy, not labels: a marked location may be a false alarm (reflection, texture, print), and real defects may be unmarked. Start from these regions when proposing boxes, expand to the full differing structure, and search beyond the marked locations too.
@@ -93,77 +101,26 @@ training:
   gradient_checkpointing_kwargs:
     use_reentrant: false
   seed: 42
-  eval_every_n_steps: 100
-  eval_split: test
+  eval_every_n_steps: 20
+  eval_split: dev
   eval_num_samples: 200
   final_eval_num_samples: null
-grpo:
-  group_size: 8
-  policy_epochs: 3
-  epochs: 2
-  max_attempts: null
-  learning_rate: 5.0e-06
-  gradient_accumulation_steps: 1
-  max_new_tokens: 512
-  rollout_micro_batch_size: 8
-  logprob_micro_batch_size: 8
-  actor_micro_batch_size: 8
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 0
-  scale_rewards: true
-  clip_low: 0.2
-  clip_high: 0.28
-  kl_beta: 0.0002
-  max_grad_norm: 1.0
-  save_steps: 100
-  logprob_error_tolerance: 0.1
-distributed:
-  num_gpu: 1
-  deepspeed: null
-  local_rank: -1
-  ddp_find_unused_parameters: false
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
   max_boxes: 16
-  reasoning_mode: loop   # direct | loop | fsm
   thinking:
-    enabled: false
-  loop:
     enabled: true
-    steps: 4
-    curriculum:
-      enabled: true
-      schedule:
-      - 1
-      - 2
-      - 4
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
-  reward:
-    normal_correct: 1.0
-    wrong_decision: -1.0
-    false_positive_penalty: -2.0
-    cls_weight: 0.0
-    iou_weight: 0.5
-    count_weight: 0.2
-    dense_weight: 0.3
-    focus_weight: 0.0
-    focus_max_candidates: 3
-    refine_weight: 0.0
-    refine_clip: 0.2
-    cand_weight: 0.0
-    cand_iou_threshold: 0.1
-    cand_max_area_frac: 0.1
-  resampling:
-    min_loc_range: 0.001
-    max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_loop4
+  # [localize] supervision: GT boxes (H is only a conditioning prior, never target).
+  sft:
+    localize_target: gt
+  sft_adapter: outputs/train/region_sft_annos_think_fsm   # frozen FSM baseline start point
   final_test: false
   prior:
-    condition: real
+    condition: real          # proposals always from real H (ablation only perturbs memory)
     relative_threshold: 0.7
     raw_threshold: null
     max_candidates: 3
@@ -172,6 +129,7 @@ outcome:
     peak_radius: 1
     peak_keep: 0.85
     region_feature_index: 23
+    h_image_size: 768
   region:
     intermediate_dim: 256
     geometry_dim: 5
@@ -185,3 +143,17 @@ outcome:
     crop_image_size: 448
     expand: 1.5
     max_crops: 3
+  # Spatial H-Memory cross-attention PoC. Kept off by default in other configs.
+  h_memory:
+    enabled: true
+    # Memory-side ablation (independent of prior.condition): proposals/region tokens
+    # always come from real H; only the H map fed to the memory encoder is perturbed.
+    #   real     -> real H
+    #   shuffled -> fixed per-sample shuffled H (spatial structure destroyed)
+    #   zero     -> all-zero H (PE remains)
+    condition: real
+    layers: [11, 19]         # 0-based decoder layer indices (full-attn layers)
+    memory_size: 64          # K = 8x8 spatial prior memory tokens
+    mem_dim: 256             # per-token memory dim
+    num_heads: 8             # cross-attn heads (hidden 2048 / 8 = head_dim 256)
+    init_gate: 0.001         # small nonzero gate; --gate-lr drives it up during training

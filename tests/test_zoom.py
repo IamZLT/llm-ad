@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from outcome.inputs import (
     OutcomeCollator,
     crop_original_by_box1000,
+    crop_original_by_center1000,
     format_region_hints,
     pixel_budget,
     zoom_prompt_suffix,
@@ -47,6 +48,27 @@ def test_zoom_suffix_mentions_full_image_coords():
     three = zoom_prompt_suffix(3)
     assert 'Images 3-5' in three
     assert 'FULL IMAGE' in three
+
+
+def test_zoom_suffix_paired_mentions_inspection_then_reference():
+    paired = zoom_prompt_suffix(2, paired=True)
+    assert 'inspection crop' in paired
+    assert 'reference crop' in paired
+
+
+def test_crop_center_square_window_uses_crop_fraction():
+    img = Image.new('RGB', (1000, 1000), color=0)
+    crop = crop_original_by_center1000(img, 500, 500, crop_fraction=0.20)
+    assert crop is not None
+    assert crop.size == (200, 200)  # 20% of the smaller side (1000)
+
+
+def test_crop_center_clamps_to_border():
+    img = Image.new('RGB', (100, 100), color=0)
+    crop = crop_original_by_center1000(img, 0, 0, crop_fraction=0.50)
+    assert crop is not None
+    assert crop.size[0] <= 100 and crop.size[1] <= 100
+    assert crop.size[0] >= 2 and crop.size[1] >= 2
 
 
 def test_format_region_hints_includes_peak_coords():

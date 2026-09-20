@@ -45,7 +45,7 @@ def encode_pair_canonical(prior, pixels, grid):
     hw_r, hw_t = tuple(int(v) for v in grid[0, 1:]), tuple(int(v) for v in grid[1, 1:])
     region_idx = int(getattr(prior, 'region_feature_index', prior.block_indices[-1]))
     match_fn = getattr(prior, '_nn_match', None)
-    test_features = matched_ref_features = None
+    test_features = matched_ref_features = match_coordinates = None
     maps = []
     for index in prior.block_indices:
         ref, test = torch.split(captured[index], counts, dim=0)
@@ -57,12 +57,15 @@ def encode_pair_canonical(prior, pixels, grid):
             if index == region_idx:
                 test_features = test.detach()
                 matched_ref_features = match['matched_ref_features'].detach()
+                # [Ht*Wt, 2] (y, x) reference-grid coordinate each test patch matched.
+                match_coordinates = match['match_coordinates'].detach()
         else:
             maps.append(prior._nn_map(test, ref, hw_t, hw_r, prior.neighborhood_radius))
     stack = torch.stack(maps)
     hmap = softmax_fuse_maps(stack, prior.temperature) if len(maps) > 1 else stack[0]
     return dict(patch_map=hmap, merged_embeddings=merged.detach(),
                 test_features=test_features, matched_ref_features=matched_ref_features,
+                match_coordinates=match_coordinates,
                 test_grid_hw=hw_t)
 
 
@@ -133,20 +136,64 @@ def crop_original_by_box1000(image: Image.Image, box, expand: float = 1.5, min_s
     return image.convert('RGB').crop((left, top, right, bottom))
 
 
-def zoom_prompt_suffix(n_crops: int) -> str:
-    """Tell the model extra images are full-image-coordinate zooms of Image 2."""
+def crop_original_by_center1000(image: Image.Image, cx: float, cy: float,
+                                crop_fraction: float = 0.20, min_side: int = 32):
+    """Crop ``image`` (original pixels) around a [0,1000] center point.
+
+    The window is a square of ``crop_fraction`` of the image's *smaller* side, so
+    a 10x10px defect at 20% becomes a ~90-200px crop before resizing. Returns None
+    if the crop collapses after clamping.
+    """
+    if image is None:
+        return None
+    w, h = image.size
+    if w < 2 or h < 2:
+        return None
+    frac = max(0.0, min(float(crop_fraction), 1.0))
+    side = max(frac * float(min(w, h)), float(min_side))
+    px, py = float(cx) / 1000.0 * w, float(cy) / 1000.0 * h
+    left = int(round(px - side / 2.0))
+    top = int(round(py - side / 2.0))
+    right = int(round(px + side / 2.0))
+    bottom = int(round(py + side / 2.0))
+    left = max(0, min(w - 2, left))
+    top = max(0, min(h - 2, top))
+    right = max(left + 2, min(w, right))
+    bottom = max(top + 2, min(h, bottom))
+    if right - left < 2 or bottom - top < 2:
+        return None
+    return image.convert('RGB').crop((left, top, right, bottom))
+
+
+def zoom_prompt_suffix(n_crops: int, paired: bool = False, reference_mode: str = 'matched') -> str:
+    """Tell the model extra images are full-image-coordinate zooms of Image 2.
+
+    ``reference_mode`` is 'matched' (reference crop at the *most similar* normal
+    location) or 'same' (reference crop at the identical [0,1000] coordinate as
+    the inspection crop). The suffix always stresses that a zoomed region is a
+    hypothesis to inspect, not an anomaly label.
+    """
     n = int(n_crops)
     if n <= 0:
         return ''
-    if n == 1:
+    ref_desc = 'matched normal reference' if reference_mode == 'matched' else 'normal reference'
+    if paired:
+        if n == 1:
+            span = ('Image 3 is a magnified inspection crop and Image 4 is the '
+                    f'{ref_desc} crop at the same location')
+        else:
+            span = (f'For each of the {n} marked candidates, a pair of magnified crops '
+                    f'follows: first the inspection crop, then its {ref_desc} crop')
+    elif n == 1:
         span = 'Image 3 is a magnified crop of Image 2 at the first marked candidate'
     else:
         span = (f'Images 3-{2 + n} are magnified crops of Image 2 at the marked '
                 f'candidate locations, in that order')
     return (
-        f'\n{span}. Use them in <verify> and <answer> to keep, refine, or reject '
-        'the hypothesis. All boxes stay Image 2 FULL IMAGE integers in [0,1000]; '
-        'do not write crop-local coordinates.'
+        f'\n{span}. A zoomed region is only a suspicious hypothesis and may still be '
+        'normal: use these magnified views in [confirm] and <answer> to keep, refine, '
+        'or reject the hypothesis. All boxes stay Image 2 FULL IMAGE integers in '
+        '[0,1000]; do not write crop-local coordinates.'
     )
 
 
@@ -293,7 +340,59 @@ def _cells_to_mask(h, w, cells):
     return out
 
 
-def extract_region_cells(proposal_masks, test_features, matched_ref_features, hmap, cfg):
+def _extract_h_patches(hmap, geoms, patch_size):
+    """Sample a ``patch_size x patch_size`` patch from sample-normalized H per token.
+
+    ``geoms`` is a list of ``[gcx, gcy, gw, gh, r/R]`` where ``gcx/gcy`` are cell
+    centers in ``[0,1]`` (the same convention ``extract_region_cells`` writes into
+    ``geom``). H is first normalized per-sample to ``[0,1]`` so the patch encodes
+    the *shape* of the anomaly prior around the region, not its absolute magnitude.
+    Bilinear sampling handles fractional grid-token centers and clamps at borders.
+
+    Returns ``[N, 1, P, P]`` float32 (N == len(geoms)). ``patch_size <= 0`` returns
+    an empty tensor so callers can gate the feature off without shape mismatch.
+    """
+    import torch.nn.functional as F
+
+    P = max(0, int(patch_size))
+    n = len(geoms)
+    if P == 0 or n == 0:
+        return torch.zeros(n, 1, 0, 0, dtype=torch.float32, device=hmap.device)
+
+    h = hmap.detach().float()
+    Ht, Wt = int(h.shape[0]), int(h.shape[1])
+    if Ht < 2 or Wt < 2:
+        return torch.zeros(n, 1, P, P, dtype=torch.float32, device=hmap.device)
+
+    # sample-wise normalization -> [0,1]
+    hmin = h.min()
+    denom = (h.max() - hmin) + 1e-6
+    h = (h - hmin) / denom
+    h = h.reshape(1, 1, Ht, Wt)
+
+    half = (P - 1) / 2.0
+    off = torch.arange(P, device=hmap.device, dtype=torch.float32) - half
+    patches = []
+    for g in geoms:
+        gcx, gcy = float(g[0]), float(g[1])
+        # cell-center in element-index space (element k occupies [k, k+1))
+        cx = gcx * Wt - 0.5
+        cy = gcy * Ht - 0.5
+        xs = cx + off
+        ys = cy + off
+        # grid_sample(align_corners=False): normalized = 2*(element + 0.5)/size - 1
+        xn = 2.0 * (xs + 0.5) / Wt - 1.0
+        yn = 2.0 * (ys + 0.5) / Ht - 1.0
+        gy, gx = torch.meshgrid(yn, xn, indexing='ij')
+        grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)  # [1, P, P, 2] (x, y)
+        out = F.grid_sample(h, grid, mode='bilinear', align_corners=False,
+                            padding_mode='border')
+        patches.append(out[0, 0])  # [P, P]
+    return torch.stack(patches, dim=0).unsqueeze(1)  # [N, 1, P, P]
+
+
+def extract_region_cells(proposal_masks, test_features, matched_ref_features, hmap, cfg,
+                         patch_size: int = 0):
     """Turn candidate region masks into contrast features for the region adapter.
 
     ``token_mode=hybrid`` (default): peak cell first, then a 2x2 split of the
@@ -301,9 +400,13 @@ def extract_region_cells(proposal_masks, test_features, matched_ref_features, hm
     ``token_mode=peak``: one token per region at its highest-H cell.
     ``token_mode=grid``: legacy 2x2 split only.
 
+    ``patch_size > 0`` additionally returns ``hpatch`` ([1,n,1,P,P]) — a PxP
+    sample-normalized H patch around each token's ``geom`` center, the extra input
+    for ``HPriorAdapter`` (kept separate from the main RegionAdapter).
+
     Returns dict(test=[1,n,D], ref=[1,n,D], geom=[1,n,G], hstat=[1,n,H],
-    valid=[1,n], owner=[1,n]). Always returns at least one cell: a single invalid
-    "empty" cell when there are no candidate regions.
+    hpatch=[1,n,1,P,P], valid=[1,n], owner=[1,n]). Always returns at least one
+    cell: a single invalid "empty" cell when there are no candidate regions.
     """
     dev = test_features.device
     Ht, Wt = int(hmap.shape[0]), int(hmap.shape[1])
@@ -364,18 +467,22 @@ def extract_region_cells(proposal_masks, test_features, matched_ref_features, hm
             _peak(r, ys, xs)
         if token_mode in ('grid', 'hybrid'):
             _grid(r, ys, xs)
+    P = max(1, int(patch_size))
     if not out_test:
         return dict(test=torch.zeros(1, 1, D, device=dev),
                     ref=torch.zeros(1, 1, D, device=dev),
                     geom=torch.zeros(1, 1, int(cfg.get('geometry_dim', 5)), device=dev),
                     hstat=torch.zeros(1, 1, int(cfg.get('hstat_dim', 2)), device=dev),
+                    hpatch=torch.zeros(1, 1, 1, P, P, device=dev),
                     valid=torch.zeros(1, 1, dtype=torch.bool, device=dev),
                     owner=torch.full((1, 1), -1, device=dev, dtype=torch.long))
     n = min(len(out_test), max_cells)
+    hpatch = _extract_h_patches(h, out_geom[:n], patch_size)
     return dict(test=torch.stack(out_test[:n]).unsqueeze(0),
                 ref=torch.stack(out_ref[:n]).unsqueeze(0),
                 geom=torch.tensor(out_geom[:n], device=dev, dtype=torch.float32).unsqueeze(0),
                 hstat=torch.tensor(out_hstat[:n], device=dev, dtype=torch.float32).unsqueeze(0),
+                hpatch=hpatch.unsqueeze(0),  # [1, n, 1, P, P]
                 valid=torch.ones(1, n, dtype=torch.bool, device=dev),
                 owner=torch.tensor(out_owner[:n], device=dev, dtype=torch.long).unsqueeze(0))
 
@@ -413,18 +520,106 @@ class OutcomeCollator(PriorCollator):
     def _zoom_cfg(self) -> dict:
         return dict(self.cfg.get('outcome', {}).get('zoom') or {})
 
-    def _build_zoom_crops(self, test_original: Image.Image, proposals: list) -> list:
+    def _zoom_peaks(self, hmap, zcfg) -> list:
+        """H local-max + NMS → top-K peaks in [0,1000], independent of CC proposals."""
+        from models.vision_cache import topk_spatial_points
+
+        max_crops = max(0, int(zcfg.get('max_crops', 3)))
+        nms_radius = int(zcfg.get('nms_radius', 2))
+        return topk_spatial_points(hmap, k=max_crops, nms_radius=nms_radius)
+
+    def _matched_ref_crop(self, ref_original, qx, qy, hmap, match_coordinates, crop_fraction):
+        """Crop the normal reference at the location each test peak *matched*.
+
+        ``match_coordinates`` is [Ht*Wt, 2] (y, x) on the reference grid; index it
+        by the test grid cell of the peak [0,1000] point, then crop the reference
+        around the matched coordinate.
+        """
+        if ref_original is None or match_coordinates is None:
+            return None
+        arr = hmap.detach().float().cpu().numpy() if torch.is_tensor(hmap) else np.asarray(hmap, dtype=float)
+        ht, wt = int(arr.shape[0]), int(arr.shape[1])
+        if ht <= 0 or wt <= 0:
+            return None
+        mc = match_coordinates.detach().float().cpu().numpy()
+        if mc.ndim != 2 or int(mc.shape[0]) != ht * wt:
+            return None
+        tx = max(0, min(wt - 1, int(round(float(qx) / 1000.0 * wt))))
+        ty = max(0, min(ht - 1, int(round(float(qy) / 1000.0 * ht))))
+        flat = ty * wt + tx
+        ry = float(mc[flat, 0])
+        rx = float(mc[flat, 1])
+        rqx = (rx + 0.5) / float(wt) * 1000.0
+        rqy = (ry + 0.5) / float(ht) * 1000.0
+        return crop_original_by_center1000(ref_original, rqx, rqy, crop_fraction)
+
+    def _gt_oracle_boxes(self, item) -> list:
+        """GT component boxes in [0,1000] (eval-only oracle source)."""
+        comps = list(item.get('component_bboxes') or [])
+        if not comps and item.get('gt_box_px'):
+            comps = [item['gt_box_px']]
+        orig = item.get('orig_size')
+        if not orig or not comps:
+            return []
+        w, h = float(orig[0]), float(orig[1])
+        return [[b[0] / w * 1000.0, b[1] / h * 1000.0, b[2] / w * 1000.0, b[3] / h * 1000.0]
+                for b in comps if len(b) == 4]
+
+    def _build_zoom_crops(self, test_original, ref_original, proposals, hmap,
+                          match_coordinates, oracle_boxes) -> tuple:
+        """Build zoom crop entries: each entry is [test_crop] or [test_crop, ref_crop].
+
+        ``source`` picks the proposal used for the test crop:
+          - 'cc'    : existing connected-component bbox (expand)
+          - 'peaks' : H local-max + NMS peak, fixed ``crop_fraction`` window
+        ``include_reference`` appends a reference crop. ``reference_mode`` chooses
+        where that reference crop is taken:
+          - 'matched' : the location each test peak *matched* (needs match coords)
+          - 'same'    : the identical [0,1000] coordinate as the test crop
+        ``oracle_boxes`` (non-empty) overrides source with GT boxes (eval-only).
+        """
         zcfg = self._zoom_cfg()
         expand = float(zcfg.get('expand', 1.5))
         crop_size = int(zcfg.get('crop_image_size', 448))
         max_crops = max(0, int(zcfg.get('max_crops', 3)))
-        crops = []
-        for prop in proposals[:max_crops]:
-            raw = crop_original_by_box1000(test_original, prop.get('bbox_2d'), expand=expand)
+        source = str(zcfg.get('source', 'cc'))
+        include_ref = bool(zcfg.get('include_reference', False))
+        reference_mode = str(zcfg.get('reference_mode', 'matched'))
+        crop_fraction = float(zcfg.get('crop_fraction', 0.20))
+        entries = []
+
+        def _entry(center, box=None):
+            if box is not None:
+                raw = crop_original_by_box1000(test_original, box, expand=expand)
+            else:
+                raw = crop_original_by_center1000(test_original, center[0], center[1], crop_fraction)
             if raw is None:
-                continue
-            crops.append(self._resize_one(raw, crop_size))
-        return crops
+                return
+            imgs = [self._resize_one(raw, crop_size)]
+            if include_ref:
+                if reference_mode == 'matched':
+                    ref_raw = self._matched_ref_crop(ref_original, center[0], center[1],
+                                                    hmap, match_coordinates, crop_fraction)
+                else:
+                    ref_raw = crop_original_by_center1000(ref_original, center[0], center[1],
+                                                          crop_fraction)
+                if ref_raw is not None:
+                    imgs.append(self._resize_one(ref_raw, crop_size))
+            entries.append(imgs)
+
+        if oracle_boxes:
+            for box in oracle_boxes[:max_crops]:
+                cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+                _entry([cx, cy], box=box)
+        elif source == 'peaks':
+            for qx, qy in self._zoom_peaks(hmap, zcfg):
+                _entry([qx, qy])
+        else:
+            for prop in proposals[:max_crops]:
+                peak = prop.get('peak_2d') or [(prop.get('bbox_2d') or [500, 500])[0],
+                                               (prop.get('bbox_2d') or [500, 500])[1]]
+                _entry([float(peak[0]), float(peak[1])], box=prop.get('bbox_2d'))
+        return entries, include_ref
 
     def __call__(self, batch):
         if len(batch) != 1:
@@ -434,12 +629,20 @@ class OutcomeCollator(PriorCollator):
         zcfg = self._zoom_cfg()
         zoom_on = bool(zcfg.get('enabled', False))
         global_size = int((self.cfg.get('data') or {}).get('max_image_size', 448))
-        h_size = int(zcfg.get('h_image_size', 768)) if zoom_on else global_size
+        # H resolution is decoupled from crop zoom: `prior.h_image_size` (new,
+        # explicit) wins; `zoom.h_image_size` remains a legacy alias that only
+        # applies when zoom is on (preserves old configs' behavior).
+        pcfg = self.cfg.get('outcome', {}).get('prior', {})
+        h_size = global_size
+        if pcfg.get('h_image_size'):
+            h_size = int(pcfg['h_image_size'])
+        elif zoom_on and zcfg.get('h_image_size'):
+            h_size = int(zcfg['h_image_size'])
 
         ref_g, test_g = self._align_pair_at(item['ref'], item['test'], global_size)
         initial = self._concat_image_tensors(ref_g, test_g)
 
-        if zoom_on and h_size != global_size:
+        if h_size != global_size:
             with pixel_budget(self.processor, h_size):
                 ref_h, test_h = self._align_pair_at(item['ref'], item['test'], h_size)
                 h_in = self._concat_image_tensors(ref_h, test_h)
@@ -454,6 +657,7 @@ class OutcomeCollator(PriorCollator):
 
         pcfg = self.cfg.get('outcome', {}).get('prior', {})
         hmap = vis_h['patch_map']
+        hmap_real = hmap  # real, un-shuffled H (kept for the cross-attn memory ablation)
         condition = pcfg.get('condition', 'real')
         if condition == 'shuffled':
             # Fixed per sample and across all members of its group; no GT involved.
@@ -463,18 +667,56 @@ class OutcomeCollator(PriorCollator):
             hmap = hmap.flatten()[perm.to(hmap.device)].reshape_as(hmap)
         if condition not in ('real', 'none', 'shuffled'):
             raise ValueError(f'unknown H condition: {condition}')
+        # H-memory (cross-attn) input: independent of prior.condition so proposals/
+        # RegionAdapter always use the real H while only the memory is perturbed.
+        h_mem_cfg = self.cfg.get('outcome', {}).get('h_memory', {}) or {}
+        h_mem_map = None
+        if bool(h_mem_cfg.get('enabled', False)):
+            mem_cond = str(h_mem_cfg.get('condition', 'real'))
+            if mem_cond not in ('real', 'shuffled', 'zero'):
+                raise ValueError(f'unknown h_memory.condition: {mem_cond}')
+            if mem_cond == 'real':
+                h_mem_map = hmap_real
+            elif mem_cond == 'shuffled':
+                key = f"hmem:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
+                s = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
+                perm = torch.randperm(hmap_real.numel(), generator=torch.Generator().manual_seed(s))
+                h_mem_map = hmap_real.flatten()[perm.to(hmap_real.device)].reshape_as(hmap_real)
+            else:
+                h_mem_map = torch.zeros_like(hmap_real)
         proposals, proposal_masks, threshold_mode = region_proposals(hmap, pcfg)
         if condition == 'none':
             proposals = []
             proposal_masks = np.zeros((0, *proposal_masks.shape[1:]), dtype=bool)
         region_cfg = self.cfg.get('outcome', {}).get('region', {}) or {}
+        h_prior_cfg = self.cfg.get('outcome', {}).get('h_prior_adapter') or {}
+        h_patch_size = int(h_prior_cfg.get('patch_size', 7))
         images = [ref_g, test_g]
         caches = [vis_g_merged]
         grids = [initial['image_grid_thw']]
         if vis_h.get('test_features') is None or vis_h.get('matched_ref_features') is None:
             raise ValueError('region tokens require matched features; check prior.region_feature_index')
         region_raw = extract_region_cells(proposal_masks, vis_h['test_features'],
-                                          vis_h['matched_ref_features'], hmap, region_cfg)
+                                          vis_h['matched_ref_features'], hmap, region_cfg,
+                                          patch_size=h_patch_size)
+        # HAdapter side-channel ablation: keep proposals/geom/hstat from real H but
+        # perturb ONLY the H patch fed to HPriorAdapter. `h_prior_adapter.condition`
+        # is independent of `prior.condition` so we can test the side channel's use of
+        # H's *spatial structure* without changing proposal quality.
+        h_prior_cond = str(h_prior_cfg.get('condition', 'real'))
+        if h_prior_cond not in ('real', 'shuffled', 'zero'):
+            raise ValueError(f'unknown h_prior_adapter.condition: {h_prior_cond}')
+        if h_prior_cond != 'real' and h_patch_size > 0:
+            hp_map = vis_h['patch_map']  # the real, un-shuffled H map
+            if h_prior_cond == 'shuffled':
+                key = f"hprior:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
+                s = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
+                perm = torch.randperm(hp_map.numel(), generator=torch.Generator().manual_seed(s))
+                hp_map = hp_map.flatten()[perm.to(hp_map.device)].reshape_as(hp_map)
+            elif h_prior_cond == 'zero':
+                hp_map = torch.zeros_like(hp_map)
+            geoms = region_raw['geom'][0].tolist()
+            region_raw['hpatch'] = _extract_h_patches(hp_map, geoms, h_patch_size).unsqueeze(0)
         region_token_id = region_token_id_of(self.processor)
         n_region = int(region_raw['valid'].shape[1])
         owners = region_raw['owner'][0].tolist() if 'owner' in region_raw else None
@@ -482,8 +724,14 @@ class OutcomeCollator(PriorCollator):
         text = render_prompt(self.cfg, item['class_name'], region_tokens=region_tokens)
 
         crops = []
+        paired = False
+        n_entries = 0
         if zoom_on and condition != 'none':
-            crops = self._build_zoom_crops(item['test'], proposals)
+            oracle_boxes = self._gt_oracle_boxes(item) if bool(zcfg.get('oracle', False)) else []
+            entries, paired = self._build_zoom_crops(item['test'], item['ref'], proposals, hmap,
+                                                     vis_h.get('match_coordinates'), oracle_boxes)
+            n_entries = len(entries)
+            crops = [img for entry in entries for img in entry]
             if crops:
                 # Encode every crop under the global (LLM) pixel budget so processor grids match.
                 crop_encs = [
@@ -505,7 +753,8 @@ class OutcomeCollator(PriorCollator):
                 images.extend(crops)
                 caches.append(crop_merged)
                 grids.append(crop_grid)
-                text = text + zoom_prompt_suffix(len(crops))
+                ref_mode = str(zcfg.get('reference_mode', 'matched'))
+                text = text + zoom_prompt_suffix(n_entries, paired=paired, reference_mode=ref_mode)
 
         user = dict(role='user', content=[dict(type='image', image=im) for im in images]+[dict(type='text', text=text)])
         enable_thinking = bool((self.cfg.get('prompt') or {}).get('enable_thinking', False))
@@ -528,8 +777,11 @@ class OutcomeCollator(PriorCollator):
         full['region_ref'] = region_raw['ref'].cpu()
         full['region_geom'] = region_raw['geom'].cpu()
         full['region_hstat'] = region_raw['hstat'].cpu()
+        full['region_hpatch'] = region_raw['hpatch'].cpu()
         full['region_valid'] = region_raw['valid'].cpu()
         full['region_token_id'] = int(region_token_id)
+        if h_mem_map is not None:
+            full['h_map'] = h_mem_map.detach().cpu()
         prior_hint_tokens = int(region_raw['valid'].shape[1])
         full['_meta'] = [{key: item.get(key) for key in ('orig_size','gt_box_px','is_anomaly','image_path','ref_path','class_name','defect_type','component_bboxes','num_components','mask_area_fraction','union_area_fraction','full_mask_path')}]
         full['_meta'][0].update(prior_candidates=proposals, prior_condition=condition,

@@ -18,3 +18,4 @@ __pycache__/
 
 # Local docs & reference dumps (not tracked in git)
 docs/
+exp

@@ -8,14 +8,20 @@ recurrence happens OUTSIDE the model by emitting stage tokens and re-prefilling.
 
 Internal-Loop (latent-space)::
 
-    H^(0) -> F_theta(H^(0)) -> F_theta(H^(1)) -> ... -> F_theta(H^(K-1)) -> A
+    H^(0) = E(X)
+    H^(k+1) = F_theta(H^(k)),   k = 0, ..., K-1
+    H_out   = Norm(H^(K))
 
-recurrence happens INSIDE the Qwen decoder. ``F_theta`` is the *same* original
-``Qwen3_5TextModel.forward`` every time — no new Transformer block is created,
-no ``ModuleList`` is added, and all loop iterations (including LoRA) share one
-set of parameters. This reuses Qwen's native full/linear attention mask and
-M-RoPE construction, so the only thing we touch is the ``language_model.forward``
-entry point.
+where ``F_theta = L_N o ... o L_1`` contains ONLY the decoder layers (no final
+RMSNorm between recurrent steps) and the final ``Norm`` is applied exactly once
+after the K-th pass. All K passes share one set of parameters (including LoRA):
+no new Transformer block is created and no ``ModuleList`` is added.
+
+This is the "recurrent-depth Transformer" definition (weight-shared depth
+recursion), as opposed to the naive ``(Norm o F)^K`` which the original
+implementation produced by re-calling ``Qwen3_5TextModel.forward`` (that method
+runs ``self.norm`` after every layer stack, so the loop also re-normalised the
+hidden state at every depth).
 
 Recurrent-depth cache::
 
@@ -25,14 +31,10 @@ Each recurrent depth owns an independent ``DynamicCache``. For the t-th token
 ``x_t -> F_theta(C^(1)) -> h_t^(1) -> F_theta(C^(2)) -> h_t^(2) -> ...`` the
 k-th pass only ever processes ``[B, 1, D]`` against ``C^(k)`` (which already
 holds the full history of depth k), instead of re-running the whole prefix.
-This is the standard cached autoregressive decode for a recurrent-depth stack:
-position ``t`` does not change across depths, so the M-RoPE / ``position_ids``
-are identical for all K passes and are simply passed through.
-
-The 2-D ``(position t, depth k)`` recurrence therefore needs one cache per depth
-(``K_{l,k}(t), V_{l,k}(t)`` plus the linear-attention conv/recurrent state), not
-a single cache. ``LoopDepthCache`` presents these K caches to ``generate()`` as
-one ``Cache`` object while routing each depth pass to its own inner cache.
+Position ``t`` does not change across depths, so the M-RoPE / ``position_ids``
+are identical for all K passes and are computed once. ``LoopDepthCache`` presents
+these K caches to ``generate()`` as one ``Cache`` while routing each depth pass to
+its own inner cache.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ from types import MethodType
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from models.qwen35 import unwrap_model, unwrap_qwen_core
 
@@ -89,6 +93,19 @@ def is_looped(model) -> bool:
     except RuntimeError:
         return False
     return hasattr(tm, "_loop_original_forward")
+
+
+def set_loop_steps(model, steps: int) -> int:
+    """Runtime change of the recurrent depth K (curriculum / diagnostics).
+
+    Must be called after ``enable_looped_qwen`` (which installs the patch).
+    Returns the effective (clamped) step count.
+    """
+    tm = get_qwen_text_model(model)
+    if not hasattr(tm, "_loop_original_forward"):
+        raise RuntimeError("looped Qwen is not enabled; call enable_looped_qwen first")
+    tm._loop_steps = max(1, int(steps))
+    return tm._loop_steps
 
 
 class LoopDepthCache(Cache):
@@ -201,28 +218,23 @@ def _repeat_cache_layer_batch(layer, repeats: int) -> None:
                     states[i] = st.repeat_interleave(repeats, dim=0)
 
 
-def _last_hidden(out, return_dict: bool):
-    if return_dict:
-        return out.last_hidden_state
-    return out[0]
-
-
 def enable_looped_qwen(model, cfg: dict):
-    """Patch ``language_model.forward`` to run the same stack ``steps`` times.
+    """Patch ``language_model.forward`` to run the decoder layers ``steps`` times.
 
-    No new Transformer block is created; all loop iterations share exactly the
-    same parameters, including the same LoRA parameters. Calling this again only
-    updates the step count (idempotent, no double patching).
+    ``F_theta = L_N o ... o L_1`` (decoder layers only); the final RMSNorm is
+    applied ONCE after the K-th pass: ``H_out = Norm(H^(K))``. All K passes share
+    one set of parameters (including LoRA). Re-entry only updates the step count
+    (idempotent, no double patching). ``steps=1`` still installs the patch so the
+    K=1 forward is bit-comparable to the original stack (a required unit test).
 
     With ``use_cache=True`` (generation) each depth pass is routed to its own
     inner ``DynamicCache`` inside a ``LoopDepthCache``; with ``use_cache=False``
     (teacher-forcing) the full sequence is recomputed per depth with no cache.
     """
-    steps = loop_steps(cfg)
-
-    if steps <= 1:
+    if not loop_enabled(cfg):
         return model
 
+    steps = loop_steps(cfg)
     text_model = get_qwen_text_model(model)
 
     # Avoid double patching: capture the ORIGINAL forward only once.
@@ -235,6 +247,8 @@ def enable_looped_qwen(model, cfg: dict):
     text_model._loop_original_forward = original_forward
     text_model._loop_steps = steps
     text_model._last_loop_stats = {}
+    text_model._last_loop_states = None
+    text_model._capture_loop_states = False
 
     def looped_forward(
         self,
@@ -247,13 +261,23 @@ def enable_looped_qwen(model, cfg: dict):
         **kwargs,
     ):
         K = int(self._loop_steps)
-        return_dict = bool(kwargs.get("return_dict", True))
 
-        # Resolve the per-depth cache. On the prefill step generate() may hand us
-        # a freshly-created (empty) DynamicCache; replace it with a LoopDepthCache
-        # holding K inner caches. On decode steps generate() hands back the exact
-        # LoopDepthCache we returned, so it is reused directly.
-        if isinstance(past_key_values, LoopDepthCache):
+        # Exactly one of input_ids / inputs_embeds.
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        # Mirror merge_with_config_defaults: default use_cache from config, and
+        # force it off under gradient checkpointing in training mode.
+        if use_cache is None:
+            use_cache = bool(getattr(self.config, "use_cache", False))
+        if getattr(self, "gradient_checkpointing", False) and self.training and use_cache:
+            use_cache = False
+
+        # ---- 1. K independent caches ----
+        if isinstance(past_key_values, LoopDepthCache) and past_key_values._depth_count == K:
             loop_cache = past_key_values
             depth_caches = past_key_values.depth_caches
         elif use_cache:
@@ -263,49 +287,81 @@ def enable_looped_qwen(model, cfg: dict):
             loop_cache = None
             depth_caches = [None] * K
 
-        # ----- depth 0: normal forward on the embedded input -----
-        out = original_forward(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=depth_caches[0],
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
+        # ---- 2. position ids (M-RoPE). Token-position, NOT depth-position, so a
+        # single set is shared by all K passes. Depth-0 cache length == every
+        # depth's length. ----
+        if position_ids is None:
+            past_seen_tokens = depth_caches[0].get_seq_length() if depth_caches[0] is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
-        hidden = _last_hidden(out, return_dict)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            rope_position_ids = position_ids[1:]
+        else:
+            text_position_ids = None
+            rope_position_ids = position_ids
 
+        # ---- 3. build masks once (all depths share the same sequence length) ----
+        if not isinstance(attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": depth_caches[0],
+                "position_ids": text_position_ids,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+            }
+        else:
+            causal_mask_mapping = attention_mask
+
+        # ---- 4. RoPE is token-position dependent, shared across depths ----
+        position_embeddings = self.rotary_emb(inputs_embeds, rope_position_ids)
+
+        # ---- 5. TRUE recurrent depth: same layers, same weights, NO final norm
+        # between recurrent steps. ----
+        hidden = inputs_embeds
+        capture = bool(getattr(self, "_capture_loop_states", False))
+        states = [] if capture else None
         deltas, norms, cosines = [], [], []
 
-        # ----- depth 1..K-1: feed last hidden state as next embeds -----
-        for k in range(1, K):
-            previous = hidden
+        for depth in range(K):
+            prev_hidden = hidden
+            depth_cache = depth_caches[depth]
 
-            out = original_forward(
-                input_ids=None,
-                inputs_embeds=hidden,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=depth_caches[k],
-                use_cache=use_cache,
-                **kwargs,
-            )
+            for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+                hidden = decoder_layer(
+                    hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+                    position_ids=text_position_ids,
+                    past_key_values=depth_cache,
+                    use_cache=use_cache,
+                    **kwargs,
+                )
 
-            hidden = _last_hidden(out, return_dict)
+            if capture:
+                states.append(hidden)
 
             # Diagnostics only; no gradient flows through the statistics.
-            with torch.no_grad():
-                h = hidden.detach().float()
-                p = previous.detach().float()
-                num = (h - p).norm(dim=-1).mean()
-                den = p.norm(dim=-1).mean().clamp(min=1e-6)
-                deltas.append(float((num / den).item()))
+            if depth > 0:
+                with torch.no_grad():
+                    h = hidden.detach().float()
+                    p = prev_hidden.detach().float()
+                    num = (h - p).norm(dim=-1).mean()
+                    den = p.norm(dim=-1).mean().clamp(min=1e-6)
+                    deltas.append(float((num / den).item()))
+                    cos = torch.nn.functional.cosine_similarity(h, p, dim=-1).mean()
+                    cosines.append(float(cos.item()))
+                    norms.append(float(h.norm(dim=-1).mean().item()))
 
-                norms.append(float(h.norm(dim=-1).mean().item()))
-
-                cos = (h * p).sum(dim=-1) / (h.norm(dim=-1) * p.norm(dim=-1)).clamp(min=1e-6)
-                cosines.append(float(cos.mean().item()))
+        # ---- 6. final RMSNorm ONCE ----
+        hidden = self.norm(hidden)
 
         self._last_loop_stats = {
             "steps": K,
@@ -313,11 +369,15 @@ def enable_looped_qwen(model, cfg: dict):
             "norms": norms,
             "cosines": cosines,
         }
+        if capture:
+            self._last_loop_states = states
+        else:
+            self._last_loop_states = None
 
-        if use_cache and loop_cache is not None:
-            out.past_key_values = loop_cache
-
-        return out
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden,
+            past_key_values=loop_cache if use_cache else None,
+        )
 
     text_model.forward = MethodType(looped_forward, text_model)
     return model

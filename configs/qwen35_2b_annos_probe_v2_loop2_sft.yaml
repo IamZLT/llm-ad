@@ -133,6 +133,11 @@ outcome:
   loop:
     enabled: true
     steps: 2
+    curriculum:
+      enabled: true
+      schedule:
+      - 1
+      - 2
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30

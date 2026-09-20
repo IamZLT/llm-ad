@@ -156,6 +156,13 @@ def _vision_ctx(model, batch):
             model, adapter, region_raw_from_batch(batch), int(batch['region_token_id'])))
     else:
         stack.enter_context(nullcontext())
+    # H-memory cross-attention (no-op when h_memory is absent or h_map is missing).
+    from models.h_memory import bind_h_cross_attn
+    h_mem = getattr(unwrap_model(model), 'h_memory', None)
+    if h_mem is not None and batch.get('h_map') is not None:
+        stack.enter_context(bind_h_cross_attn(model, h_mem, batch['h_map']))
+    else:
+        stack.enter_context(nullcontext())
     return stack
 
 

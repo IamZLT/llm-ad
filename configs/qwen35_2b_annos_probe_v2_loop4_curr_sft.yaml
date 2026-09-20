@@ -1,17 +1,18 @@
-# Internal-Loop (latent-space recurrent-depth) SFT.
-# Loop-4 = F_theta applied 4x inside the language stack, no external FSM stages.
-# Only the <answer> JSON is supervised (answer_only); U/C/L/V are NOT trained.
-# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_sft.yaml \
-#        --output-dir outputs/train/region_sft_loop4 --epochs 1 --num-gpu 1
+# Internal-Loop (latent-space recurrent-depth) SFT, depth curriculum chain: Direct -> Loop2 -> Loop4.
+# Loop4_curr starts from the TRAINED Loop2 checkpoint (true depth curriculum), then trains K=4.
+# The RegionAdapter is frozen via --freeze-region-adapter so only the LoRA trains.
+# Run: python train_region_sft.py --config configs/qwen35_2b_annos_probe_v2_loop4_curr_sft.yaml \
+#        --init-sft outputs/train/region_sft_loop2_from_direct --freeze-region-adapter \
+#        --output-dir outputs/train/region_sft_loop4_curr --epochs 1 --num-gpu 1
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2_loop4
+  run_name: qwen35_2b_annos_probe_v2_loop4_curr
   auto_create_output_dir: true
 tensorboard:
-  port: 5011
+  port: 5016
   host: 0.0.0.0
   log_every_n_steps: 10
   vis_every_n_steps: 20
@@ -133,12 +134,6 @@ outcome:
   loop:
     enabled: true
     steps: 4
-    curriculum:
-      enabled: true
-      schedule:
-      - 1
-      - 2
-      - 4
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -160,7 +155,7 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_loop4
+  sft_adapter: outputs/train/region_sft_loop4_curr
   final_test: false
   prior:
     condition: real

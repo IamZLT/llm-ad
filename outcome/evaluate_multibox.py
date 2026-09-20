@@ -116,6 +116,7 @@ def summarize(rows):
     abnormal = [r for r in rows if r['is_anomaly']]
     recall = mean(r['pred'] is True for r in abnormal)
     tnr = mean(r['pred'] is False for r in normal)
+    abnormal_tp = [r for r in abnormal if r['pred'] is True and r['task_valid']]
     out = dict(n=len(rows), n_anomaly=len(abnormal), n_normal=len(normal),
         task_valid_rate=mean(r['task_valid'] for r in rows),
         protocol_core_rate=mean(r['protocol_core'] for r in rows),
@@ -125,6 +126,12 @@ def summarize(rows):
         anomaly_recall=recall, normal_fpr=mean(r['pred'] is True for r in normal),
         normal_correct_rate=tnr,
         invalid_decision_rate=mean(r['pred'] is None for r in rows),
+        anomaly_invalid_rate=mean(r['pred'] is None for r in abnormal),
+        normal_invalid_rate=mean(r['pred'] is None for r in normal),
+        anomaly_valid_recall=mean(r['pred'] is True and r['task_valid'] for r in abnormal),
+        mask_miou_given_tp=mean(r['mask_iou'] for r in abnormal_tp),
+        union_miou_given_tp=mean(r['union_iou'] for r in abnormal_tp),
+        matched_miou_given_tp=mean(r['matched_miou'] for r in abnormal_tp if r.get('matched_miou') is not None),
         balanced_accuracy=(recall+tnr)/2 if recall is not None and tnr is not None else None,
         mask_miou=mean(r['mask_iou'] for r in abnormal),
         mask_acc_at_05=mean(r['mask_iou'] >= .5 for r in abnormal),
@@ -169,6 +176,7 @@ def summarize(rows):
         mean_num_components=mean(r['num_components'] for r in abnormal))
     for size in ('small','medium','large'):
         subset = [r for r in abnormal if r['size_bin'] == size]
+        tp = [r for r in subset if r['pred'] is True and r['task_valid']]
         out[f'n_{size}'] = len(subset)
         out[f'mask_miou_{size}'] = mean(r['mask_iou'] for r in subset)
         out[f'matched_miou_{size}'] = mean(r['matched_miou'] for r in subset if r.get('matched_miou') is not None)
@@ -176,6 +184,18 @@ def summarize(rows):
         out[f'union_miou_{size}'] = mean(r['union_iou'] for r in subset)
         out[f'det_f1_at_50_{size}'] = mean(r['det_f1_at_50'] for r in subset if r.get('det_f1_at_50') is not None)
         out[f'det_f1_at_75_{size}'] = mean(r['det_f1_at_75'] for r in subset if r.get('det_f1_at_75') is not None)
+        # FSM recall and localization conditioned on true-positive detection, per size.
+        out[f'anomaly_recall_{size}'] = mean(r['pred'] is True for r in subset)
+        out[f'mask_miou_{size}_given_tp'] = mean(r['mask_iou'] for r in tp)
+        out[f'matched_miou_{size}_given_tp'] = mean(r['matched_miou'] for r in tp if r.get('matched_miou') is not None)
+        out[f'union_miou_{size}_given_tp'] = mean(r['union_iou'] for r in tp)
+        # Frozen H proposal recall: does the prior hit GT at all, per size?
+        out[f'prior_recall_at_01_{size}'] = mean((r['iou_h_bestk'] or 0.0) >= .1 for r in subset)
+        out[f'prior_recall_at_03_{size}'] = mean((r['iou_h_bestk'] or 0.0) >= .3 for r in subset)
+        out[f'prior_component_recall_at_01_{size}'] = mean(
+            r['prior_component_recall_at_01'] for r in subset if r.get('prior_component_recall_at_01') is not None)
+        out[f'mean_iou_h_top1_{size}'] = mean(r['iou_h_top1'] for r in subset if r['iou_h_top1'] is not None)
+        out[f'mean_iou_h_bestk_{size}'] = mean(r['iou_h_bestk'] for r in subset if r['iou_h_bestk'] is not None)
     for cb in ('single','multi'):
         subset = [r for r in abnormal if r['component_bin'] == cb]
         out[f'n_{cb}'] = len(subset)
@@ -186,6 +206,12 @@ def summarize(rows):
         out[f'recall_at_05_{cb}'] = mean(r['recall_at_05'] for r in subset if r.get('recall_at_05') is not None)
         out[f'det_f1_at_50_{cb}'] = mean(r['det_f1_at_50'] for r in subset if r.get('det_f1_at_50') is not None)
         out[f'det_f1_at_75_{cb}'] = mean(r['det_f1_at_75'] for r in subset if r.get('det_f1_at_75') is not None)
+        # Conditional on true-positive (recall-correct) anomaly detection.
+        tp = [r for r in subset if r['pred'] is True and r['task_valid']]
+        out[f'anomaly_recall_{cb}'] = mean(r['pred'] is True for r in subset)
+        out[f'mask_miou_{cb}_given_tp'] = mean(r['mask_iou'] for r in tp)
+        out[f'matched_miou_{cb}_given_tp'] = mean(r['matched_miou'] for r in tp if r.get('matched_miou') is not None)
+        out[f'union_miou_{cb}_given_tp'] = mean(r['union_iou'] for r in tp)
     for key in ('image_count','prompt_tokens','visual_tokens','prior_hint_tokens','zoom_n_crops'):
         out[f'mean_{key}'] = mean(r[key] for r in rows if r.get(key) is not None)
     by_class = defaultdict(list)
@@ -274,7 +300,7 @@ def stratified_eval_indices(dataset, count: int, seed: int = 42):
     return picked[:count]
 
 
-def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, writer=None, step=0, namespace='dev'):
+def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, writer=None, step=0, namespace='dev', indices=None):
     count = len(dataset) if limit is None else min(int(limit), len(dataset))
     if count <= 0:
         raise ValueError('evaluation split/limit must be nonempty')
@@ -285,7 +311,12 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     max_boxes = int(cfg['outcome'].get('max_boxes', 16))
-    indices = stratified_eval_indices(dataset, count, seed=int(cfg['training']['seed']))
+    if indices is None:
+        indices = stratified_eval_indices(dataset, count, seed=int(cfg['training']['seed']))
+    else:
+        # Caller supplies an explicit (already stratified / sharded) index list.
+        indices = list(indices)
+        count = len(indices)
     t_start = time.perf_counter()
     staged = bool((cfg.get('grpo') or {}).get('staged_rollout', False))
     with output_path.with_suffix('.jsonl').open('w') as stream:

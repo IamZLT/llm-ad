@@ -38,12 +38,17 @@ from torch.utils.tensorboard import SummaryWriter
 from data.prior_dataset import build_train_ref_pool
 from data.scan import load_prior_split, split_holdout_by_class
 from models.anomaly_prior import AnomalyPrior
-from models.looped_qwen import enable_looped_qwen
+from models.looped_qwen import enable_looped_qwen, loop_enabled, set_loop_steps
 from models.lora import apply_lora
 from models.qwen35 import (setup_model_and_processor, freeze_vision_encoder, force_vision_eval,
                            unwrap_model, print_trainable_params)
-from models.region_adapter import build_region_adapter
-from models.region_injection import bind_region_injection, ensure_region_token, region_raw_from_batch, save_region_adapter
+from models.region_adapter import RegionAdapter, build_region_adapter
+from models.region_injection import (bind_region_injection, ensure_region_token, load_region_adapter,
+                                     region_raw_from_batch, save_region_adapter)
+from models.h_prior_adapter import (build_h_prior_adapter, load_h_prior_adapter,
+                                    save_h_prior_adapter, HPriorAdapter)
+from models.h_memory import (build_h_memory, load_h_memory, save_h_memory,
+                             bind_h_cross_attn, HMemory)
 from models.vision_cache import bind_cached_image_features
 from outcome.inputs import OutcomeCollator, OutcomeDataset
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
@@ -281,14 +286,26 @@ def _prior_candidate_boxes(meta: dict) -> list:
     return out
 
 
-def _ground_multibox(cands: list) -> str:
-    """H-hint boxes plus coarse location; empty list has no location suffix."""
-    if not cands:
+def _ground_multibox(cands: list, gt_boxes: list = None, source: str = 'h') -> str:
+    """Localize-stage boxes.
+
+    ``source='h'`` (default): the model reads out the H region hints
+    (``candidate_bboxes_2d`` = ``prior_candidates``). This teaches a "hints ->
+    coordinates" copy, which is exactly the H-shortcut we want to avoid for the
+    cross-attention PoC.
+
+    ``source='gt'``: ``candidate_bboxes_2d`` = the GT component boxes, so GT provides
+    the localization supervision and H is only a *conditioning prior* (prompt hints +
+    H-memory), never the training target.
+    """
+    boxes = gt_boxes if (source == 'gt' and gt_boxes is not None) else cands
+    if not boxes:
         return 'candidate_bboxes_2d=[]'
-    return f'candidate_bboxes_2d={cands}; {_where_join(cands)}'
+    return f'candidate_bboxes_2d={boxes}; {_where_join(boxes)}'
 
 
-def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False, answer_only: bool = False) -> str:
+def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False, answer_only: bool = False,
+                     localize_source: str = 'h') -> str:
     """Five-block target; category/boxes come from GT, process blocks summarize the chain.
 
     The process blocks and the answer ``description`` are sample-aware templates built
@@ -330,12 +347,15 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
     )
     if multibox:
         cands = _prior_candidate_boxes(meta)
-        ground = _ground_multibox(cands)
+        gt_boxes = []
         if is_anom:
             comps = list(meta.get('component_bboxes') or [])
             if not comps and meta.get('gt_box_px') is not None:
                 comps = [meta['gt_box_px']]
-            boxes = _boxes_to_1000(comps, meta['orig_size'])
+            gt_boxes = _boxes_to_1000(comps, meta['orig_size'])
+        ground = _ground_multibox(cands, gt_boxes, source=localize_source)
+        if is_anom:
+            boxes = gt_boxes
             n = len(boxes)
             n_txt = _region_count(n)
             where = _where_join(boxes)
@@ -469,6 +489,24 @@ def default_batch_size(arch: str) -> int:
     return 8
 
 
+def loop_steps_for_epoch(cfg: dict, epoch: int) -> int:
+    """Recurrent depth K for a training epoch (depth curriculum for the Internal-Loop).
+
+    When ``outcome.loop.curriculum.enabled`` is true, ``schedule`` maps epoch i to
+    its depth (e.g. ``[1, 2, 4]`` -> K=1, then 2, then 4). The final entry repeats
+    for any further epochs. Without a curriculum this is just ``outcome.loop.steps``.
+    """
+    lc = (cfg.get("outcome") or {}).get("loop", {}) or {}
+    curriculum = lc.get("curriculum") or {}
+    if not curriculum.get("enabled", False):
+        return int(lc.get("steps", 1))
+    schedule = curriculum.get("schedule") or []
+    if not schedule:
+        return int(lc.get("steps", 1))
+    idx = min(int(epoch) - 1, len(schedule) - 1)
+    return max(1, int(schedule[idx]))
+
+
 def shard_indices(n, epoch, seed, rank, world, batch_size, device):
     """Rank shard of a shuffled epoch, truncated so every rank has the same step count."""
     rng = random.Random(int(seed) + int(epoch))
@@ -521,14 +559,15 @@ def _stack_gen_in(singles, max_len):
     return out
 
 
-def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False, answer_only=False):
+def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False, answer_only=False,
+                   localize_source='h'):
     """Collate one-at-a-time (vision cache is per-pair), then pad a language batch."""
     singles, seqs, labels_list, targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         prompt_ids = batch['input_ids'][0].tolist()
         target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking,
-                                  answer_only=answer_only)
+                                  answer_only=answer_only, localize_source=localize_source)
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
         labels_list.append(build_labels(prompt_ids, target_ids, target_text=target,
                                         tokenizer=tokenizer, thinking=thinking))
@@ -557,8 +596,10 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
             ref=torch.cat([b['region_ref'] for b in singles], dim=1),
             geom=torch.cat([b['region_geom'] for b in singles], dim=1),
             hstat=torch.cat([b['region_hstat'] for b in singles], dim=1),
+            hpatch=torch.cat([b['region_hpatch'] for b in singles], dim=1),
             valid=torch.cat([b['region_valid'] for b in singles], dim=1),
         ),
+        h_maps=[b['h_map'] for b in singles if b.get('h_map') is not None],
         metas=[b['_meta'][0] for b in singles],
         targets=targets,
         seq_lens=[len(s) for s in seqs],
@@ -566,12 +607,27 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
     return packed, int((labels_t != -100).sum())
 
 
-def load_sft_model(cfg, device):
+def load_sft_model(cfg, device, init_sft=None, freeze_region=False, freeze_lora=False,
+                   freeze_h_prior=False, freeze_h_memory=False):
+    """Load the base model + (optional) LoRA + region adapter + H-prior adapter for SFT.
+
+    ``init_sft`` starts from an existing region-SFT checkpoint (LoRA via
+    ``PeftModel``, region adapter from ``region_adapter.pt``) so branches can share
+    a common Direct-SFT start point instead of re-training the RegionAdapter.
+    ``freeze_region`` keeps that loaded adapter frozen (only the LoRA trains).
+    ``freeze_lora`` freezes the LoRA loaded via ``init_sft`` (used for the mechanism
+    probe that trains only the HPriorAdapter).
+    ``freeze_h_prior`` freezes the HPriorAdapter (default: trainable when enabled).
+    """
     if device.type == 'cuda':
         torch.cuda.set_device(device)
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
     ensure_region_token(processor, model)
-    model = apply_lora(model, cfg)
+    if init_sft:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, init_sft, is_trainable=not freeze_lora)
+    else:
+        model = apply_lora(model, cfg)
     enable_looped_qwen(model, cfg)
     freeze_vision_encoder(model)
     model.to(device)
@@ -582,20 +638,83 @@ def load_sft_model(cfg, device):
     prior = AnomalyPrior.from_qwen(model, cfg)
     feature_dim = int(prior.visual.config.hidden_size)
     hidden_size = int(model.config.text_config.hidden_size)
-    model.region_adapter = build_region_adapter(cfg, feature_dim, hidden_size)
+    if init_sft:
+        region_path = Path(init_sft) / 'region_adapter.pt'
+        if not region_path.exists():
+            raise ValueError(f'region adapter missing in --init-sft dir: {region_path}')
+        model.region_adapter = load_region_adapter(RegionAdapter, region_path, feature_dim, hidden_size)
+    else:
+        model.region_adapter = build_region_adapter(cfg, feature_dim, hidden_size)
     # The adapter is created after model.to(device): sync it explicitly or the SFT
     # forward will hit a CPU/FP32 vs GPU/BF16 mismatch.
     dtype = next(model.parameters()).dtype
     model.region_adapter.to(device=device, dtype=dtype)
-    print_trainable_params(model, note='LoRA + region adapter，视觉塔已冻结')
+    if freeze_region:
+        for p in model.region_adapter.parameters():
+            p.requires_grad = False
+        model.region_adapter.eval()
+
+    # Optional H-prior side channel. When enabled it is trainable by default (this is
+    # the PoC module under test); --freeze-h-prior keeps it frozen.
+    hcfg = (cfg.get('outcome') or {}).get('h_prior_adapter') or {}
+    model.h_prior_adapter = None
+    if bool(hcfg.get('enabled', False)):
+        if init_sft:
+            h_path = Path(init_sft) / 'h_prior_adapter.pt'
+            if h_path.exists():
+                model.h_prior_adapter = load_h_prior_adapter(HPriorAdapter, h_path, hidden_size)
+            else:
+                model.h_prior_adapter = build_h_prior_adapter(cfg, hidden_size)
+        else:
+            model.h_prior_adapter = build_h_prior_adapter(cfg, hidden_size)
+        model.h_prior_adapter.to(device=device, dtype=dtype)
+        if freeze_h_prior:
+            for p in model.h_prior_adapter.parameters():
+                p.requires_grad = False
+            model.h_prior_adapter.eval()
+
+    # Optional Spatial H-Memory cross-attention. Trainable by default (the PoC module
+    # under test); --freeze-h-memory keeps it frozen (e.g. joint LoRA ablation).
+    hmcfg = (cfg.get('outcome') or {}).get('h_memory') or {}
+    model.h_memory = None
+    if bool(hmcfg.get('enabled', False)):
+        if init_sft:
+            hm_path = Path(init_sft) / 'h_memory.pt'
+            if hm_path.exists():
+                model.h_memory = load_h_memory(HMemory, hm_path, hidden_size)
+            else:
+                model.h_memory = build_h_memory(cfg, hidden_size)
+        else:
+            model.h_memory = build_h_memory(cfg, hidden_size)
+        model.h_memory.to(device=device, dtype=dtype)
+        if freeze_h_memory:
+            for p in model.h_memory.parameters():
+                p.requires_grad = False
+            model.h_memory.eval()
+
+    parts = ['LoRA']
+    if freeze_lora and init_sft:
+        parts = ['冻结 LoRA']
+    if freeze_region:
+        parts.append('冻结 region adapter')
+    else:
+        parts.append('region adapter')
+    if model.h_prior_adapter is not None:
+        parts.append('冻结 HPriorAdapter' if freeze_h_prior else 'HPriorAdapter')
+    if model.h_memory is not None:
+        parts.append('冻结 HMemory' if freeze_h_memory else 'HMemory')
+    note = ' + '.join(parts) + '（视觉塔已冻结）'
+    print_trainable_params(model, note=note)
     return model, processor, prior
 
 
 def batch_loss(model, packed, backward_scale=None):
     """Teacher-forced CE on a packed batch. Backward stays inside the bind contexts."""
     adapter = getattr(unwrap_model(model), 'region_adapter', None)
+    h_mem = getattr(unwrap_model(model), 'h_memory', None)
     with bind_cached_image_features(model, packed['image_embeds']), \
-            bind_region_injection(model, adapter, packed['region_raw'], int(packed['region_token_id'])):
+            bind_region_injection(model, adapter, packed['region_raw'], int(packed['region_token_id'])), \
+            bind_h_cross_attn(model, h_mem, packed.get('h_maps')):
         out = forward_with_vision(model, packed['gen_in'], packed['input_ids'], packed['attention_mask'])
         shift_logits = out.logits[:, :-1, :].contiguous()
         shift_labels = packed['labels'][:, 1:].contiguous()
@@ -606,7 +725,7 @@ def batch_loss(model, packed, backward_scale=None):
     return loss
 
 
-def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False):
+def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False, localize_source='h'):
     """Mean teacher-forced loss on the holdout split (no update).
 
     Every rank evaluates an equal-length disjoint shard using the unwrapped module
@@ -631,7 +750,7 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     total = 0.0
     with torch.no_grad():
         for i in shard:
-            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking, answer_only)
+            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking, answer_only, localize_source)
             total += float(batch_loss(raw, packed))
     count = len(shard)
     if world > 1:
@@ -663,6 +782,35 @@ def _save_adapter(model, processor, path: Path):
     core.save_pretrained(path)
     processor.save_pretrained(path)
     save_region_adapter(getattr(core, 'region_adapter', None), path / 'region_adapter.pt')
+    save_h_prior_adapter(getattr(core, 'h_prior_adapter', None), path / 'h_prior_adapter.pt')
+    save_h_memory(getattr(core, 'h_memory', None), path / 'h_memory.pt')
+
+
+def _build_optimizer(model, args):
+    """AdamW over trainable params; the HPriorAdapter scalar gate gets its own LR.
+
+    The alpha gate is zero-initialized for exact baseline parity, which mutes the
+    conv/proj gradients (dR'/dW ∝ tanh(alpha)). A separate, larger gate LR lets
+    alpha turn on first so the rest of the module can receive meaningful gradients.
+    """
+    base_lr = float(args.lr)
+    gate_lr = float(args.gate_lr) if args.gate_lr is not None else base_lr
+    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    if gate_lr == base_lr:
+        return torch.optim.AdamW([p for _, p in trainable], lr=base_lr, weight_decay=0.0)
+
+    def _is_gate(name: str) -> bool:
+        if name.endswith('h_prior_adapter.alpha'):
+            return True
+        return '.cross_attns.' in name and name.endswith('.gate')
+
+    gate = [p for n, p in trainable if _is_gate(n)]
+    rest = [p for n, p in trainable if not _is_gate(n)]
+    groups = [{'params': rest, 'lr': base_lr}]
+    if gate:
+        groups.append({'params': gate, 'lr': gate_lr})
+    print(f'[opt] gate_lr={gate_lr} (base={base_lr}) gate_params={len(gate)} rest={len(rest)}', flush=True)
+    return torch.optim.AdamW(groups, weight_decay=0.0)
 
 
 def main():
@@ -680,6 +828,22 @@ def main():
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--dev-eval-samples', type=int, default=64,
                         help='holdout samples for the dev loss reported at each epoch end; 0 disables')
+    parser.add_argument('--init-sft', default=None,
+                        help='start from an existing region-SFT checkpoint (LoRA + region adapter) '
+                             'so mechanism branches share a common Direct-SFT start point')
+    parser.add_argument('--freeze-region-adapter', action='store_true',
+                        help='freeze the region adapter loaded via --init-sft (only LoRA trains)')
+    parser.add_argument('--freeze-lora', action='store_true',
+                        help='freeze the LoRA loaded via --init-sft (used for the mechanism probe '
+                             'that trains only the HPriorAdapter)')
+    parser.add_argument('--freeze-h-prior', action='store_true',
+                        help='freeze the HPriorAdapter (trainable by default when enabled)')
+    parser.add_argument('--freeze-h-memory', action='store_true',
+                        help='freeze the HMemory cross-attn (trainable by default when enabled)')
+    parser.add_argument('--gate-lr', type=float, default=None,
+                        help='separate LR for the HPriorAdapter alpha gate (scalar). '
+                             'Defaults to --lr; a larger value is needed because the zero-init gate '
+                             'mutes the conv/proj gradients at alpha=0.')
     args = parser.parse_args()
     _maybe_relaunch_multi_gpu(args.num_gpu)
 
@@ -705,7 +869,11 @@ def main():
     dataset_cls = OutcomeMultiboxDataset if multibox else OutcomeDataset
     collator_cls = OutcomeMultiboxCollator if multibox else OutcomeCollator
 
-    model, processor, prior = load_sft_model(cfg, device)
+    model, processor, prior = load_sft_model(cfg, device, init_sft=args.init_sft,
+                                             freeze_region=args.freeze_region_adapter,
+                                             freeze_lora=args.freeze_lora,
+                                             freeze_h_prior=args.freeze_h_prior,
+                                             freeze_h_memory=args.freeze_h_memory)
     if world > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
                     find_unused_parameters=False)
@@ -713,6 +881,9 @@ def main():
     thinking = thinking_enabled(cfg)
     reasoning_mode = str((cfg.get('outcome') or {}).get('reasoning_mode', 'fsm'))
     answer_only = reasoning_mode in ('loop', 'direct')
+    localize_source = str((cfg.get('outcome') or {}).get('sft', {}).get('localize_target', 'h'))
+    if localize_source not in ('h', 'gt'):
+        raise ValueError(f"outcome.sft.localize_target must be 'h' or 'gt', got {localize_source!r}")
 
     train, test = load_prior_split(cfg)
     train, dev = split_holdout_by_class(train, float(cfg['data']['holdout_ratio']),
@@ -726,7 +897,7 @@ def main():
         dev_dataset = dataset_cls(dev, cfg, processor, 'eval', pool)
 
     collator = collator_cls(processor, prior, cfg)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(args.lr), weight_decay=0.0)
+    opt = _build_optimizer(model, args)
 
     output_dir = Path(args.output_dir)
     tb_cfg = cfg.get('tensorboard') or {}
@@ -759,13 +930,19 @@ def main():
     window_samples = 0
     try:
         for epoch in range(1, total_epochs + 1):
+            if loop_enabled(cfg):
+                k = loop_steps_for_epoch(cfg, epoch)
+                set_loop_steps(model, k)
+                writer.add_scalar('train/loop_steps', k, step)
+                if main_proc:
+                    print(f'[sft] recurrent depth K={k}', flush=True)
             model.train()
             force_vision_eval(model)
             indices = shard_indices(len(dataset), epoch, seed, rank, world, batch_size, device)
             for start in range(0, len(indices), batch_size):
                 started = time.perf_counter()
                 samples = [dataset[i] for i in indices[start:start + batch_size]]
-                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking, answer_only)
+                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking, answer_only, localize_source)
                 loss = batch_loss(model, packed, backward_scale=1.0 / accum)
                 running_loss += float(loss.detach())
                 running_supervised += n_sup
@@ -788,15 +965,29 @@ def main():
                     writer.add_scalar('train/lr', float(args.lr), step)
                     writer.add_scalar('train/epoch', epoch, step)
                     writer.add_scalar('optimizer/grad_norm', grad_norm, step)
+                    hp = getattr(unwrap_model(model), 'h_prior_adapter', None)
+                    if hp is not None:
+                        writer.add_scalar('h_prior/alpha', float(hp.alpha.detach()), step)
+                        writer.add_scalar('h_prior/gate', float(torch.tanh(hp.alpha.detach())), step)
+                    hm = getattr(unwrap_model(model), 'h_memory', None)
+                    if hm is not None:
+                        gates = [torch.tanh(ca.gate.detach()) for ca in hm.cross_attns.values()]
+                        for i, g in enumerate(gates):
+                            writer.add_scalar(f'h_memory/gate_l{hm.layers[i]}', float(g), step)
+                        writer.add_scalar('h_memory/gate_mean', float(torch.stack(gates).mean()), step)
                     writer.add_scalar('train/seconds_per_step', seconds, step)
                     if device.type == 'cuda':
                         writer.add_scalar('train/gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 1024 ** 3, step)
                     writer.flush()
                     if main_proc and step % log_every == 0:
+                        alpha_s = ''
+                        hp = getattr(unwrap_model(model), 'h_prior_adapter', None)
+                        if hp is not None:
+                            alpha_s = f' alpha={float(hp.alpha.detach()):+.4f}(gate={float(torch.tanh(hp.alpha.detach())):+.3f})'
                         print(f'[sft] step={step} loss={running_loss / max(1, window_samples):.4f} '
                               f'supervised_tok={running_supervised} seq={seq_mean:.0f} '
                               f'anom={anomaly_frac:.2f} gnorm={grad_norm:.2f} '
-                              f'seen={seen * batch_size} ({seconds:.1f}s)', flush=True)
+                              f'seen={seen * batch_size} ({seconds:.1f}s){alpha_s}', flush=True)
                         running_loss = 0.0
                         running_supervised = 0
                         window_samples = 0
@@ -810,7 +1001,8 @@ def main():
             if dev_dataset is not None:
                 dev_loss, n_dev = evaluate_dev(model, collator, dev_dataset, device, tokenizer,
                                                multibox, int(args.dev_eval_samples), seed, epoch,
-                                               thinking=thinking, answer_only=answer_only)
+                                               thinking=thinking, answer_only=answer_only,
+                                               localize_source=localize_source)
                 writer.add_scalar('dev/loss', dev_loss, step)
                 writer.add_scalar('dev/n', n_dev, step)
                 writer.flush()

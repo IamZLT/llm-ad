@@ -73,6 +73,7 @@ def main():
     parser.add_argument('--mode', choices=['train','eval','predict'], default='train')
     parser.add_argument('--split', choices=['dev','test'], default='dev')
     parser.add_argument('--adapter', help='Evaluation/prediction LoRA; not an optimizer resume')
+    parser.add_argument('--sft-adapter', help='Override outcome.sft_adapter (point eval at a specific SFT branch checkpoint)')
     parser.add_argument('--resume-adapter', help='Train from this RL LoRA (weights only; optimizer resets)')
     parser.add_argument('--num-gpu', type=int, default=1)
     parser.add_argument('--max-attempts', type=int)
@@ -84,6 +85,8 @@ def main():
     args = parser.parse_args()
     cfg = load_yaml_config(args.config)
     cfg.setdefault('distributed', {})['num_gpu'] = args.num_gpu
+    if args.sft_adapter:
+        cfg.setdefault('outcome', {})['sft_adapter'] = args.sft_adapter
     if args.adapter and args.mode == 'train':
         parser.error('--adapter is evaluation only; use --resume-adapter to continue an RL LoRA')
     if args.resume_adapter and args.mode != 'train':

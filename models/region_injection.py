@@ -29,12 +29,13 @@ REGION_TENSOR_KEYS = (
     "region_ref",
     "region_geom",
     "region_hstat",
+    "region_hpatch",
     "region_valid",
 )
 
 # Fields the injection consumes; these must never be forwarded to the Qwen model as
 # unknown kwargs. ``model_inputs`` in rl/grpo.py reads this set.
-REGION_INPUT_KEYS = set(REGION_TENSOR_KEYS) | {"region_token_id"}
+REGION_INPUT_KEYS = set(REGION_TENSOR_KEYS) | {"region_token_id", "h_map"}
 
 
 def _embedding_consumer(model) -> nn.Module:
@@ -82,6 +83,7 @@ def region_raw_from_batch(batch: dict) -> Dict[str, torch.Tensor]:
         ref=batch["region_ref"],
         geom=batch["region_geom"],
         hstat=batch["region_hstat"],
+        hpatch=batch["region_hpatch"],
         valid=batch["region_valid"],
     )
 
@@ -143,6 +145,17 @@ def bind_region_injection(
     region_embeds = adapter(region_raw)
     if region_embeds.dim() == 3:
         region_embeds = region_embeds[0]
+    # Optional H-prior side channel (HPriorAdapter): a gated residual on the region
+    # embeddings. Looked up from the model so every call site (SFT/eval/RL) shares it
+    # without signature churn. Absent hpatch or a non-mounted adapter -> pure baseline.
+    h_adapter = getattr(unwrap_model(model), 'h_prior_adapter', None)
+    if h_adapter is not None and region_raw.get("hpatch") is not None:
+        region_embeds = h_adapter(
+            region_raw["hpatch"], region_embeds.unsqueeze(0),
+            valid=region_raw.get("valid"),
+        )
+        if region_embeds.dim() == 3:
+            region_embeds = region_embeds[0]
     orig = consumer.get_input_embeddings
     wrapper = _RegionScatterEmbedding(orig(), int(region_token_id), region_embeds)
     consumer.get_input_embeddings = lambda: wrapper
@@ -213,4 +226,41 @@ def attach_region_adapter(model, prior, cfg, sft_dir) -> nn.Module:
     dtype = next(model.parameters()).dtype
     adapter.to(device=device, dtype=dtype)
     model.region_adapter = adapter
+
+    # Optional H-prior side channel. Loaded from the same SFT dir; if enabled in the
+    # config but the weights are absent, raise loudly (a random init would corrupt the
+    # region embeddings via the gated residual).
+    h_adapter = attach_h_prior_adapter(model, cfg, sft_dir)
+    model.h_prior_adapter = h_adapter
+
+    # Optional Spatial H-Memory cross-attention (loaded from the same SFT dir).
+    from models.h_memory import attach_h_memory
+    model.h_memory = attach_h_memory(model, cfg, sft_dir)
+    return adapter
+
+
+def attach_h_prior_adapter(model, cfg, sft_dir):
+    """Load the (frozen) HPriorAdapter from ``sft_dir`` when enabled; else None."""
+    from models.h_prior_adapter import HPriorAdapter, load_h_prior_adapter
+
+    hc = (cfg.get("outcome", {}) or {}).get("h_prior_adapter", {}) or {}
+    if not bool(hc.get("enabled", False)):
+        return None
+    if not sft_dir:
+        raise ValueError(
+            "outcome.h_prior_adapter.enabled requires outcome.sft_adapter to locate its weights"
+        )
+    ckpt = Path(sft_dir) / "h_prior_adapter.pt"
+    if not ckpt.exists():
+        raise ValueError(
+            f"h_prior_adapter weights are missing: {ckpt}. Run train_region_sft.py first."
+        )
+    hidden_size = language_hidden_size(model)
+    adapter = load_h_prior_adapter(HPriorAdapter, ckpt, hidden_size)
+    for p in adapter.parameters():
+        p.requires_grad = False
+    adapter.eval()
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    adapter.to(device=device, dtype=dtype)
     return adapter
