@@ -28,8 +28,15 @@ def move_batch(batch: dict, device: torch.device) -> dict:
 
 
 def model_inputs(batch: dict) -> dict:
-    skip = {"labels", "_meta", "prompt_len", "image_embeds"} | REGION_INPUT_KEYS
-    return {k: v for k, v in batch.items() if k not in skip and torch.is_tensor(v)}
+    # Underscore-prefixed keys are internal transients (e.g. ``_h_H``, ``_meta``)
+    # that are consumed by injection contexts (``bind_h_vpt``) directly, never by
+    # the model's forward. Excluding them here matches ``move_batch``, which also
+    # treats ``_``-prefixed keys as non-model data. Without this, a leftover
+    # ``_h_H`` from a previous resample iteration leaks into ``generate(**kwargs)``
+    # and transformers rejects it as an unknown model kwarg.
+    skip = {"labels", "prompt_len", "image_embeds", "h_box_geom"} | REGION_INPUT_KEYS
+    return {k: v for k, v in batch.items()
+            if not k.startswith("_") and k not in skip and torch.is_tensor(v)}
 
 
 def expand_gen_in_for_group(gen_in: dict, group: int) -> dict:
@@ -60,13 +67,16 @@ def micro_batch_ranges(n: int, micro: int) -> List[Tuple[int, int]]:
     return [(s, min(s + micro, n)) for s in range(0, n, micro)]
 
 
-def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                        output_hidden_states: bool = False):
     """Keep processor vision tensors; pad mm_token_type_ids to generated length."""
     n = int(input_ids.shape[0])
     kwargs = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
     }
+    if output_hidden_states:
+        kwargs["output_hidden_states"] = True
     for k, v in gen_in.items():
         if k in ("input_ids", "attention_mask", "labels") or not torch.is_tensor(v):
             continue

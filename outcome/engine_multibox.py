@@ -26,7 +26,8 @@ from models.anomaly_prior import AnomalyPrior
 from models.looped_qwen import enable_looped_qwen, loop_enabled, loop_stats
 from models.lora import apply_lora
 from models.qwen35 import setup_model_and_processor, freeze_vision_encoder, force_vision_eval, unwrap_model
-from models.region_injection import attach_region_adapter, ensure_region_token, save_region_adapter
+from models.h_vpt import attach_h_vpt, ensure_control_token, save_h_vpt
+from models.h_box_prior import attach_h_box_prior, ensure_box_token, save_h_box_prior
 from outcome.evaluate_multibox import evaluate, make_record
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
 from outcome.policy import generate_group, generate_group_staged, group_advantages, optimize_group
@@ -70,7 +71,8 @@ def validate_config(cfg):
 def load_model(cfg, adapter=None, fresh_lora=True, resume_adapter=None):
     from peft import PeftModel
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
-    ensure_region_token(processor, model)
+    ensure_control_token(processor, model)
+    ensure_box_token(processor, model)
     sft = cfg.get('outcome', {}).get('sft_adapter')
     if sft:
         model = PeftModel.from_pretrained(model, sft, is_trainable=False).merge_and_unload()
@@ -97,7 +99,8 @@ def load_model(cfg, adapter=None, fresh_lora=True, resume_adapter=None):
         model.enable_input_require_grads()
     force_vision_eval(model)
     prior = AnomalyPrior.from_qwen(model, cfg)
-    attach_region_adapter(model, prior, cfg, sft)
+    attach_h_vpt(model, cfg, sft)
+    attach_h_box_prior(model, cfg, sft)
     return model, processor, prior
 
 
@@ -157,7 +160,27 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
         eval_set, eval_name = dev_set, 'dev'
     else:
         eval_set, eval_name = None, None
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=float(gc['learning_rate']), weight_decay=0.)
+    # H-VPT projector (when trainable) gets its own (larger) LR so the gate can
+    # actually open under reward pressure. The scalar gate + cross-attn weights
+    # barely move at the RL base LR (5e-6), which would leave the H channel
+    # effectively frozen despite being marked trainable.
+    h_vpt = getattr(unwrap_model(model), 'h_vpt', None)
+    hc = oc.get('h_vpt') or {}
+    h_vpt_lr = float(hc.get('lr', float(gc['learning_rate']) * 100.0))
+    if h_vpt is not None and any(p.requires_grad for p in h_vpt.projector.parameters()):
+        proj, rest = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            (proj if 'h_vpt.projector' in n else rest).append(p)
+        opt = torch.optim.AdamW(
+            [{'params': rest, 'lr': float(gc['learning_rate'])},
+             {'params': proj, 'lr': h_vpt_lr}], weight_decay=0.)
+        print(f'[multibox] h_vpt projector trainable: {len(proj)} params @ lr={h_vpt_lr} '
+              f'(base={gc["learning_rate"]})', flush=True)
+    else:
+        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                lr=float(gc['learning_rate']), weight_decay=0.)
     if main_proc:
         writer = SummaryWriter(str(Path(output_dir)/'tb'))
         writer.add_text('outcome/0_config', json.dumps({
@@ -198,7 +221,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 rollout_sec = 0.0
                 for resamples in range(max_group_resamples + 1):
                     t_gen = time.perf_counter()
-                    completions = generate_group_staged(model, processor, batch, cfg, group=int(gc['group_size']), sample=True) \
+                    completions = generate_group_staged(model, processor, batch, cfg, group=int(gc['group_size']), sample=True, step=attempt) \
                         if bool(gc.get('staged_rollout', False)) else \
                         generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
                     rollout_sec += time.perf_counter() - t_gen
@@ -241,6 +264,8 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     protocol_strict_rate=sum(p['protocol_strict'] for p in parsed)/len(parsed),
                     think_ok_rate=sum(bool(p.get('think_ok')) for p in parsed)/len(parsed),
                     think_filled_rate=sum(bool(p.get('think_filled')) for p in parsed)/len(parsed),
+                    reject_rate=sum(p.get('verify_action') == 'reject' for p in parsed)/len(parsed),
+                    reject_bonus_mean=sum(s.get('reject_bonus', 0.0) for s in scores)/len(scores),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
                 for s in ('U', 'C', 'L', 'V', 'ANSWER'):
                     hits = [float(c.stage_hits.get(s, False)) for c in completions]
@@ -256,9 +281,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     for i, c in enumerate(lstats.get('cosines') or [], start=2):
                         metrics[f'loop_cosine_{i}'] = float(c)
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
-                               prior_hint_tokens=meta['prior_hint_tokens'],
-                               mean_new_tokens=sum(len(c.ids)-int(batch['prompt_len'][0]) for c in completions)/len(completions),
-                               h_candidate_count=len(meta['prior_candidates']))
+                               mean_new_tokens=sum(len(c.ids)-int(batch['prompt_len'][0]) for c in completions)/len(completions))
                 # Average the per-sample metrics across ranks so TB/console show the
                 # global value; the counters (attempts/updates/skipped_total) are kept.
                 metrics = {k: (avg_across_ranks(float(v), device) if k not in ('attempts', 'updates', 'skipped_total') else v)
@@ -312,6 +335,11 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 def _f(v):
                     return f'{v:.3f}' if v is not None else '--'
 
+                h_gate = None
+                h_vpt_m = getattr(unwrap_model(model), 'h_vpt', None)
+                if h_vpt_m is not None:
+                    h_gate = float(torch.tanh(h_vpt_m.projector.gate).item())
+
                 if main_proc:
                     print(f'[multibox] a={attempt}/{attempts} up={updates} sk={skipped} '
                           f'rw={metrics["reward_mean"]:.3f} loc={_f(mean_loc)} lrng={loc_range:.4f} '
@@ -320,6 +348,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                           f'rs={resamples} tv={metrics["task_valid_rate"]:.2f} '
                           f'pc={metrics["protocol_core_rate"]:.2f} ps={metrics["protocol_strict_rate"]:.2f} '
                           f'tk={metrics["think_ok_rate"]:.2f} tok={metrics["mean_new_tokens"]:.0f} '
+                          f'hgate={_f(h_gate)} '
                           f'{loss_part} '
                           f'({time.perf_counter()-started:.1f}s)', flush=True)
                 every = int(cfg['training'].get('eval_every_n_steps', 0))
@@ -351,15 +380,19 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     if main_proc:
                         unwrap_model(model).save_pretrained(output_dir/f'checkpoint-{attempt}')
                         processor.save_pretrained(output_dir/f'checkpoint-{attempt}')
-                        save_region_adapter(getattr(unwrap_model(model), 'region_adapter', None),
-                                            output_dir/f'checkpoint-{attempt}'/'region_adapter.pt')
+                        save_h_vpt(getattr(unwrap_model(model), 'h_vpt', None),
+                                   output_dir/f'checkpoint-{attempt}'/'h_vpt.pt')
+                        save_h_box_prior(getattr(unwrap_model(model), 'h_box_prior', None),
+                                         output_dir/f'checkpoint-{attempt}'/'h_box_prior.pt')
                     if world > 1 and dist.is_initialized():
                         dist.barrier()
         if main_proc:
             unwrap_model(model).save_pretrained(output_dir/'adapter_final')
             processor.save_pretrained(output_dir/'adapter_final')
-            save_region_adapter(getattr(unwrap_model(model), 'region_adapter', None),
-                                output_dir/'adapter_final'/'region_adapter.pt')
+            save_h_vpt(getattr(unwrap_model(model), 'h_vpt', None),
+                       output_dir/'adapter_final'/'h_vpt.pt')
+            save_h_box_prior(getattr(unwrap_model(model), 'h_box_prior', None),
+                             output_dir/'adapter_final'/'h_box_prior.pt')
         if main_proc:
             (output_dir/'training_summary.json').write_text(json.dumps(dict(attempts=attempts,updates=updates,skipped=skipped), indent=2))
     finally:

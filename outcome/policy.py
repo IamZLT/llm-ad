@@ -10,7 +10,6 @@ from transformers import GenerationConfig, StoppingCriteriaList, StopStringCrite
 
 from models.qwen35 import force_vision_eval, unwrap_model
 from models.vision_cache import bind_cached_image_features
-from models.region_injection import bind_region_injection, has_region, region_raw_from_batch
 from rl.grpo import (clipped_pg_kl, disable_adapter_ctx, dropout_eval, expand_gen_in_for_group,
                      forward_with_vision, micro_batch_ranges, model_inputs, padded_completion_tensors,
                      token_logprobs, token_logprobs_nograd)
@@ -67,26 +66,41 @@ def group_advantages(rewards, scale=False, eps=1e-6):
 
 
 def _region_bind(model, batch):
-    """Region-token + H-memory injection context for one forward; no-op without adapters.
+    """VPT H-injection + H-Box geometry-token injection context for one forward.
 
     Returns a FRESH context manager on every call so it can be reused across the
     multiple ``with`` blocks inside ``optimize_group`` (a generator-based context
-    manager cannot be re-entered).
+    manager cannot be re-entered). ``batch['_h_H']`` / ``batch['_g_proj']`` are
+    produced by the staged rollout before generation / logprob.
+
+    When the HVPT projector is trainable (``h_vpt.trainable=gate_projector``), h_H
+    is *recomputed* here from the stored control-token hidden (``batch['_h_ctrl']``)
+    and H map so gradients flow to the projector during the actor forward. The
+    detached inputs are fine — the projector's own weights carry the gradient. In
+    the no-grad old/ref pass this recomputation is numerically identical to the
+    rollout value (projector weights are unchanged before the first update). The
+    H-Box geometry tokens are static (frozen projector), so ``_g_proj`` is reused
+    as-is.
     """
-    adapter = getattr(unwrap_model(model), 'region_adapter', None)
-    h_mem = getattr(unwrap_model(model), 'h_memory', None)
-    has_r = adapter is not None and has_region(batch)
-    has_h = h_mem is not None and batch.get('h_map') is not None
-    if not has_r and not has_h:
-        return nullcontext()
     stack = ExitStack()
-    if has_r:
-        stack.enter_context(bind_region_injection(
-            model, adapter, region_raw_from_batch(batch), int(batch['region_token_id'])))
-    if has_h:
-        from models.h_memory import bind_h_cross_attn
-        stack.enter_context(bind_h_cross_attn(model, h_mem, batch['h_map']))
-    return stack
+    from models.h_vpt import bind_h_vpt, compute_h_H
+    from models.h_box_prior import bind_h_box
+    bound = False
+    h_H = batch.get('_h_H')
+    h_vpt = getattr(unwrap_model(model), 'h_vpt', None)
+    if h_vpt is not None and any(p.requires_grad for p in h_vpt.projector.parameters()):
+        h_ctrl = batch.get('_h_ctrl')
+        h_map = batch.get('h_map')
+        if h_ctrl is not None and h_map is not None:
+            h_H = compute_h_H(h_vpt, h_map, h_ctrl)
+    if h_H is not None:
+        stack.enter_context(bind_h_vpt(model, h_H, int(batch['feat_token_id'])))
+        bound = True
+    g_proj = batch.get('_g_proj')
+    if g_proj is not None:
+        stack.enter_context(bind_h_box(model, g_proj, int(batch.get('box_token_id', -1))))
+        bound = True
+    return stack if bound else nullcontext()
 
 
 def generate_group(model, processor, batch, cfg, group=1, sample=False):
@@ -203,7 +217,7 @@ def _stop_reason_from_run(run) -> str:
     return 'error' if run.error else 'length'
 
 
-def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
+def generate_group_staged(model, processor, batch, cfg, group=1, sample=False, step=0):
     """GRPO rollout through the FSM (staged) decoder, batched per stage.
 
     Each completion carries ``sampled_mask`` so ``optimize_group`` can mask the
@@ -218,6 +232,16 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
     max_localize = gcfg.get('max_localize_tokens', None)
     if max_localize is not None:
         max_localize = int(max_localize)
+    # Confirm-reject reloop: [confirm]=reject -> distrust H, CONTINUE into a
+    # second pure-text [localize] pass. reject_logit_bias seeds exploration of the
+    # reject verdict (SFT teaches only keep/none) and decays to 0 over
+    # reject_bias_anneal_steps, after which reward.reject_weight takes over.
+    rlc = gcfg.get('confirm_reloop') or {}
+    confirm_reloop = bool(rlc.get('enabled', True))
+    max_reloop = int(rlc.get('max_loops', 3))
+    reject_bias_init = float(rlc.get('reject_logit_bias', 0.0))
+    anneal = max(1, int(rlc.get('reject_bias_anneal_steps', 200)))
+    reject_logit_bias = reject_bias_init * max(0.0, 1.0 - float(step) / anneal)
     prompt_len = int(batch['prompt_len'][0])
     prompt_ids = batch['input_ids']
     if prompt_ids.ndim == 1:
@@ -228,7 +252,10 @@ def generate_group_staged(model, processor, batch, cfg, group=1, sample=False):
                                      max_stage_tokens=max_stage,
                                      max_answer_tokens=max_answer,
                                      max_localize_tokens=max_localize,
-                                     greedy=not sample)
+                                     greedy=not sample,
+                                     confirm_reloop=confirm_reloop,
+                                     max_reloop=max_reloop,
+                                     reject_logit_bias=reject_logit_bias)
     result = []
     for run in runs:
         new_ids = torch.tensor(run.new_ids or [], device=device, dtype=torch.long)

@@ -11,8 +11,10 @@ import torch
 from PIL import Image
 
 from data.prior_dataset import PriorCollator, PriorCoTDataset, apply_chat_template_safe
-from models.anomaly_prior import heatmap_to_pil, softmax_fuse_maps, unpack_merge_order
+from models.anomaly_prior import fuse_maps, heatmap_to_pil, softmax_fuse_maps, unpack_merge_order
 from models.qwen35 import qwen_vision_factor
+from models.h_vpt import control_token_id_of, feat_token_id_of
+from models.h_box_prior import GEOM_DIM, box_token_id_of, geometry_from_proposals
 from models.region_injection import REGION_TOKEN, region_token_id_of
 from outcome.protocol import render_prompt, validate_gt
 from utils.common import smart_resize
@@ -62,7 +64,11 @@ def encode_pair_canonical(prior, pixels, grid):
         else:
             maps.append(prior._nn_map(test, ref, hw_t, hw_r, prior.neighborhood_radius))
     stack = torch.stack(maps)
-    hmap = softmax_fuse_maps(stack, prior.temperature) if len(maps) > 1 else stack[0]
+    hmap = (
+        fuse_maps(stack, getattr(prior, "fusion_mode", "softmax"),
+                  prior.temperature, getattr(prior, "normalize_layers", False))
+        if len(maps) > 1 else stack[0]
+    )
     return dict(patch_map=hmap, merged_embeddings=merged.detach(),
                 test_features=test_features, matched_ref_features=matched_ref_features,
                 match_coordinates=match_coordinates,
@@ -197,14 +203,15 @@ def zoom_prompt_suffix(n_crops: int, paired: bool = False, reference_mode: str =
     )
 
 
-def format_region_hints(proposals, n_tokens: int, owners=None) -> str:
+def format_region_hints(proposals, n_tokens: int, owners=None, expose_peak: bool = True) -> str:
     """One ``<|region|>`` per token, grouped by H region.
 
-    The first token of each region is ``hK:<|region|>@[x,y]`` (peak on Image 2).
-    Later tokens of the same region are bare ``<|region|>`` and describe extent.
+    With ``expose_peak=True`` the first token of each region is ``hK:<|region|>@[x,y]``
+    (peak on Image 2) and later tokens are bare ``<|region|>``. With ``expose_peak=False``
+    every token is a bare ``<|region|>`` so H coordinates never enter the text.
     """
     n = max(1, int(n_tokens))
-    if not proposals:
+    if not proposals or not expose_peak:
         return ' '.join([REGION_TOKEN] * n)
     if owners is None:
         owners = list(range(min(n, len(proposals)))) + [-1] * max(0, n - len(proposals))
@@ -474,6 +481,7 @@ def extract_region_cells(proposal_masks, test_features, matched_ref_features, hm
                     geom=torch.zeros(1, 1, int(cfg.get('geometry_dim', 5)), device=dev),
                     hstat=torch.zeros(1, 1, int(cfg.get('hstat_dim', 2)), device=dev),
                     hpatch=torch.zeros(1, 1, 1, P, P, device=dev),
+                    role=torch.zeros(1, 1, device=dev, dtype=torch.long),
                     valid=torch.zeros(1, 1, dtype=torch.bool, device=dev),
                     owner=torch.full((1, 1), -1, device=dev, dtype=torch.long))
     n = min(len(out_test), max_cells)
@@ -483,8 +491,319 @@ def extract_region_cells(proposal_masks, test_features, matched_ref_features, hm
                 geom=torch.tensor(out_geom[:n], device=dev, dtype=torch.float32).unsqueeze(0),
                 hstat=torch.tensor(out_hstat[:n], device=dev, dtype=torch.float32).unsqueeze(0),
                 hpatch=hpatch.unsqueeze(0),  # [1, n, 1, P, P]
+                role=torch.zeros(1, n, device=dev, dtype=torch.long),
                 valid=torch.ones(1, n, dtype=torch.bool, device=dev),
                 owner=torch.tensor(out_owner[:n], device=dev, dtype=torch.long).unsqueeze(0))
+
+
+# ---------------------------------------------------------------------------
+# H-aware Adaptive Evidence Router (token_mode=routed)
+# ---------------------------------------------------------------------------
+# H is NOT injected into the LLM. Instead it allocates the region-evidence budget:
+# for each real-H proposal it selects Core / Extent / Context sub-regions, decides
+# how broadly to search the surrounding context (radius from H confidence), and how
+# many tokens each role gets — all from cached block24 test/matched-ref features
+# (no extra ViT forward). The router's H input is a separate ablation variable
+# (real | shuffled | flat) while proposals always come from the real H.
+
+CORE, EXTENT, CONTEXT = 0, 1, 2
+
+
+def build_router_condition(hmap_real, condition: str, seed_key: str) -> torch.Tensor:
+    """Router-side H map for the causal ablation (proposals stay real-H)."""
+    condition = str(condition)
+    if condition == 'real':
+        return hmap_real
+    if condition == 'shuffled':
+        s = int(hashlib.sha256(seed_key.encode()).hexdigest()[:8], 16)
+        perm = torch.randperm(hmap_real.numel(), generator=torch.Generator().manual_seed(s))
+        return hmap_real.flatten()[perm.to(hmap_real.device)].reshape_as(hmap_real)
+    if condition == 'flat':
+        return torch.full_like(hmap_real, float(hmap_real.mean()))
+    raise ValueError(f'unknown router.condition: {condition}')
+
+
+def _normalize_h(h: np.ndarray) -> np.ndarray:
+    h = h.astype(np.float32)
+    denom = float(h.max() - h.min()) + 1e-6
+    return (h - float(h.min())) / denom
+
+
+def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Binary dilation by a square (2r+1)x(2r+1) structuring element."""
+    radius = max(0, int(radius))
+    if radius == 0:
+        return mask.copy()
+    h, w = mask.shape
+    out = mask.copy()
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return out
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            ny = np.clip(ys + dy, 0, h - 1)
+            nx = np.clip(xs + dx, 0, w - 1)
+            out[ny, nx] = True
+    return out
+
+
+def _mask_cells(mask: np.ndarray) -> list:
+    return [(int(y), int(x)) for y, x in zip(*np.nonzero(mask))]
+
+
+def _fps_partition(cells, n_tokens: int, first=None) -> list:
+    """Farthest-point partition of ``cells`` into ``n_tokens`` clusters.
+
+    ``first`` optionally pins the first seed (a (y, x) cell, e.g. the H peak).
+    Returns a list of ``K`` lists of (y, x) cells (K <= n_tokens, K <= len(cells)).
+    """
+    if not cells:
+        return []
+    K = min(max(1, int(n_tokens)), len(cells))
+    pts = np.array(cells, dtype=float)
+    if first is not None:
+        d = (pts[:, 0] - first[0]) ** 2 + (pts[:, 1] - first[1]) ** 2
+        s0 = int(np.argmin(d))
+    else:
+        s0 = 0
+    seeds = [s0]
+    dist = np.full(len(cells), np.inf)
+
+    def _update(s):
+        d = np.sqrt((pts[:, 0] - pts[s, 0]) ** 2 + (pts[:, 1] - pts[s, 1]) ** 2)
+        np.minimum(dist, d, out=dist)
+
+    _update(s0)
+    for _ in range(1, K):
+        s = int(np.argmax(dist))
+        seeds.append(s)
+        _update(s)
+    clusters = [[] for _ in range(K)]
+    sd = np.sqrt((pts[:, 0][:, None] - pts[seeds, 0][None, :]) ** 2 +
+                 (pts[:, 1][:, None] - pts[seeds, 1][None, :]) ** 2)
+    assign = np.argmin(sd, axis=1)
+    for i in range(len(cells)):
+        clusters[int(assign[i])].append((int(pts[i, 0]), int(pts[i, 1])))
+    return clusters
+
+
+def _pool_cells(test_f, ref_f, h_norm, cells, weights=None):
+    """Pool a cluster of cells into (test_vec, ref_vec, geom, hstat)."""
+    ys = np.array([c[0] for c in cells], dtype=int)
+    xs = np.array([c[1] for c in cells], dtype=int)
+    t = test_f[ys, xs]  # [K, D]
+    r = ref_f[ys, xs]
+    hh = h_norm[ys, xs]
+    if weights is None:
+        w = np.full(len(cells), 1.0 / max(1, len(cells)), dtype=np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32)
+        w = w / (w.sum() + 1e-6)
+    tvec = (t * w[:, None]).sum(0)
+    rvec = (r * w[:, None]).sum(0)
+    Ht, Wt = test_f.shape[0], test_f.shape[1]
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    geom = [(x0 + x1) / 2.0 / Wt + 0.5 / Wt,
+            (y0 + y1) / 2.0 / Ht + 0.5 / Ht,
+            (x1 - x0 + 1) / Wt,
+            (y1 - y0 + 1) / Ht,
+            0.0]  # owner fraction patched later
+    hstat = [float(hh.max()), float(hh.mean())]
+    return tvec, rvec, geom, hstat
+
+
+def extract_routed_region_cells(proposal_masks, router_hmap, test_features,
+                                matched_ref_features, cfg):
+    """H-aware adaptive evidence router: Core / Extent / Context with dynamic budget.
+
+    ``proposal_masks`` (bool [R, Ht, Wt]) always come from the real H. ``router_hmap``
+    is the ablation variable (real/shuffled/flat) and drives confidence, context
+    radius, and the Core threshold — i.e. only H's *second-stage routing* role.
+
+    Returns ``(region_raw, router_meta)`` where region_raw matches the shape of
+    ``extract_region_cells`` but adds a ``role`` field ([1, n] long, 0/1/2), and
+    ``router_meta`` records per-candidate confidence/radius/budget for logging.
+    """
+    dev = test_features.device
+    Ht, Wt = int(router_hmap.shape[0]), int(router_hmap.shape[1])
+    D = int(test_features.shape[-1])
+    test_f = test_features.float().reshape(Ht, Wt, D).cpu().numpy()
+    ref_f = matched_ref_features.float().reshape(Ht, Wt, D).cpu().numpy()
+    rc = dict(cfg)
+    router = dict(rc.get('router') or {})
+    max_cells = max(1, int(rc.get('max_cells', 15)))
+    min_per = max(1, int(router.get('min_tokens_per_candidate', 3)))
+    r_min = int(router.get('context_radius_min', 1))
+    r_max = int(router.get('context_radius_max', 4))
+    beta = float(router.get('core_fraction', 0.5))
+    if r_max < r_min:
+        r_max = r_min
+
+    h = router_hmap.detach().float().cpu().numpy().reshape(Ht, Wt)
+    h_norm = _normalize_h(h)
+    R = int(proposal_masks.shape[0])
+    pmask = np.asarray(proposal_masks, dtype=bool)
+
+    out_test, out_ref, out_geom, out_hstat, out_role, out_owner = [], [], [], [], [], []
+    router_meta = []
+
+    # ---- per-candidate confidence / radius / budget ----
+    metas = []
+    for i in range(R):
+        M = pmask[i]
+        if not M.any():
+            continue
+        p_i = float(h_norm[M].max())
+        ring = _dilate_mask(M, 1) & ~M
+        b_i = float(h_norm[ring].mean()) if ring.any() else 0.0
+        c_i = float(np.clip(p_i - b_i, 0.0, 1.0))
+        u_i = 1.0 - c_i
+        radius = int(round(r_min + u_i * (r_max - r_min)))
+        # budget weight q_i = peak * sqrt(area) (area in cells)
+        area = float(M.sum())
+        q_i = float(p_i * np.sqrt(area + 1e-6))
+        metas.append(dict(i=i, p=p_i, b=b_i, conf=c_i, unc=u_i, radius=radius,
+                          area=area, q=q_i))
+    if not metas:
+        return dict(test=torch.zeros(1, 1, D, device=dev),
+                    ref=torch.zeros(1, 1, D, device=dev),
+                    geom=torch.zeros(1, 1, int(rc.get('geometry_dim', 5)), device=dev),
+                    hstat=torch.zeros(1, 1, int(rc.get('hstat_dim', 2)), device=dev),
+                    role=torch.zeros(1, 1, device=dev, dtype=torch.long),
+                    valid=torch.zeros(1, 1, dtype=torch.bool, device=dev),
+                    owner=torch.full((1, 1), -1, device=dev, dtype=torch.long)), []
+
+    # ---- allocate total budget across candidates (largest remainder) ----
+    R_used = len(metas)
+    q_sum = float(sum(m['q'] for m in metas)) + 1e-6
+    B_extra = max_cells - R_used * min_per
+    if B_extra < 0:
+        B_extra = 0
+    exact = []
+    for m in metas:
+        w = m['q'] / q_sum
+        exact.append(dict(**m, w=w, budget=min_per + w * B_extra))
+    # floor + largest remainder
+    floors = [int(np.floor(e['budget'])) for e in exact]
+    remainders = [(e['budget'] - f, idx) for idx, (e, f) in enumerate(zip(exact, floors))]
+    rem_budget = max_cells - sum(floors)
+    if rem_budget > 0:
+        remainders.sort(key=lambda t: -t[0])
+        for _, idx in remainders[:rem_budget]:
+            floors[idx] += 1
+    # enforce min_per floor
+    for idx in range(len(floors)):
+        floors[idx] = max(min_per, floors[idx])
+    # final cap to max_cells (if min_per*R > max_cells)
+    while sum(floors) > max_cells:
+        idx = max(range(len(floors)), key=lambda j: floors[j])
+        if floors[idx] <= min_per:
+            break
+        floors[idx] -= 1
+    for e, budget in zip(exact, floors):
+        e['budget'] = budget
+
+    # ---- emit Core / Extent / Context tokens ----
+    for e in exact:
+        i = e['i']
+        M = pmask[i]
+        ys, xs = np.nonzero(M)
+        cells = list(zip(ys.tolist(), xs.tolist()))
+        local = h_norm[M]
+        thr = float(local.mean()) + beta * (float(local.max()) - float(local.mean()))
+        core_mask = M & (h_norm >= thr)
+        if not core_mask.any():
+            # fall back to the peak cell
+            pk = int(np.argmax(local))
+            core_mask = _cells_to_mask(Ht, Wt, [cells[pk]])
+        extent_mask = M & ~core_mask
+        if not extent_mask.any():
+            extent_mask = M.copy()
+        context_mask = _dilate_mask(M, e['radius']) & ~M
+
+        budget = e['budget']
+        n_core = 1
+        E = max(0, budget - min_per)  # extra beyond 1 core + 1 extent + 1 context
+        n_context = 1 + int(round(e['unc'] * E))
+        n_extent = max(1, budget - n_core - n_context)
+
+        # Core: single cluster at H peak, H-weighted pooling.
+        core_cells = _mask_cells(core_mask)
+        pk_cell = max(core_cells, key=lambda c: h_norm[c[0], c[1]])
+        tvec, rvec, geom, hstat = _pool_cells(test_f, ref_f, h_norm, core_cells,
+                                              weights=[h_norm[c] for c in core_cells])
+        out_test.append(torch.from_numpy(tvec))
+        out_ref.append(torch.from_numpy(rvec))
+        out_geom.append(geom)
+        out_hstat.append(hstat)
+        out_role.append(CORE)
+        out_owner.append(i)
+
+        # Extent: n_extent clusters, seed at H peak, H-weighted pooling.
+        extent_cells = _mask_cells(extent_mask)
+        clusters = _fps_partition(extent_cells, n_extent, first=pk_cell)
+        for cl in clusters:
+            if not cl:
+                continue
+            tvec, rvec, geom, hstat = _pool_cells(test_f, ref_f, h_norm, cl,
+                                                  weights=[h_norm[c] for c in cl])
+            out_test.append(torch.from_numpy(tvec))
+            out_ref.append(torch.from_numpy(rvec))
+            out_geom.append(geom)
+            out_hstat.append(hstat)
+            out_role.append(EXTENT)
+            out_owner.append(i)
+
+        # Context: n_context clusters, uniform pooling, seed near proposal centroid.
+        context_cells = _mask_cells(context_mask)
+        if context_cells:
+            cy = float(np.mean([c[0] for c in cells]))
+            cx = float(np.mean([c[1] for c in cells]))
+            clusters = _fps_partition(context_cells, n_context, first=(cy, cx))
+        else:
+            clusters = []
+        for cl in clusters:
+            if not cl:
+                continue
+            tvec, rvec, geom, hstat = _pool_cells(test_f, ref_f, h_norm, cl, weights=None)
+            out_test.append(torch.from_numpy(tvec))
+            out_ref.append(torch.from_numpy(rvec))
+            out_geom.append(geom)
+            out_hstat.append(hstat)
+            out_role.append(CONTEXT)
+            out_owner.append(i)
+
+        router_meta.append(dict(
+            candidate=i, confidence=round(float(e['conf']), 4),
+            uncertainty=round(float(e['unc']), 4), radius=int(e['radius']),
+            budget=int(budget), n_core=n_core, n_extent=n_extent, n_context=n_context))
+
+    n = min(len(out_test), max_cells)
+    if n == 0:
+        return dict(test=torch.zeros(1, 1, D, device=dev),
+                    ref=torch.zeros(1, 1, D, device=dev),
+                    geom=torch.zeros(1, 1, int(rc.get('geometry_dim', 5)), device=dev),
+                    hstat=torch.zeros(1, 1, int(rc.get('hstat_dim', 2)), device=dev),
+                    role=torch.zeros(1, 1, device=dev, dtype=torch.long),
+                    valid=torch.zeros(1, 1, dtype=torch.bool, device=dev),
+                    owner=torch.full((1, 1), -1, device=dev, dtype=torch.long)), router_meta
+
+    geoms = torch.tensor(out_geom[:n], device=dev, dtype=torch.float32)  # [n, 5]
+    # 5th geometry slot = owner fraction (r / R), matching extract_region_cells.
+    owner_frac = torch.tensor(
+        [o / max(R, 1) for o in out_owner[:n]], device=dev, dtype=torch.float32)
+    geoms = torch.cat([geoms[:, :4], owner_frac.unsqueeze(1)], dim=1)
+
+    region_raw = dict(
+        test=torch.stack(out_test[:n]).unsqueeze(0).to(dev),
+        ref=torch.stack(out_ref[:n]).unsqueeze(0).to(dev),
+        geom=geoms.unsqueeze(0),
+        hstat=torch.tensor(out_hstat[:n], device=dev, dtype=torch.float32).unsqueeze(0),
+        role=torch.tensor(out_role[:n], device=dev, dtype=torch.long).unsqueeze(0),
+        valid=torch.ones(1, n, dtype=torch.bool, device=dev),
+        owner=torch.tensor(out_owner[:n], device=dev, dtype=torch.long).unsqueeze(0),
+    )
+    return region_raw, router_meta
 
 
 class OutcomeDataset(PriorCoTDataset):
@@ -626,18 +945,11 @@ class OutcomeCollator(PriorCollator):
             raise ValueError('OutcomeCollator expects one sample; group sampling happens downstream')
         item = batch[0]
         device = self._device()
-        zcfg = self._zoom_cfg()
-        zoom_on = bool(zcfg.get('enabled', False))
         global_size = int((self.cfg.get('data') or {}).get('max_image_size', 448))
-        # H resolution is decoupled from crop zoom: `prior.h_image_size` (new,
-        # explicit) wins; `zoom.h_image_size` remains a legacy alias that only
-        # applies when zoom is on (preserves old configs' behavior).
         pcfg = self.cfg.get('outcome', {}).get('prior', {})
         h_size = global_size
         if pcfg.get('h_image_size'):
             h_size = int(pcfg['h_image_size'])
-        elif zoom_on and zcfg.get('h_image_size'):
-            h_size = int(zcfg['h_image_size'])
 
         ref_g, test_g = self._align_pair_at(item['ref'], item['test'], global_size)
         initial = self._concat_image_tensors(ref_g, test_g)
@@ -655,106 +967,55 @@ class OutcomeCollator(PriorCollator):
                 self.prior, initial['pixel_values'].to(device), initial['image_grid_thw'].to(device))
             vis_g_merged = vis_h['merged_embeddings'].detach()
 
-        pcfg = self.cfg.get('outcome', {}).get('prior', {})
-        hmap = vis_h['patch_map']
-        hmap_real = hmap  # real, un-shuffled H (kept for the cross-attn memory ablation)
-        condition = pcfg.get('condition', 'real')
-        if condition == 'shuffled':
-            # Fixed per sample and across all members of its group; no GT involved.
-            key = f"{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
-            seed = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
-            perm = torch.randperm(hmap.numel(), generator=torch.Generator().manual_seed(seed))
-            hmap = hmap.flatten()[perm.to(hmap.device)].reshape_as(hmap)
-        if condition not in ('real', 'none', 'shuffled'):
-            raise ValueError(f'unknown H condition: {condition}')
-        # H-memory (cross-attn) input: independent of prior.condition so proposals/
-        # RegionAdapter always use the real H while only the memory is perturbed.
-        h_mem_cfg = self.cfg.get('outcome', {}).get('h_memory', {}) or {}
-        h_mem_map = None
-        if bool(h_mem_cfg.get('enabled', False)):
-            mem_cond = str(h_mem_cfg.get('condition', 'real'))
-            if mem_cond not in ('real', 'shuffled', 'zero'):
-                raise ValueError(f'unknown h_memory.condition: {mem_cond}')
-            if mem_cond == 'real':
-                h_mem_map = hmap_real
-            elif mem_cond == 'shuffled':
-                key = f"hmem:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
+        hmap_real = vis_h['patch_map']
+        # H-VPT cross-attn map: the ONLY H channel into the LLM. ``condition`` is
+        # real/shuffled/zero (causal ablation). Proposals / region tokens / hstat /
+        # peak text are all removed — H reaches the LLM only through the VPT-style
+        # control-token cross-attention.
+        h_vpt_cfg = self.cfg.get('outcome', {}).get('h_vpt', {}) or {}
+        h_vpt_map = None
+        if bool(h_vpt_cfg.get('enabled', False)):
+            cond = str(h_vpt_cfg.get('condition', 'real'))
+            if cond not in ('real', 'shuffled', 'zero'):
+                raise ValueError(f'unknown h_vpt.condition: {cond}')
+            if cond == 'real':
+                h_vpt_map = hmap_real
+            elif cond == 'shuffled':
+                key = f"hvpt:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
                 s = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
                 perm = torch.randperm(hmap_real.numel(), generator=torch.Generator().manual_seed(s))
-                h_mem_map = hmap_real.flatten()[perm.to(hmap_real.device)].reshape_as(hmap_real)
+                h_vpt_map = hmap_real.flatten()[perm.to(hmap_real.device)].reshape_as(hmap_real)
             else:
-                h_mem_map = torch.zeros_like(hmap_real)
-        proposals, proposal_masks, threshold_mode = region_proposals(hmap, pcfg)
-        if condition == 'none':
-            proposals = []
-            proposal_masks = np.zeros((0, *proposal_masks.shape[1:]), dtype=bool)
-        region_cfg = self.cfg.get('outcome', {}).get('region', {}) or {}
-        h_prior_cfg = self.cfg.get('outcome', {}).get('h_prior_adapter') or {}
-        h_patch_size = int(h_prior_cfg.get('patch_size', 7))
+                h_vpt_map = torch.zeros_like(hmap_real)
+
+        # H-Box geometry-token prior: H connected components -> candidate boxes ->
+        # geometry vectors injected as STATIC tokens in [localize]. This is the
+        # "search prior" channel (extent signal), parallel to h_vpt's dense features.
+        h_box_cfg = self.cfg.get('outcome', {}).get('h_box_prior', {}) or {}
+        h_box_geom = None
+        box_proposals = []
+        if bool(h_box_cfg.get('enabled', False)):
+            cond = str(h_box_cfg.get('condition', 'real'))
+            if cond not in ('real', 'shuffled', 'zero'):
+                raise ValueError(f'unknown h_box_prior.condition: {cond}')
+            k_boxes = int(h_box_cfg.get('max_boxes', pcfg.get('max_candidates', 3)))
+            box_proposals, _, _ = region_proposals(hmap_real, pcfg)
+            h_min = float(hmap_real.min())
+            h_max = float(hmap_real.max())
+            if cond == 'zero':
+                geom = np.zeros((k_boxes, GEOM_DIM), dtype=np.float32)
+            else:
+                geom = geometry_from_proposals(box_proposals, k_boxes, h_min, h_max)
+                if cond == 'shuffled':
+                    key = f"hbox:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
+                    s = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
+                    geom = geom[np.random.default_rng(s).permutation(k_boxes)]
+            h_box_geom = torch.from_numpy(geom)  # [K, GEOM_DIM]
+
         images = [ref_g, test_g]
         caches = [vis_g_merged]
         grids = [initial['image_grid_thw']]
-        if vis_h.get('test_features') is None or vis_h.get('matched_ref_features') is None:
-            raise ValueError('region tokens require matched features; check prior.region_feature_index')
-        region_raw = extract_region_cells(proposal_masks, vis_h['test_features'],
-                                          vis_h['matched_ref_features'], hmap, region_cfg,
-                                          patch_size=h_patch_size)
-        # HAdapter side-channel ablation: keep proposals/geom/hstat from real H but
-        # perturb ONLY the H patch fed to HPriorAdapter. `h_prior_adapter.condition`
-        # is independent of `prior.condition` so we can test the side channel's use of
-        # H's *spatial structure* without changing proposal quality.
-        h_prior_cond = str(h_prior_cfg.get('condition', 'real'))
-        if h_prior_cond not in ('real', 'shuffled', 'zero'):
-            raise ValueError(f'unknown h_prior_adapter.condition: {h_prior_cond}')
-        if h_prior_cond != 'real' and h_patch_size > 0:
-            hp_map = vis_h['patch_map']  # the real, un-shuffled H map
-            if h_prior_cond == 'shuffled':
-                key = f"hprior:{self.cfg['training']['seed']}:{item['image_path']}:{item['ref_path']}"
-                s = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16)
-                perm = torch.randperm(hp_map.numel(), generator=torch.Generator().manual_seed(s))
-                hp_map = hp_map.flatten()[perm.to(hp_map.device)].reshape_as(hp_map)
-            elif h_prior_cond == 'zero':
-                hp_map = torch.zeros_like(hp_map)
-            geoms = region_raw['geom'][0].tolist()
-            region_raw['hpatch'] = _extract_h_patches(hp_map, geoms, h_patch_size).unsqueeze(0)
-        region_token_id = region_token_id_of(self.processor)
-        n_region = int(region_raw['valid'].shape[1])
-        owners = region_raw['owner'][0].tolist() if 'owner' in region_raw else None
-        region_tokens = format_region_hints(proposals, n_region, owners)
-        text = render_prompt(self.cfg, item['class_name'], region_tokens=region_tokens)
-
-        crops = []
-        paired = False
-        n_entries = 0
-        if zoom_on and condition != 'none':
-            oracle_boxes = self._gt_oracle_boxes(item) if bool(zcfg.get('oracle', False)) else []
-            entries, paired = self._build_zoom_crops(item['test'], item['ref'], proposals, hmap,
-                                                     vis_h.get('match_coordinates'), oracle_boxes)
-            n_entries = len(entries)
-            crops = [img for entry in entries for img in entry]
-            if crops:
-                # Encode every crop under the global (LLM) pixel budget so processor grids match.
-                crop_encs = [
-                    getattr(self.processor, 'image_processor')(images=crop, return_tensors='pt')
-                    for crop in crops
-                ]
-                def _pixels(t):
-                    return t.reshape(-1, t.shape[-1]) if t.ndim == 3 else t
-                def _grid(t):
-                    if t.ndim == 1:
-                        t = t.unsqueeze(0)
-                    if t.ndim == 3:
-                        t = t.reshape(-1, int(t.shape[-1]))
-                    return t
-                crop_pixels = torch.cat([_pixels(e['pixel_values']) for e in crop_encs], dim=0)
-                crop_grid = torch.cat([_grid(e['image_grid_thw']) for e in crop_encs], dim=0)
-                crop_merged = encode_visual_merged(
-                    self.prior, crop_pixels.to(device), crop_grid.to(device))
-                images.extend(crops)
-                caches.append(crop_merged)
-                grids.append(crop_grid)
-                ref_mode = str(zcfg.get('reference_mode', 'matched'))
-                text = text + zoom_prompt_suffix(n_entries, paired=paired, reference_mode=ref_mode)
+        text = render_prompt(self.cfg, item['class_name'], region_tokens='')
 
         user = dict(role='user', content=[dict(type='image', image=im) for im in images]+[dict(type='text', text=text)])
         enable_thinking = bool((self.cfg.get('prompt') or {}).get('enable_thinking', False))
@@ -764,37 +1025,31 @@ class OutcomeCollator(PriorCollator):
         maximum = int(self.cfg['training']['max_length'])
         if length > maximum:
             raise ValueError(f'prompt has {length} tokens > {maximum}; increase max_length or reduce image budget; refusing silent truncation')
-        n_region = int(region_raw['valid'].shape[1])
-        actual = int((full['input_ids'][0] == region_token_id).sum())
-        if actual != n_region:
-            raise RuntimeError(f'region tokenization mismatch: expected {n_region} <|region|> tokens, got {actual}')
         expected_grid = torch.cat(grids).cpu()
         if not torch.equal(full['image_grid_thw'].reshape(-1, 3).cpu(), expected_grid):
             raise RuntimeError('processor geometry changed between vision cache and prompt construction')
         full['image_embeds'] = torch.cat(caches)
         full['prompt_len'] = torch.tensor([length])
-        full['region_test'] = region_raw['test'].cpu()
-        full['region_ref'] = region_raw['ref'].cpu()
-        full['region_geom'] = region_raw['geom'].cpu()
-        full['region_hstat'] = region_raw['hstat'].cpu()
-        full['region_hpatch'] = region_raw['hpatch'].cpu()
-        full['region_valid'] = region_raw['valid'].cpu()
-        full['region_token_id'] = int(region_token_id)
-        if h_mem_map is not None:
-            full['h_map'] = h_mem_map.detach().cpu()
-        prior_hint_tokens = int(region_raw['valid'].shape[1])
+        full['control_token_id'] = int(control_token_id_of(self.processor))
+        full['feat_token_id'] = int(feat_token_id_of(self.processor))
+        full['n_feat_tokens'] = int(h_vpt_cfg.get('n_tokens', 64))
+        if h_vpt_map is not None:
+            full['h_map'] = h_vpt_map.detach().cpu()
+        full['box_token_id'] = int(box_token_id_of(self.processor))
+        full['n_box_tokens'] = int(h_box_cfg.get('max_boxes', 3)) if h_box_geom is not None else 0
+        if h_box_geom is not None:
+            full['h_box_geom'] = h_box_geom
         full['_meta'] = [{key: item.get(key) for key in ('orig_size','gt_box_px','is_anomaly','image_path','ref_path','class_name','defect_type','component_bboxes','num_components','mask_area_fraction','union_area_fraction','full_mask_path')}]
-        full['_meta'][0].update(prior_candidates=proposals, prior_condition=condition,
-                                prior_threshold_mode=threshold_mode, h_min=float(hmap.min()), h_max=float(hmap.max()),
+        full['_meta'][0].update(h_min=float(hmap_real.min()), h_max=float(hmap_real.max()),
                                 image_count=len(images), prompt_tokens=int(length),
                                 visual_tokens=int((full['image_grid_thw'].prod(-1)//(self.prior.spatial_merge_size**2)).sum()),
-                                prior_hint_tokens=prior_hint_tokens,
-                                zoom_enabled=zoom_on, zoom_h_size=h_size, zoom_n_crops=len(crops))
-        # Visualization payload (heatmap + original images + H peaks in 0-1000).
+                                h_size=h_size,
+                                prior_candidates=box_proposals,
+                                prior_condition=str(h_box_cfg.get('condition', 'real')))
+        # Visualization payload (heatmap + original images).
         full['_meta'][0].update(
             ref=item['ref'],
             test=item['test'],
-            heatmap=heatmap_to_pil(hmap, item['test'].size),
-            prior_points=[p['peak_2d'] for p in proposals],
+            heatmap=heatmap_to_pil(hmap_real, item['test'].size),
         )
         return full

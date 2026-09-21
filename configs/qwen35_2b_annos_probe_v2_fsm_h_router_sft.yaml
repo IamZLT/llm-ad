@@ -1,0 +1,162 @@
+# H-aware Adaptive Evidence Router (final scheme).
+#
+# H@768 -> proposal (real H) -> Router(Core/Extent/Context + dynamic budget) -> cached
+# block24 test/matched-ref evidence -> RegionAdapter (role-aware) -> Qwen + FSM.
+#
+# H is NOT injected into the LLM: no HPriorAdapter, no H-memory cross-attention, no
+# zoom crops, no H peak text coords, no raw-H stat branch. H only decides *how* the
+# region evidence is sampled (ROI scope + role split + token budget).
+#
+# Supervision: [localize] target is GT (outcome.sft.localize_target=gt); H is a search
+# heuristic, never the label.
+paths:
+  dataset_root: /root/data-fs/bljiao/datasets
+  output_dir: ./outputs/train/qwen35_2b_outcome_multibox
+runtime:
+  mode: train
+  run_name: qwen35_2b_annos_probe_v2_fsm_h_router
+  auto_create_output_dir: true
+tensorboard:
+  port: 5019
+  host: 0.0.0.0
+  log_every_n_steps: 10
+  vis_every_n_steps: 20
+  vis_num_samples: 5
+model:
+  random_init_llm: false
+  arch: Qwen3.5-2B
+  name: /root/data-fs/bljiao/anomaly_llm/model_card/Qwen3.5-2B
+  local_files_only: true
+  freeze_vit: true
+  torch_dtype: bfloat16
+prior:
+  layer_index_base: 1
+  layer_indices:
+  - 12
+  - 16
+  - 20
+  - 24
+  softmax_temperature: 0.5
+  neighborhood_radius: 0
+  render: colormap
+  overlay_alpha: 0.45
+lora:
+  enabled: true
+  skip_visual: true
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+  - in_proj_qkv
+  - in_proj_z
+  - in_proj_a
+  - in_proj_b
+  - out_proj
+data:
+  train_layout: visa
+  train_root: /root/data-fs/bljiao/datasets/VisA
+  eval_layout: mvtec
+  eval_root: /root/data-fs/bljiao/datasets/mvtec_anomaly_detection
+  visa_max_normal_per_class: null
+  min_contour_area: 5
+  merge_kernel_ratio: 0.01
+  gt_source: annos
+  annos_root: /root/data-fs/bljiao/anomaly_llm/datasets/ANNOS
+  source_dirname: VisA
+  train_anomaly_only: false
+  random_train_ref: true
+  ref_topk: 5
+  normal_anomaly_ratio: 1.0
+  holdout_ratio: 0.1
+  max_samples: null
+  max_eval_samples: null
+  max_image_size: 448
+  factor: null
+  min_pixels: null
+  max_pixels: null
+prompt:
+  enable_thinking: true
+  template: |
+    Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image.
+    A set of routed reference-conditioned region evidence tokens follows: {region_tokens}. Each token carries visual evidence (inspection content, its matched normal counterpart, and their discrepancy) selected by an external anomaly-prior router. The router is only a search heuristic, not a label: it decides where to look and how broadly, but the evidence itself decides what is actually anomalous. Some routed regions may be false alarms, and real defects may not be perfectly centered by the router, so inspect the evidence and expand beyond it when needed.
+    bboxes_2d is a list of boxes, and each box is itself a list [x1,y1,x2,y2]. A single defect must be written as [[x1,y1,x2,y2]] (a list containing one box), never as the flat list [x1,y1,x2,y2].
+    Example (anomalous): <answer>{"is_anomaly": true, "bboxes_2d": [[120, 200, 480, 620]], "description": "a defect on the upper-left"}</answer>
+    Example (normal): <answer>{"is_anomaly": false, "bboxes_2d": [], "description": "no defect; appearance matches the reference"}</answer>
+    For anomaly=true, bboxes_2d contains one box per spatially disconnected anomalous region, with no duplicates and at most {max_boxes} boxes.
+    For anomaly=false, bboxes_2d MUST be [].
+    All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2 (x1=left, y1=top, x2=right, y2=bottom).
+    Stop immediately after </answer>.
+training:
+  max_length: 4096
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  seed: 42
+  eval_every_n_steps: 20
+  eval_split: dev
+  eval_num_samples: 200
+  final_eval_num_samples: null
+outcome:
+  version: outcome-multibox-v1
+  protocol_weight: 0.01
+  max_boxes: 16
+  thinking:
+    enabled: true
+  localization:
+    iou_threshold: 0.30
+    geometry_weight: 0.30
+  # [localize] supervision: GT boxes (H is only a routing prior, never target).
+  sft:
+    localize_target: gt
+  sft_adapter: outputs/train/region_sft_annos_think_fsm   # frozen FSM baseline start point (LoRA init)
+  final_test: false
+  prior:
+    condition: real          # proposals always from real H
+    relative_threshold: 0.7
+    raw_threshold: null
+    max_candidates: 3
+    min_cells: 1
+    box_mode: full
+    peak_radius: 1
+    peak_keep: 0.85
+    region_feature_index: 23    # block24 cached evidence (unchanged)
+    # high-res H + region feature extraction, decoupled from the 448 global images.
+    h_image_size: 768
+  region:
+    intermediate_dim: 256
+    geometry_dim: 5
+    hstat_dim: 2
+    activation: gelu
+    max_cells: 15
+    token_mode: routed
+    # Turn off direct H injection: the region token carries test/ref/diff/geom/role only.
+    use_hstat: false
+    num_roles: 3              # CORE=0, EXTENT=1, CONTEXT=2
+    router:
+      enabled: true
+      # causal ablation switch (independent of prior.condition): proposals stay real-H,
+      # only the router's *second-stage* H input is perturbed.
+      condition: real          # real | shuffled | flat
+      core_fraction: 0.5       # core threshold beta
+      context_radius_min: 1
+      context_radius_max: 4
+      min_tokens_per_candidate: 3
+      expose_peak_text: false  # no H peak coordinates in the prompt
+  zoom:
+    enabled: false
+    h_image_size: 768
+    crop_image_size: 448
+    expand: 1.5
+    max_crops: 3
+  # All direct-H routes are disabled in the final scheme.
+  h_prior_adapter:
+    enabled: false
+  h_memory:
+    enabled: false

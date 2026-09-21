@@ -363,6 +363,7 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     cand_max_area_frac = float(loc.get('cand_max_area_frac', 0.10))
     refine_clip = abs(float(loc.get('refine_clip', 0.2)))
     focus_max_candidates = int(loc.get('focus_max_candidates', 3))
+    reject_weight = float(loc.get('reject_weight', 0.0))
     correct = parsed['task_valid'] and parsed['is_anomaly'] == bool(meta['is_anomaly'])
     pred_px = [to_pixels(b, meta['orig_size']) for b in parsed['bboxes_2d']]
     union_iou_val = (iou(union_box(pred_px), meta.get('gt_box_px'))
@@ -391,6 +392,14 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
         candd = set_localization_reward(cand_boxes, comps, meta['orig_size'], iou_threshold, geometry_weight)
     loc_reward = setd['reward']
     delta_refine = loc_reward - candd['reward']
+    # Reject shaping: a [confirm]=reject triggers the confirm-reloop (a zero-H /
+    # pure-text re-localization). Reward it only when the final localization is
+    # actually good (mask_iou), so a reject that rescues a bad localization is
+    # rewarded while a pointless reject is penalized. (2*mask_iou - 1) makes the
+    # term positive above IoU 0.5 and negative below, tying reject directly to
+    # localization quality. Anomaly-only: normal-sample rejects are covered by
+    # focus_reward / the empty final answer.
+    reject_bonus = 0.0
     if not correct:
         # False positive (normal image declared anomalous) gets a heavier
         # penalty than a miss (anomaly declared normal): in industrial QC a
@@ -407,6 +416,9 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 + dense_weight * loc_reward
                 + cand_weight * cand_cov_val
                 + refine_weight * float(min(max(delta_refine, -refine_clip), refine_clip)))
+        if parsed['verify_action'] == 'reject':
+            reject_bonus = reject_weight * (2.0 * mask_iou_val - 1.0)
+            task = task + reject_bonus
     protocol_core = float(parsed['protocol_core'])
     return dict(task=task, protocol=protocol_core, protocol_core=protocol_core,
                 protocol_strict=float(parsed['protocol_strict']),
@@ -416,4 +428,5 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 mask_iou=mask_iou_val, union_iou=union_iou_val,
                 raw_iou=raw_set_iou, set_iou=raw_set_iou, set_giou=set_giou_val,
                 count_reward=count_val, focus_reward=focus_val, cand_coverage=cand_cov_val,
+                reject_bonus=reject_bonus, verify_action=parsed['verify_action'],
                 correct=bool(correct), matched_pairs=setd['matched_pairs'], s_sum=setd['s_sum'])

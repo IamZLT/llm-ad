@@ -82,6 +82,9 @@ def test_build_labels_masks_fsm_markers_supervises_bodies():
                 out['offset_mapping'] = [(i, i + 1) for i in range(len(text))]
             return out
 
+        def convert_tokens_to_ids(self, token):
+            return -1  # no special tokens in this mock
+
     text = staged_sft_target('ref', 'diff', 'candidate_bboxes_2d=[]', 'none; x',
                              '{"is_anomaly": false, "bboxes_2d": [], "description": "ok"}')
     tok = _Tok()

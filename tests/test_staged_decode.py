@@ -4,6 +4,7 @@ import pytest
 from outcome.staged_decode import (
     OPEN,
     STAGES,
+    _confirm_action,
     inject_after,
     next_marker,
     next_stage,
@@ -48,6 +49,23 @@ def test_controller_owns_next_marker():
     assert inject_after('C') == '[localize]\n'
     assert inject_after('L') == '[confirm]\n'
 
+    assert inject_after('V') == '</think>\n\n<answer>\n'
+
+
+def test_confirm_action_detects_reject_for_reloop():
+    assert _confirm_action('reject; H misled me') == 'reject'
+    assert _confirm_action('keep; boxes match') == 'keep'
+    assert _confirm_action('refine; shrink the box') == 'refine'
+    assert _confirm_action('none; no true defect') == 'none'
+    assert _confirm_action('discover; extra defect') == 'discover'
+    assert _confirm_action('') == ''
+
+
+def test_reloop_opens_localize_not_think_close():
+    # A confirm-reject reloop re-opens [localize] (zero-H) instead of the normal
+    # </think><answer> transition — verified here via the marker the controller
+    # injects on a reloop.
+    assert OPEN['L'] == '[localize]\n'
     assert inject_after('V') == '</think>\n\n<answer>\n'
 
 

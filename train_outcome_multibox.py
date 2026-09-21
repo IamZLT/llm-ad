@@ -105,7 +105,8 @@ def main():
     validate_config(cfg)
     set_seed(int(cfg['training']['seed']))
     main_proc = is_main_process()
-    name = f"{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    run_name = (cfg.get('runtime') or {}).get('run_name') or 'run'
+    name = f"{run_name}__{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
     output = Path(args.output_dir) if args.output_dir else Path(cfg['paths']['output_dir'])/name
     if main_proc:
         output.mkdir(parents=True, exist_ok=False)
@@ -167,7 +168,11 @@ def main():
                 print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
             if main_proc:
-                start_tensorboard(output / 'tb', cfg)
+                # Point TensorBoard at the shared RL parent dir so every run's
+                # ``train_<run_name>__.../tb`` appears as a sub-run on ONE page
+                # (tick runs to compare). Kill-and-restart on a fixed port keeps
+                # all runs visible regardless of launch order.
+                start_tensorboard(Path(cfg['paths']['output_dir']).resolve(), cfg)
             run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output)
     if main_proc:
         print(f'Output: {output}', flush=True)

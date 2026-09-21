@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import re
 
+from models.h_box_prior import BOX_TOKEN
+from models.h_vpt import CONTROL_TOKEN, FEAT_TOKEN
+
 THINK_STAGES = ('understand', 'compare', 'localize', 'confirm')
 UNSUPERVISED_STAGES = ('understand', 'compare')
 STAGE_CANON = {
@@ -48,16 +51,21 @@ def visible_sft_target(answer_json: str) -> str:
     return f'{THINK_CLOSE_PREFIX}<answer>\n{answer_json}\n</answer>'
 
 
-def staged_sft_target(understand, compare, localize, confirm, answer_json: str) -> str:
+def staged_sft_target(understand, compare, localize, confirm, answer_json: str,
+                      localize_prefix: str = '') -> str:
     """Think continuation: four stage headers, close think, then JSON.
 
     The chat template already opened ``<think>``, so this must not emit a second
     opening tag. ``[localize]`` / ``[confirm]`` are ground / verify, not XML.
+
+    ``localize_prefix`` (when non-empty) is prepended inside the ``[localize]``
+    body — used for the VPT control/feat placeholder tokens, which the staged
+    decoder injects itself (and which ``staged_sft_labels`` masks).
     """
     body = (
         f'[understand]\n{understand}\n'
         f'[compare]\n{compare}\n'
-        f'[localize]\n{localize}\n'
+        f'[localize]\n{localize_prefix}{localize}\n'
         f'[confirm]\n{confirm}\n'
     )
     return f'{body}{THINK_CLOSE_PREFIX}<answer>\n{answer_json}\n</answer>'
@@ -100,6 +108,12 @@ def staged_sft_labels(tokenizer, target_text: str) -> list:
     enc = tokenizer(target_text, add_special_tokens=False, return_offsets_mapping=True)
     ids, offs = _encoding_fields(enc)
     labels = list(ids)
+    # VPT control/feat + H-Box geometry placeholders are controller-injected
+    # (never model text), so they are masked out of the SFT labels.
+    ctrl_id = tokenizer.convert_tokens_to_ids(CONTROL_TOKEN)
+    feat_id = tokenizer.convert_tokens_to_ids(FEAT_TOKEN)
+    box_id = tokenizer.convert_tokens_to_ids(BOX_TOKEN)
+    labels = [(-100 if t in (ctrl_id, feat_id, box_id) else t) for t in labels]
     spans = staged_marker_char_spans(target_text)
     if not spans:
         return labels
@@ -194,6 +208,15 @@ def parse_think_stages(think_text: str) -> dict:
         end = hits[i + 1].start() if i + 1 < len(hits) else len(text)
         bodies[canon] = text[start:end].strip()
     ok = headers == list(THINK_STAGES)
+    if not ok:
+        # Multi-round: a confirm-reject adds extra (localize, confirm) pairs, so
+        # headers may be U,C,L,V,(L,V)*. The `bodies` dict keeps the LAST occurrence
+        # of each stage (the zero-H reloop result), which is what RL scores.
+        base = headers[:len(THINK_STAGES)] == list(THINK_STAGES)
+        extras = headers[len(THINK_STAGES):]
+        ok = (base and len(extras) % 2 == 0
+              and extras[0::2] == ['localize'] * (len(extras) // 2)
+              and extras[1::2] == ['confirm'] * (len(extras) // 2))
     filled = ok and all(not _PLACEHOLDER_BODY.match(bodies.get(s, '')) for s in THINK_STAGES)
     no_early = True
     if ok:

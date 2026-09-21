@@ -7,7 +7,7 @@ paths:
   output_dir: ./outputs/train/qwen35_2b_outcome_multibox
 runtime:
   mode: train
-  run_name: qwen35_2b_annos_probe_v2
+  run_name: qwen35_2b_annos_probe_v2_h_box
   auto_create_output_dir: true
 tensorboard:
   port: 5010
@@ -178,7 +178,7 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/region_sft_annos_think_fsm_h_vpt_v2   # VPT SFT (control-token cross-attn H)
+  sft_adapter: outputs/train/region_sft_annos_think_fsm_h_box_v1   # H-Box SFT (geometry-token prior + VPT)
   final_test: false
   prior:
     # High-res H-map resolution (the scalar heatmap fed to the VPT encoder). Must
@@ -192,11 +192,15 @@ outcome:
     box_mode: full
     peak_radius: 1
     peak_keep: 0.85
-  # H-Box geometry-token prior: DISABLED for the pure-VPT baseline (its SFT
-  # region_sft_annos_think_fsm_h_vpt_v2 has no h_box_prior.pt). The H-Box
-  # experiment uses qwen35_2b_annos_probe_v2_fsm_h_box_rl.yaml instead.
+  # H-Box geometry-token prior (IAD-Unify style): inject H connected-component
+  # bboxes as STATIC geometry tokens. Loaded frozen from
+  # outcome.sft_adapter/h_box_prior.pt (trained by train_region_sft.py). Parallel
+  # to h_vpt for a clean ablation; can be removed once validated.
   h_box_prior:
-    enabled: false
+    enabled: true
+    condition: real          # real | shuffled | zero (causal ablation)
+    max_boxes: 3             # K <|h_box|> slots (== prior.max_candidates)
+    geom_dim: 11             # x1,y1,x2,y2,cx,cy,w,h,area,peak,is_valid
   # VPT-style H cross-attention: the single H channel into the LLM. Loaded frozen
   # from outcome.sft_adapter/h_vpt.pt (trained by train_region_sft.py).
   h_vpt:

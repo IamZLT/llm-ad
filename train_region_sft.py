@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Region-module SFT: train the region adapter + language LoRA with real category/bbox.
+"""H-VPT SFT: train the VPT-style H cross-attention + language LoRA with real category/bbox.
 
 Freezes the vision encoder and H/matching computation. Supervises the full five-block
 target: <ground>/<answer> carry the GT category/boxes, while the process blocks
@@ -9,7 +9,7 @@ cold-start RL policy reliably emits the whole scaffold with meaningful text.
 
 After this run, the saved directory is pointed to by ``outcome.sft_adapter`` in the RL
 config: ``load_model`` merges the SFT LoRA into the base weights, mounts the frozen
-region adapter, and starts a fresh RL LoRA.
+H-VPT module, and starts a fresh RL LoRA.
 """
 
 from __future__ import annotations
@@ -42,17 +42,17 @@ from models.looped_qwen import enable_looped_qwen, loop_enabled, set_loop_steps
 from models.lora import apply_lora
 from models.qwen35 import (setup_model_and_processor, freeze_vision_encoder, force_vision_eval,
                            unwrap_model, print_trainable_params)
-from models.region_adapter import RegionAdapter, build_region_adapter
-from models.region_injection import (bind_region_injection, ensure_region_token, load_region_adapter,
-                                     region_raw_from_batch, save_region_adapter)
-from models.h_prior_adapter import (build_h_prior_adapter, load_h_prior_adapter,
-                                    save_h_prior_adapter, HPriorAdapter)
-from models.h_memory import (build_h_memory, load_h_memory, save_h_memory,
-                             bind_h_cross_attn, HMemory)
+from models.h_vpt import (HVPT, build_h_vpt, load_h_vpt, save_h_vpt,
+                          ensure_control_token, control_token_id_of, feat_token_id_of,
+                          compute_h_H, bind_h_vpt, CONTROL_TOKEN, FEAT_TOKEN)
+from models.h_box_prior import (HBoxProjector, build_h_box_prior, load_h_box_prior,
+                                save_h_box_prior, ensure_box_token, box_token_id_of,
+                                BOX_TOKEN, bind_h_box, compute_g_proj)
 from models.vision_cache import bind_cached_image_features
 from outcome.inputs import OutcomeCollator, OutcomeDataset
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.protocol_multibox import candidate_hits_comp
+from outcome.policy import generate_group_staged
+from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.thinking import thinking_enabled, staged_sft_target, staged_sft_labels
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
@@ -179,7 +179,6 @@ def log_sft_case(writer, step, meta, target, overlay_alpha=0.45):
         f"class={meta.get('class_name')} is_anomaly={meta.get('is_anomaly')} "
         f"defect={meta.get('defect_type')}\n"
         f"image={meta.get('image_path')}\n"
-        f"h_candidates={len(meta.get('prior_candidates') or [])} "
         f"prompt_tokens={meta.get('prompt_tokens')} visual_tokens={meta.get('visual_tokens')}\n\n"
         f"{target}"
     )
@@ -254,58 +253,22 @@ def _where_join(boxes_1000) -> str:
     return ', '.join(seen[:-1]) + f', and {seen[-1]}'
 
 
-# Candidate-hit rules for the multibox <ground>/<verify> targets, in the 0-1000
-# system. H candidates are patch-aligned boxes that usually sit *inside* a GT
-# component (matched cand-GT IoU ~0.17 on VisA train), so a hit is IoU>=bar OR
-# candidate-center inside the component (shared with the RL coverage reward via
-# outcome.protocol_multibox.candidate_hits_comp).
-CAND_HIT_IOU = 0.10
-# A candidate that already covers a component this tightly needs no refinement.
-CAND_TIGHT_IOU = 0.50
+def _ground_multibox(gt_boxes: list = None) -> str:
+    """Localize-stage boxes: always the GT component boxes.
 
-
-def _box_iou_1000(a, b) -> float:
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    if inter <= 0:
-        return 0.0
-    aa = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
-    ab = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
-    union = aa + ab - inter
-    return float(inter / union) if union > 0 else 0.0
-
-
-def _prior_candidate_boxes(meta: dict) -> list:
-    """H region-hint boxes (already 0-1000) in proposal order."""
-    out = []
-    for p in meta.get('prior_candidates') or []:
-        b = p.get('bbox_2d') if isinstance(p, dict) else None
-        if b and len(b) == 4:
-            out.append([round(float(v), 3) for v in b])
-    return out
-
-
-def _ground_multibox(cands: list, gt_boxes: list = None, source: str = 'h') -> str:
-    """Localize-stage boxes.
-
-    ``source='h'`` (default): the model reads out the H region hints
-    (``candidate_bboxes_2d`` = ``prior_candidates``). This teaches a "hints ->
-    coordinates" copy, which is exactly the H-shortcut we want to avoid for the
-    cross-attention PoC.
-
-    ``source='gt'``: ``candidate_bboxes_2d`` = the GT component boxes, so GT provides
-    the localization supervision and H is only a *conditioning prior* (prompt hints +
-    H-memory), never the training target.
+    H is never the training target (its text-coordinate readout was the known
+    small-defect bottleneck). The [localize] stage is supervised on GT boxes; H
+    only conditions the model via the VPT cross-attention (the control/feat tokens
+    are prefixed to this stage by ``localize_prefix``).
     """
-    boxes = gt_boxes if (source == 'gt' and gt_boxes is not None) else cands
+    boxes = gt_boxes or []
     if not boxes:
         return 'candidate_bboxes_2d=[]'
     return f'candidate_bboxes_2d={boxes}; {_where_join(boxes)}'
 
 
 def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False, answer_only: bool = False,
-                     localize_source: str = 'h') -> str:
+                     localize_source: str = 'gt', h_vpt_tokens: str = '', h_box_tokens: str = '') -> str:
     """Five-block target; category/boxes come from GT, process blocks summarize the chain.
 
     The process blocks and the answer ``description`` are sample-aware templates built
@@ -322,18 +285,13 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
     the single union box (``bbox_2d``). Use it for the SFT that seeds multi-box RL so
     the language LoRA is already aligned with the multi-box output format.
 
-    Multibox ground/verify semantics (cold-start for the coarse-to-fine loop):
+    Multibox ground/verify semantics (VPT scheme):
 
-    * ``<ground>`` reads out the H region hints (``candidate_bboxes_2d`` =
-      ``prior_candidates`` boxes, for BOTH normal and anomalous samples) and
-      names each candidate's approximate image-frame location after a semicolon.
-      This is a label-agnostic "hints -> coordinates" task, so the candidate
-      stage is a high-recall proposal step rather than a copy of the final answer.
-    * ``<verify>`` adjudicates the candidates against GT coverage: ``keep`` when
-      they already bound the defect tightly, ``refine`` when bounds need
-      tightening or spurious candidates must be dropped, ``discover`` when GT
-      components sit beyond the marked hints, ``reject`` (normal with hints) /
-      ``none`` (normal, no hints) when no candidate confirms a defect.
+    * ``[localize]`` outputs the GT component boxes (``candidate_bboxes_2d``) with
+      the VPT control/feat tokens prefixed via ``localize_prefix``. H is never the
+      training target: it conditions the model only through the cross-attention.
+    * ``[confirm]`` confirms the localized boxes against GT (``keep`` for anomaly,
+      ``none`` for normal).
     * ``<answer>`` carries the precise per-component GT boxes (or [] for normal).
     """
     is_anom = bool(meta['is_anomaly'])
@@ -342,18 +300,17 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
         f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
         'material, structure, texture, print, and lighting as expected appearance. '
         f'Image 2 shows the same {cls} under inspection and should match that '
-        'baseline aside from a true defect. Weigh later region hints as fallible; '
-        'do not decide anomaly or coordinates yet'
+        'baseline aside from a true defect. Weigh the anomaly heatmap as a fallible '
+        'search hint; do not decide anomaly or coordinates yet'
     )
     if multibox:
-        cands = _prior_candidate_boxes(meta)
         gt_boxes = []
         if is_anom:
             comps = list(meta.get('component_bboxes') or [])
             if not comps and meta.get('gt_box_px') is not None:
                 comps = [meta['gt_box_px']]
             gt_boxes = _boxes_to_1000(comps, meta['orig_size'])
-        ground = _ground_multibox(cands, gt_boxes, source=localize_source)
+        ground = _ground_multibox(gt_boxes)
         if is_anom:
             boxes = gt_boxes
             n = len(boxes)
@@ -365,27 +322,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
                 'appearance variation on the reference cannot explain, so this is a '
                 'true defect rather than normal variation'
             )
-            comp_hit = [max((_box_iou_1000(c, g) for c in cands), default=0.0) for g in boxes]
-            covered = [any(candidate_hits_comp(c, g, CAND_HIT_IOU) for c in cands) for g in boxes]
-            n_missed = sum(1 for ok in covered if not ok)
-            n_spurious = sum(1 for c in cands
-                             if not any(candidate_hits_comp(c, g, CAND_HIT_IOU) for g in boxes))
-            if not cands:
-                verify = ('discover; the region evidence is silent, but direct reference '
-                          f'comparison localizes {n_txt} of defect on the {cls}')
-            elif n_missed > 0:
-                verify = (f'discover; {_region_count(n_missed)} '
-                          f'{_plural(n_missed, "lies", "lie")} beyond the marked candidates, '
-                          'and the rest are tightened to the defect extent')
-            elif n_spurious > 0:
-                verify = (f'refine; dropped {_region_count(n_spurious)} matching the reference '
-                          'and tightened the remaining candidates to the defect extent')
-            elif all(v >= CAND_TIGHT_IOU for v in comp_hit):
-                verify = ('keep; the candidate bounds already match the observed difference '
-                          'and are absent from the reference')
-            else:
-                verify = ('refine; tightened the candidate bounds to the exact defect extent, '
-                          'confirmed against the reference')
+            verify = ('keep; the localized boxes match the observed difference '
+                      'and are absent from the reference')
             description = (
                 f'A localized defect is present on the {cls} {where}: {n_txt} '
                 f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
@@ -398,13 +336,7 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
                 'any apparent change is material or appearance variation rather than '
                 'a true defect'
             )
-            k = len(cands)
-            if k:
-                verify = (f'reject; the marked {_plural(k, "candidate matches", "candidates match")} '
-                          'the reference, consistent with normal material or appearance '
-                          'variation rather than a true defect')
-            else:
-                verify = f'none; no candidate region confirms a true defect on the {cls}'
+            verify = f'none; no true defect on the {cls}'
             description = (
                 f'The {cls} inspection image is consistent with the Image 1 baseline; '
                 'apparent changes are material or appearance variation rather than a true defect.'
@@ -413,7 +345,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
         if answer_only:
             return f'<answer>\n{answer}\n</answer>'
         if thinking:
-            return staged_sft_target(understand, compare, ground, verify, answer)
+            return staged_sft_target(understand, compare, ground, verify, answer,
+                                     localize_prefix=h_box_tokens + h_vpt_tokens)
         return (
             f'<understand>\n{understand}\n</understand>\n'
             f'<compare>\n{compare}\n</compare>\n'
@@ -452,7 +385,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
     if answer_only:
         return f'<answer>\n{answer}\n</answer>'
     if thinking:
-        return staged_sft_target(understand, compare, ground, verify, answer)
+        return staged_sft_target(understand, compare, ground, verify, answer,
+                                 localize_prefix=h_box_tokens + h_vpt_tokens)
     return (
         f'<understand>\n{understand}\n</understand>\n'
         f'<compare>\n{compare}\n</compare>\n'
@@ -560,14 +494,20 @@ def _stack_gen_in(singles, max_len):
 
 
 def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False, answer_only=False,
-                   localize_source='h'):
+                   localize_source='gt'):
     """Collate one-at-a-time (vision cache is per-pair), then pad a language batch."""
     singles, seqs, labels_list, targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         prompt_ids = batch['input_ids'][0].tolist()
+        n_feat = int(batch.get('n_feat_tokens', 0))
+        h_vpt_on = bool(batch.get('h_map') is not None)
+        h_vpt_tokens = (CONTROL_TOKEN + FEAT_TOKEN * n_feat) if h_vpt_on else ''
+        n_box = int(batch.get('n_box_tokens', 0))
+        h_box_tokens = (BOX_TOKEN * n_box) if n_box > 0 else ''
         target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking,
-                                  answer_only=answer_only, localize_source=localize_source)
+                                  answer_only=answer_only, localize_source=localize_source,
+                                  h_vpt_tokens=h_vpt_tokens, h_box_tokens=h_box_tokens)
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
         labels_list.append(build_labels(prompt_ids, target_ids, target_text=target,
                                         tokenizer=tokenizer, thinking=thinking))
@@ -590,16 +530,11 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         labels=labels_t,
         gen_in=_stack_gen_in(singles, max_len),
         image_embeds=torch.cat([b['image_embeds'] for b in singles], dim=0),
-        region_token_id=int(singles[0]['region_token_id']),
-        region_raw=dict(
-            test=torch.cat([b['region_test'] for b in singles], dim=1),
-            ref=torch.cat([b['region_ref'] for b in singles], dim=1),
-            geom=torch.cat([b['region_geom'] for b in singles], dim=1),
-            hstat=torch.cat([b['region_hstat'] for b in singles], dim=1),
-            hpatch=torch.cat([b['region_hpatch'] for b in singles], dim=1),
-            valid=torch.cat([b['region_valid'] for b in singles], dim=1),
-        ),
+        control_token_id=int(singles[0]['control_token_id']),
+        feat_token_id=int(singles[0]['feat_token_id']),
+        box_token_id=int(singles[0].get('box_token_id', -1)),
         h_maps=[b['h_map'] for b in singles if b.get('h_map') is not None],
+        h_box_geoms=[b['h_box_geom'] for b in singles if b.get('h_box_geom') is not None],
         metas=[b['_meta'][0] for b in singles],
         targets=targets,
         seq_lens=[len(s) for s in seqs],
@@ -607,22 +542,19 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
     return packed, int((labels_t != -100).sum())
 
 
-def load_sft_model(cfg, device, init_sft=None, freeze_region=False, freeze_lora=False,
-                   freeze_h_prior=False, freeze_h_memory=False):
-    """Load the base model + (optional) LoRA + region adapter + H-prior adapter for SFT.
+def load_sft_model(cfg, device, init_sft=None, freeze_lora=False):
+    """Load the base model + (optional) LoRA + the H-VPT module for SFT.
 
-    ``init_sft`` starts from an existing region-SFT checkpoint (LoRA via
-    ``PeftModel``, region adapter from ``region_adapter.pt``) so branches can share
-    a common Direct-SFT start point instead of re-training the RegionAdapter.
-    ``freeze_region`` keeps that loaded adapter frozen (only the LoRA trains).
+    ``init_sft`` starts from an existing SFT checkpoint (LoRA via ``PeftModel``,
+    H-VPT from ``h_vpt.pt``) so branches can share a common start point.
     ``freeze_lora`` freezes the LoRA loaded via ``init_sft`` (used for the mechanism
-    probe that trains only the HPriorAdapter).
-    ``freeze_h_prior`` freezes the HPriorAdapter (default: trainable when enabled).
+    probe that trains only the H-VPT module).
     """
     if device.type == 'cuda':
         torch.cuda.set_device(device)
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
-    ensure_region_token(processor, model)
+    ensure_control_token(processor, model)
+    ensure_box_token(processor, model)
     if init_sft:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, init_sft, is_trainable=not freeze_lora)
@@ -636,86 +568,108 @@ def load_sft_model(cfg, device, init_sft=None, freeze_region=False, freeze_lora=
         model.enable_input_require_grads()
     force_vision_eval(model)
     prior = AnomalyPrior.from_qwen(model, cfg)
-    feature_dim = int(prior.visual.config.hidden_size)
     hidden_size = int(model.config.text_config.hidden_size)
-    if init_sft:
-        region_path = Path(init_sft) / 'region_adapter.pt'
-        if not region_path.exists():
-            raise ValueError(f'region adapter missing in --init-sft dir: {region_path}')
-        model.region_adapter = load_region_adapter(RegionAdapter, region_path, feature_dim, hidden_size)
-    else:
-        model.region_adapter = build_region_adapter(cfg, feature_dim, hidden_size)
-    # The adapter is created after model.to(device): sync it explicitly or the SFT
-    # forward will hit a CPU/FP32 vs GPU/BF16 mismatch.
     dtype = next(model.parameters()).dtype
-    model.region_adapter.to(device=device, dtype=dtype)
-    if freeze_region:
-        for p in model.region_adapter.parameters():
-            p.requires_grad = False
-        model.region_adapter.eval()
-
-    # Optional H-prior side channel. When enabled it is trainable by default (this is
-    # the PoC module under test); --freeze-h-prior keeps it frozen.
-    hcfg = (cfg.get('outcome') or {}).get('h_prior_adapter') or {}
-    model.h_prior_adapter = None
-    if bool(hcfg.get('enabled', False)):
+    # H-VPT module: the ONLY trainable H channel (H -> z_H -> control cross-attn).
+    hvcfg = (cfg.get('outcome') or {}).get('h_vpt') or {}
+    model.h_vpt = None
+    if bool(hvcfg.get('enabled', False)):
         if init_sft:
-            h_path = Path(init_sft) / 'h_prior_adapter.pt'
+            h_path = Path(init_sft) / 'h_vpt.pt'
             if h_path.exists():
-                model.h_prior_adapter = load_h_prior_adapter(HPriorAdapter, h_path, hidden_size)
+                model.h_vpt = load_h_vpt(HVPT, h_path, hidden_size)
             else:
-                model.h_prior_adapter = build_h_prior_adapter(cfg, hidden_size)
+                model.h_vpt = build_h_vpt(cfg, hidden_size)
         else:
-            model.h_prior_adapter = build_h_prior_adapter(cfg, hidden_size)
-        model.h_prior_adapter.to(device=device, dtype=dtype)
-        if freeze_h_prior:
-            for p in model.h_prior_adapter.parameters():
-                p.requires_grad = False
-            model.h_prior_adapter.eval()
+            model.h_vpt = build_h_vpt(cfg, hidden_size)
+        model.h_vpt.to(device=device, dtype=dtype)
 
-    # Optional Spatial H-Memory cross-attention. Trainable by default (the PoC module
-    # under test); --freeze-h-memory keeps it frozen (e.g. joint LoRA ablation).
-    hmcfg = (cfg.get('outcome') or {}).get('h_memory') or {}
-    model.h_memory = None
-    if bool(hmcfg.get('enabled', False)):
+    # H-Box geometry-token prior: static linear projection of connected-component
+    # bbox geometry (parallel to H-VPT for a clean ablation).
+    hbcfg = (cfg.get('outcome') or {}).get('h_box_prior') or {}
+    model.h_box_prior = None
+    if bool(hbcfg.get('enabled', False)):
         if init_sft:
-            hm_path = Path(init_sft) / 'h_memory.pt'
-            if hm_path.exists():
-                model.h_memory = load_h_memory(HMemory, hm_path, hidden_size)
+            b_path = Path(init_sft) / 'h_box_prior.pt'
+            if b_path.exists():
+                model.h_box_prior = load_h_box_prior(b_path, hidden_size)
             else:
-                model.h_memory = build_h_memory(cfg, hidden_size)
+                model.h_box_prior = build_h_box_prior(cfg, hidden_size)
         else:
-            model.h_memory = build_h_memory(cfg, hidden_size)
-        model.h_memory.to(device=device, dtype=dtype)
-        if freeze_h_memory:
-            for p in model.h_memory.parameters():
-                p.requires_grad = False
-            model.h_memory.eval()
+            model.h_box_prior = build_h_box_prior(cfg, hidden_size)
+        model.h_box_prior.to(device=device, dtype=dtype)
 
     parts = ['LoRA']
     if freeze_lora and init_sft:
         parts = ['冻结 LoRA']
-    if freeze_region:
-        parts.append('冻结 region adapter')
-    else:
-        parts.append('region adapter')
-    if model.h_prior_adapter is not None:
-        parts.append('冻结 HPriorAdapter' if freeze_h_prior else 'HPriorAdapter')
-    if model.h_memory is not None:
-        parts.append('冻结 HMemory' if freeze_h_memory else 'HMemory')
+    if model.h_vpt is not None:
+        parts.append('H-VPT')
+    if model.h_box_prior is not None:
+        parts.append('H-Box')
     note = ' + '.join(parts) + '（视觉塔已冻结）'
     print_trainable_params(model, note=note)
     return model, processor, prior
 
 
+def _h_vpt_probe_train(model, h_vpt, packed, g_proj_flat=None):
+    """Two-pass VPT step 1 (training): forward prompt→control token, return h_H.
+
+    The packed ``input_ids`` carry ``<|h_ctrl|>`` + N ``<|h_feat|>`` inside the
+    ``[localize]`` body. We run a truncated forward up to (and including) the
+    control token to read its last-layer hidden (detached, mirroring VPT's
+    two-turn formulation), then project H into h_H. Returns [B, N, hidden].
+
+    ``g_proj_flat`` (when non-None) scatters the H-Box geometry tokens during the
+    probe so ``h_ctrl`` is the model's hidden state *after* seeing the geometry
+    prior — matching the staged decoder's probe exactly.
+    """
+    ctrl_id = int(packed['control_token_id'])
+    input_ids = packed['input_ids']
+    attention_mask = packed['attention_mask']
+    pos = (input_ids == ctrl_id).long().argmax(dim=-1)  # [B], exactly one per row
+    max_pos = int(pos.max().item())
+    ids_trunc = input_ids[:, :max_pos + 1].contiguous()
+    attn_trunc = attention_mask[:, :max_pos + 1].contiguous()
+    box_id = int(packed.get('box_token_id', -1))
+    with torch.no_grad():
+        with bind_h_box(model, g_proj_flat, box_id):
+            out = forward_with_vision(model, packed['gen_in'], ids_trunc, attn_trunc,
+                                      output_hidden_states=True)
+        h = out.hidden_states[-1]  # [B, L, hidden]
+        n = int(ids_trunc.shape[0])
+        h_ctrl = h[torch.arange(n, device=h.device), pos].detach()  # [B, hidden]
+    h_maps = packed['h_maps']
+    h_Hs = [compute_h_H(h_vpt, hm, h_ctrl[b:b + 1]) for b, hm in enumerate(h_maps)]
+    return torch.stack(h_Hs, dim=0)  # [B, N, hidden]
+
+
 def batch_loss(model, packed, backward_scale=None):
-    """Teacher-forced CE on a packed batch. Backward stays inside the bind contexts."""
-    adapter = getattr(unwrap_model(model), 'region_adapter', None)
-    h_mem = getattr(unwrap_model(model), 'h_memory', None)
-    with bind_cached_image_features(model, packed['image_embeds']), \
-            bind_region_injection(model, adapter, packed['region_raw'], int(packed['region_token_id'])), \
-            bind_h_cross_attn(model, h_mem, packed.get('h_maps')):
-        out = forward_with_vision(model, packed['gen_in'], packed['input_ids'], packed['attention_mask'])
+    """Teacher-forced CE with a two-pass VPT H injection + H-Box geometry tokens.
+
+    Backward stays in the binds. The H-Box geometry tokens are static (linear
+    projection, no probe), so ``g_proj_flat`` is computed once and scattered into
+    the ``<|h_box|>`` slots on both the VPT probe and the main forward.
+    """
+    core = unwrap_model(model)
+    h_vpt = getattr(core, 'h_vpt', None)
+    h_box = getattr(core, 'h_box_prior', None)
+    h_maps = packed.get('h_maps')
+    h_box_geoms = packed.get('h_box_geoms')
+    box_id = int(packed.get('box_token_id', -1))
+    with bind_cached_image_features(model, packed['image_embeds']):
+        g_proj_flat = None
+        if h_box is not None and h_box_geoms:
+            g_proj_flat = torch.cat([compute_g_proj(h_box, g) for g in h_box_geoms], dim=0)
+        if h_vpt is not None and h_maps:
+            h_H = _h_vpt_probe_train(model, h_vpt, packed, g_proj_flat)  # [B, N, hidden]
+            h_H_flat = h_H.reshape(-1, h_H.shape[-1])
+            with bind_h_box(model, g_proj_flat, box_id), bind_h_vpt(model, h_H_flat, int(packed['feat_token_id'])):
+                out = forward_with_vision(model, packed['gen_in'], packed['input_ids'],
+                                          packed['attention_mask'])
+        else:
+            with bind_h_box(model, g_proj_flat, box_id):
+                out = forward_with_vision(model, packed['gen_in'], packed['input_ids'],
+                                          packed['attention_mask'])
         shift_logits = out.logits[:, :-1, :].contiguous()
         shift_labels = packed['labels'][:, 1:].contiguous()
         loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
@@ -725,7 +679,7 @@ def batch_loss(model, packed, backward_scale=None):
     return loss
 
 
-def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False, localize_source='h'):
+def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False, localize_source='gt'):
     """Mean teacher-forced loss on the holdout split (no update).
 
     Every rank evaluates an equal-length disjoint shard using the unwrapped module
@@ -762,7 +716,71 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     return total / max(1, count), count
 
 
-def _in_distributed_worker() -> bool:
+def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, device, limit, seed, step):
+    """Lightweight FSM rollout smoke eval (real generation + scoring).
+
+    Sharded across ranks like ``evaluate_dev`` so NCCL stays in lockstep; each rank
+    runs ``generate_group_staged`` (greedy) on its shard, then the scalar metrics are
+    all-reduced. Returns a dict ready for logging / console print. This is the "does
+    the VPT H-injection actually help the model emit correct boxes" signal, unlike the
+    teacher-forced dev loss.
+    """
+    raw = unwrap_model(model)
+    raw.eval()
+    force_vision_eval(raw)
+    max_boxes = int(cfg['outcome'].get('max_boxes', 16))
+    protocol_weight = float(cfg['outcome'].get('protocol_weight', 0.01))
+    loc_cfg = {**(cfg['outcome'].get('localization') or {}), **(cfg['outcome'].get('reward') or {})}
+    rng = random.Random(int(seed) * 999983 + int(step))
+    order = list(range(len(dev_dataset)))
+    rng.shuffle(order)
+    order = order[:max(1, int(limit))]
+    world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+    shard = order[rank::world]
+    if world > 1:
+        t = torch.tensor([len(shard)], device=device, dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        shard = shard[:int(t.item())]
+
+    n_anom = n_norm = n_correct_anom = n_correct_norm = n_valid = 0
+    miou_sum = 0.0
+    samples = []
+    with torch.no_grad():
+        for i in shard:
+            batch = move_batch(collator([dev_dataset[i]]), device)
+            comp = generate_group_staged(raw, processor, batch, cfg, group=1, sample=False)[0]
+            parsed = parse_output_cfg(comp.text, cfg, max_boxes=max_boxes)
+            meta = batch['_meta'][0]
+            sc = score_output(parsed, meta, protocol_weight, loc_cfg, max_boxes=max_boxes)
+            is_anom = bool(meta['is_anomaly'])
+            if is_anom:
+                n_anom += 1
+                miou_sum += float(sc.get('mask_iou') or 0.0)
+                n_correct_anom += int(bool(sc.get('correct')))
+            else:
+                n_norm += 1
+                n_correct_norm += int(bool(sc.get('correct')))
+            n_valid += int(bool(parsed.get('task_valid')))
+            if rank == 0 and len(samples) < 3:
+                samples.append((str(meta.get('class_name')), is_anom, comp.text))
+
+    acc = torch.tensor([float(n_anom), float(n_norm), float(n_correct_anom), float(n_correct_norm),
+                        float(n_valid), float(miou_sum)], device=device, dtype=torch.float64)
+    if world > 1:
+        dist.all_reduce(acc, op=dist.ReduceOp.SUM)
+    n_anom, n_norm, n_correct_anom, n_correct_norm, n_valid, miou_sum = (float(acc[k]) for k in range(6))
+    model.train()
+    force_vision_eval(model)
+    return dict(
+        n=int(n_anom + n_norm),
+        recall=(n_correct_anom / n_anom if n_anom else None),
+        tnr=(n_correct_norm / n_norm if n_norm else None),
+        acc=(n_correct_anom + n_correct_norm) / max(1, int(n_anom + n_norm)),
+        task_valid=n_valid / max(1, int(n_anom + n_norm)),
+        mask_miou=(miou_sum / n_anom if n_anom else None),
+        samples=samples,
+    )
     return os.environ.get('LOCAL_RANK') is not None
 
 
@@ -781,17 +799,16 @@ def _save_adapter(model, processor, path: Path):
     core = unwrap_model(model)
     core.save_pretrained(path)
     processor.save_pretrained(path)
-    save_region_adapter(getattr(core, 'region_adapter', None), path / 'region_adapter.pt')
-    save_h_prior_adapter(getattr(core, 'h_prior_adapter', None), path / 'h_prior_adapter.pt')
-    save_h_memory(getattr(core, 'h_memory', None), path / 'h_memory.pt')
+    save_h_vpt(getattr(core, 'h_vpt', None), path / 'h_vpt.pt')
+    save_h_box_prior(getattr(core, 'h_box_prior', None), path / 'h_box_prior.pt')
 
 
 def _build_optimizer(model, args):
-    """AdamW over trainable params; the HPriorAdapter scalar gate gets its own LR.
+    """AdamW over trainable params; the H-VPT projector gate gets its own LR.
 
-    The alpha gate is zero-initialized for exact baseline parity, which mutes the
-    conv/proj gradients (dR'/dW ∝ tanh(alpha)). A separate, larger gate LR lets
-    alpha turn on first so the rest of the module can receive meaningful gradients.
+    The projector gate is zero-initialized for exact baseline parity, which mutes
+    the encoder/projector gradients (dOut/dW ∝ tanh(gate)). A separate, larger gate
+    LR lets the gate turn on first so the rest of the module can receive gradients.
     """
     base_lr = float(args.lr)
     gate_lr = float(args.gate_lr) if args.gate_lr is not None else base_lr
@@ -800,7 +817,7 @@ def _build_optimizer(model, args):
         return torch.optim.AdamW([p for _, p in trainable], lr=base_lr, weight_decay=0.0)
 
     def _is_gate(name: str) -> bool:
-        if name.endswith('h_prior_adapter.alpha'):
+        if name.endswith('h_vpt.projector.gate'):
             return True
         return '.cross_attns.' in name and name.endswith('.gate')
 
@@ -828,22 +845,20 @@ def main():
     parser.add_argument('--max-grad-norm', type=float, default=1.0)
     parser.add_argument('--dev-eval-samples', type=int, default=64,
                         help='holdout samples for the dev loss reported at each epoch end; 0 disables')
+    parser.add_argument('--eval-steps', type=int, default=0,
+                        help='run a quick FSM rollout smoke eval every N optimizer steps (0 disables)')
+    parser.add_argument('--eval-rollout-samples', type=int, default=12,
+                        help='holdout samples per smoke eval for the FSM rollout (sharded across ranks)')
     parser.add_argument('--init-sft', default=None,
-                        help='start from an existing region-SFT checkpoint (LoRA + region adapter) '
-                             'so mechanism branches share a common Direct-SFT start point')
-    parser.add_argument('--freeze-region-adapter', action='store_true',
-                        help='freeze the region adapter loaded via --init-sft (only LoRA trains)')
+                        help='start from an existing SFT checkpoint (LoRA + H-VPT) '
+                             'so mechanism branches share a common start point')
     parser.add_argument('--freeze-lora', action='store_true',
                         help='freeze the LoRA loaded via --init-sft (used for the mechanism probe '
-                             'that trains only the HPriorAdapter)')
-    parser.add_argument('--freeze-h-prior', action='store_true',
-                        help='freeze the HPriorAdapter (trainable by default when enabled)')
-    parser.add_argument('--freeze-h-memory', action='store_true',
-                        help='freeze the HMemory cross-attn (trainable by default when enabled)')
+                             'that trains only the H-VPT module)')
     parser.add_argument('--gate-lr', type=float, default=None,
-                        help='separate LR for the HPriorAdapter alpha gate (scalar). '
+                        help='separate LR for the H-VPT projector gate (scalar). '
                              'Defaults to --lr; a larger value is needed because the zero-init gate '
-                             'mutes the conv/proj gradients at alpha=0.')
+                             'mutes the encoder/projector gradients at gate=0.')
     args = parser.parse_args()
     _maybe_relaunch_multi_gpu(args.num_gpu)
 
@@ -870,10 +885,7 @@ def main():
     collator_cls = OutcomeMultiboxCollator if multibox else OutcomeCollator
 
     model, processor, prior = load_sft_model(cfg, device, init_sft=args.init_sft,
-                                             freeze_region=args.freeze_region_adapter,
-                                             freeze_lora=args.freeze_lora,
-                                             freeze_h_prior=args.freeze_h_prior,
-                                             freeze_h_memory=args.freeze_h_memory)
+                                             freeze_lora=args.freeze_lora)
     if world > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
                     find_unused_parameters=False)
@@ -881,9 +893,10 @@ def main():
     thinking = thinking_enabled(cfg)
     reasoning_mode = str((cfg.get('outcome') or {}).get('reasoning_mode', 'fsm'))
     answer_only = reasoning_mode in ('loop', 'direct')
-    localize_source = str((cfg.get('outcome') or {}).get('sft', {}).get('localize_target', 'h'))
-    if localize_source not in ('h', 'gt'):
-        raise ValueError(f"outcome.sft.localize_target must be 'h' or 'gt', got {localize_source!r}")
+    # H is never the training target: [localize] is always supervised on GT boxes
+    # (H conditions the model only via the VPT cross-attention). The old 'h'
+    # "read out H region hints as text" target is removed.
+    localize_source = 'gt'
 
     train, test = load_prior_split(cfg)
     train, dev = split_holdout_by_class(train, float(cfg['data']['holdout_ratio']),
@@ -965,29 +978,23 @@ def main():
                     writer.add_scalar('train/lr', float(args.lr), step)
                     writer.add_scalar('train/epoch', epoch, step)
                     writer.add_scalar('optimizer/grad_norm', grad_norm, step)
-                    hp = getattr(unwrap_model(model), 'h_prior_adapter', None)
-                    if hp is not None:
-                        writer.add_scalar('h_prior/alpha', float(hp.alpha.detach()), step)
-                        writer.add_scalar('h_prior/gate', float(torch.tanh(hp.alpha.detach())), step)
-                    hm = getattr(unwrap_model(model), 'h_memory', None)
-                    if hm is not None:
-                        gates = [torch.tanh(ca.gate.detach()) for ca in hm.cross_attns.values()]
-                        for i, g in enumerate(gates):
-                            writer.add_scalar(f'h_memory/gate_l{hm.layers[i]}', float(g), step)
-                        writer.add_scalar('h_memory/gate_mean', float(torch.stack(gates).mean()), step)
+                    hv = getattr(unwrap_model(model), 'h_vpt', None)
+                    if hv is not None:
+                        g = torch.tanh(hv.projector.gate.detach())
+                        writer.add_scalar('h_vpt/gate', float(g), step)
                     writer.add_scalar('train/seconds_per_step', seconds, step)
                     if device.type == 'cuda':
                         writer.add_scalar('train/gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 1024 ** 3, step)
                     writer.flush()
                     if main_proc and step % log_every == 0:
-                        alpha_s = ''
-                        hp = getattr(unwrap_model(model), 'h_prior_adapter', None)
-                        if hp is not None:
-                            alpha_s = f' alpha={float(hp.alpha.detach()):+.4f}(gate={float(torch.tanh(hp.alpha.detach())):+.3f})'
+                        gate_s = ''
+                        hv = getattr(unwrap_model(model), 'h_vpt', None)
+                        if hv is not None:
+                            gate_s = f' h_gate={float(torch.tanh(hv.projector.gate.detach())):+.3f}'
                         print(f'[sft] step={step} loss={running_loss / max(1, window_samples):.4f} '
                               f'supervised_tok={running_supervised} seq={seq_mean:.0f} '
                               f'anom={anomaly_frac:.2f} gnorm={grad_norm:.2f} '
-                              f'seen={seen * batch_size} ({seconds:.1f}s){alpha_s}', flush=True)
+                              f'seen={seen * batch_size} ({seconds:.1f}s){gate_s}', flush=True)
                         running_loss = 0.0
                         running_supervised = 0
                         window_samples = 0
@@ -997,6 +1004,26 @@ def main():
                     if main_proc and args.save_steps > 0 and step % int(args.save_steps) == 0:
                         _save_adapter(model, processor, output_dir / f'checkpoint-{step}')
                     if world > 1 and dist.is_initialized() and args.save_steps > 0 and step % int(args.save_steps) == 0:
+                        dist.barrier()
+                    # Quick FSM rollout smoke eval every N steps (real generation + score).
+                    if args.eval_steps > 0 and step % int(args.eval_steps) == 0 and dev_dataset is not None:
+                        q = quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, device,
+                                               int(args.eval_rollout_samples), seed, step)
+                        writer.add_scalar('smoke/recall', q['recall'] if q['recall'] is not None else float('nan'), step)
+                        writer.add_scalar('smoke/tnr', q['tnr'] if q['tnr'] is not None else float('nan'), step)
+                        writer.add_scalar('smoke/acc', q['acc'], step)
+                        writer.add_scalar('smoke/task_valid', q['task_valid'], step)
+                        writer.add_scalar('smoke/mask_miou', q['mask_miou'] if q['mask_miou'] is not None else float('nan'), step)
+                        writer.flush()
+                        if main_proc:
+                            def _fmt(v):
+                                return '--' if v is None else f'{v:.3f}'
+                            print(f'[smoke] step={step} n={q["n"]} rec={_fmt(q["recall"])} tnr={_fmt(q["tnr"])} '
+                                  f'acc={q["acc"]:.3f} tv={q["task_valid"]:.3f} mIoU={_fmt(q["mask_miou"])}', flush=True)
+                            for cls, anom, text in q['samples']:
+                                tag = 'ANOM' if anom else 'NORM'
+                                print(f'  [{tag}:{cls}] {text[-240:]}', flush=True)
+                    if world > 1 and dist.is_initialized() and args.eval_steps > 0 and step % int(args.eval_steps) == 0:
                         dist.barrier()
             if dev_dataset is not None:
                 dev_loss, n_dev = evaluate_dev(model, collator, dev_dataset, device, tokenizer,
@@ -1020,7 +1047,7 @@ def main():
 
         if main_proc:
             _save_adapter(model, processor, output_dir)
-            print(f'[sft] saved SFT LoRA + region adapter to {output_dir} (steps={step})', flush=True)
+            print(f'[sft] saved SFT LoRA + H-VPT to {output_dir} (steps={step})', flush=True)
     finally:
         writer.close()
         if world > 1 and dist.is_initialized():

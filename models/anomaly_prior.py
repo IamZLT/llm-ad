@@ -72,6 +72,52 @@ def softmax_fuse_maps(maps: torch.Tensor, temperature: float) -> torch.Tensor:
     return (w * maps).sum(dim=0)
 
 
+def fuse_maps(
+    maps: torch.Tensor,
+    mode: str = "softmax",
+    temperature: float = 0.5,
+    normalize_layers: bool = False,
+) -> torch.Tensor:
+    """Fuse per-layer distance maps [L,H,W] → single H [H,W].
+
+    ``mode`` controls how the L layer responses are combined:
+      - ``softmax`` : temperature softmax (larger distance dominates; the legacy
+        behaviour, biased toward *anomaly*).
+      - ``mean``    : simple average. This matches WinCLIP+ Eq.(5), which averages
+        the multi-scale reference-association maps 1/3(M_P + M_Ws + M_Wm). Biased
+        toward *consensus* across layers rather than the hottest layer.
+      - ``harmonic``: harmonic mean, biased toward the *normal* (small-distance)
+        side, mirroring WinCLIP Eq.(3).
+
+    ``normalize_layers`` z-scores each layer map before fusing so a block whose
+    raw distances happen to live on a larger scale does not silently dominate
+    ``mean``/``softmax`` (the softmax branch already shifts by max, but not by
+    per-layer spread).
+    """
+    mode = str(mode).lower()
+    if mode not in ("softmax", "mean", "harmonic"):
+        raise ValueError(f"unknown fusion_mode={mode!r} (softmax|mean|harmonic)")
+
+    x = maps
+    if normalize_layers and x.shape[0] > 1:
+        mu = x.mean(dim=(1, 2), keepdim=True)
+        sd = x.std(dim=(1, 2), keepdim=True) + 1e-6
+        x = (x - mu) / sd
+
+    if mode == "softmax":
+        tau = max(float(temperature), 1e-6)
+        y = x / tau
+        y = y - y.amax(dim=0, keepdim=True)
+        w = torch.exp(y)
+        w = w / (w.sum(dim=0, keepdim=True) + 1e-8)
+        return (w * x).sum(dim=0)
+    if mode == "mean":
+        return x.mean(dim=0)
+    # harmonic mean: shift to positive, invert, average, invert back
+    shifted = x - x.min() + 1e-6
+    return 1.0 / (1.0 / shifted).mean(dim=0)
+
+
 def jet_colormap(values: np.ndarray) -> np.ndarray:
     """values in [0,1] → uint8 RGB, matplotlib-like jet."""
     x = np.clip(values, 0.0, 1.0)
@@ -179,6 +225,8 @@ class AnomalyPrior(nn.Module):
         layers = prior_cfg.get("layer_indices") or [12, 16, 20, 24]
         self.block_indices = to_block_indices(layers, index_base, depth)
         self.temperature = float(prior_cfg.get("softmax_temperature", 0.5))
+        self.fusion_mode = str(prior_cfg.get("fusion_mode", "softmax")).lower()
+        self.normalize_layers = bool(prior_cfg.get("normalize_layers", False))
         self.neighborhood_radius = int(prior_cfg.get("neighborhood_radius", 0))
         self.spatial_merge_size = int(
             getattr(visual, "spatial_merge_size", getattr(visual.config, "spatial_merge_size", 2))
@@ -368,7 +416,10 @@ class AnomalyPrior(nn.Module):
             for ft, fr in zip(f_t_layers, f_r_layers)
         ]
         stack = torch.stack(maps, dim=0)
-        anomaly = softmax_fuse_maps(stack, self.temperature) if stack.shape[0] > 1 else stack[0]
+        anomaly = (
+            fuse_maps(stack, self.fusion_mode, self.temperature, self.normalize_layers)
+            if stack.shape[0] > 1 else stack[0]
+        )
         heatmap = anomaly.unsqueeze(0).unsqueeze(0)
         if upsample_size is not None:
             heatmap = F.interpolate(heatmap, size=upsample_size, mode="bilinear", align_corners=False)

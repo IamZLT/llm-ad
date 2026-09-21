@@ -30,6 +30,7 @@ REGION_TENSOR_KEYS = (
     "region_geom",
     "region_hstat",
     "region_hpatch",
+    "region_role",
     "region_valid",
 )
 
@@ -78,7 +79,7 @@ def has_region(batch: dict) -> bool:
 
 
 def region_raw_from_batch(batch: dict) -> Dict[str, torch.Tensor]:
-    return dict(
+    raw = dict(
         test=batch["region_test"],
         ref=batch["region_ref"],
         geom=batch["region_geom"],
@@ -86,6 +87,10 @@ def region_raw_from_batch(batch: dict) -> Dict[str, torch.Tensor]:
         hpatch=batch["region_hpatch"],
         valid=batch["region_valid"],
     )
+    role = batch.get("region_role")
+    if role is not None:
+        raw["role"] = role
+    return raw
 
 
 class _RegionScatterEmbedding(nn.Module):
@@ -183,7 +188,16 @@ def load_region_adapter(cls, path, feature_dim: int, hidden_size: int) -> nn.Mod
     config.setdefault("feature_dim", int(feature_dim))
     config.setdefault("hidden_size", int(hidden_size))
     adapter = cls(**config)
-    adapter.load_state_dict(ckpt["state_dict"])
+    # ``role_embedding`` was added later (zero-initialized); tolerate its absence so
+    # old region adapters can be reused as a stable init for the role-aware adapter.
+    missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=False)
+    allowed_missing = {"role_embedding.weight"}
+    extra_missing = set(missing) - allowed_missing
+    if extra_missing or unexpected:
+        raise ValueError(
+            f"region adapter load mismatch for {path}: missing={sorted(extra_missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
     return adapter
 
 
@@ -219,6 +233,10 @@ def attach_region_adapter(model, prior, cfg, sft_dir) -> nn.Module:
     feature_dim = int(prior.visual.config.hidden_size)
     hidden_size = language_hidden_size(model)
     adapter = load_region_adapter(RegionAdapter, ckpt, feature_dim, hidden_size)
+    # ``use_hstat`` is a config-level decision (the router turns raw-H injection off);
+    # make the active config authoritative over whatever the checkpoint recorded.
+    rc = (cfg.get("outcome") or {}).get("region") or {}
+    adapter.use_hstat = bool(rc.get("use_hstat", True))
     for p in adapter.parameters():
         p.requires_grad = False
     adapter.eval()
