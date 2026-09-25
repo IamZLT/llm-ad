@@ -17,7 +17,7 @@ import torch
 
 from outcome.inputs_multibox import OutcomeMultiboxCollator
 from outcome.metrics import component_metrics, detection_metrics, union_iou
-from outcome.policy import generate_group, generate_group_staged
+from outcome.policy import generate_group, generate_group_zoom
 from outcome.protocol import iou, to_pixels
 from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.visualize_multibox import log_outcome_eval_grid
@@ -75,6 +75,7 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes)
         protocol_core=parsed['protocol_core'], protocol_strict=parsed['protocol_strict'],
         think_ok=parsed.get('think_ok'), think_filled=parsed.get('think_filled'),
         candidate_state=parsed['candidate_state'], verify_action=parsed['verify_action'],
+        imagine_action=parsed.get('imagine_action'),
         reject_bonus=score.get('reject_bonus', 0.0),
         reward=score['total'], loc_reward=score['loc_reward'], set_c_reward=score['set_c_reward'],
         set_f_reward=score['set_f_reward'], delta_refine=score['delta_refine'],
@@ -83,6 +84,8 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes)
         task_reward=score['task'],
         mask_iou=score['mask_iou'], union_iou=score['union_iou'], gt_box_px=gt, bboxes_2d=parsed['bboxes_2d'],
         candidate_bboxes_2d=parsed['candidate_bboxes_2d'], num_boxes=parsed['num_boxes'],
+        discrim_correct=score.get('discrim_correct'), imagine_correct=score.get('imagine_correct'),
+        objective_verdict=score.get('objective_verdict'), refine_verdict=score.get('refine_verdict'),
         num_components=int(meta.get('num_components') or (len(comps) if anomaly else 0)),
         iou_h_top1=iou_h_top1, iou_h_bestk=iou_h_bestk,
         prior_any_top1_iou=prior_any_top1_iou, prior_any_best_iou=prior_any_best_iou,
@@ -320,14 +323,11 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
         indices = list(indices)
         count = len(indices)
     t_start = time.perf_counter()
-    staged = bool((cfg.get('grpo') or {}).get('staged_rollout', False))
     with output_path.with_suffix('.jsonl').open('w') as stream:
         for pos, index in enumerate(indices):
             started = time.perf_counter()
             batch = move_batch(collator([dataset[index]]), device)
-            completion = (generate_group_staged(model, processor, batch, cfg, group=1, sample=False)[0]
-                          if staged else
-                          generate_group(model, processor, batch, cfg)[0])
+            completion = generate_group_zoom(model, processor, prior, batch, cfg)[0]
             parsed = parse_output_cfg(completion.text, cfg, max_boxes=max_boxes)
             meta = batch['_meta'][0]
             reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),

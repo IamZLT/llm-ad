@@ -320,6 +320,7 @@ def api_predict():
                 candidate_px=cand_px,
                 h_boxes=h_px,
                 verify_action=parsed.get("verify_action"),
+                imagine_action=parsed.get("imagine_action"),
                 description=(parsed.get("description") or ""),
                 text=completion.text,
                 stop_reason=completion.stop_reason,

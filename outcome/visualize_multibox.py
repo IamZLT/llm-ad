@@ -81,6 +81,7 @@ def format_outcome_case_text(step, meta, response, parsed, union_iou, loc_reward
         f"candidate_bboxes_2d={_fmt_boxes(parsed.get('candidate_bboxes_2d'))}",
         f"task_valid={parsed.get('task_valid')} core={parsed.get('protocol_core')} "
         f"strict={parsed.get('protocol_strict')} action={parsed.get('action')} "
+        f"imagine={parsed.get('imagine_action')} "
         f"think_ok={parsed.get('think_ok')} think_filled={parsed.get('think_filled')}",
         f"num_boxes={parsed.get('num_boxes')} num_components={meta.get('num_components')}",
         f"description={parsed.get('description') or ''}",

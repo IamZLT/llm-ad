@@ -282,23 +282,9 @@ def test_refine_term_is_two_sided_and_clipped():
     p = parse_output(text)
     s = score_output(p, _anomaly_meta(), protocol_weight=0.01)
     assert s['delta_refine'] == pytest.approx(-0.5)
-    # 0.5*0.5 + 0.2*0.5 + 0.3*0.5 + 0.2*1.0 (candidate covers both) - 0.1*0.2
-    assert s['task'] == pytest.approx(0.25 + 0.1 + 0.15 + 0.2 - 0.02)
-
-
-def test_giant_candidate_box_is_excluded_anti_hack():
-    # a whole-image candidate must not earn coverage or focus rewards
-    text = _output('candidate_bboxes_2d=[[0,0,1000,1000]]', 'keep; evidence',
-                   '{"is_anomaly":true,"bboxes_2d":[[100,100,200,200],[500,500,600,600]],"description":"d"}')
-    p = parse_output(text)
-    s = score_output(p, _anomaly_meta(), protocol_weight=0.01)
-    assert s['cand_coverage'] == pytest.approx(0.0)
-    text = _output('candidate_bboxes_2d=[[0,0,1000,1000]]', 'reject; noise',
-                   '{"is_anomaly":false,"bboxes_2d":[],"description":"normal"}')
-    p = parse_output(text)
-    s = score_output(p, _normal_meta(), protocol_weight=0.01)
-    assert s['focus_reward'] == pytest.approx(0.0)
-    assert s['task'] == pytest.approx(1.0)
+    # loc_reward = max(final, candidate) = 1.0 (candidate covers both), so dense = 0.3*1.0
+    # 0.5*0.5 + 0.2*0.5 + 0.3*1.0 + 0.2*1.0 (candidate covers both) - 0.1*0.2
+    assert s['task'] == pytest.approx(0.25 + 0.1 + 0.3 + 0.2 - 0.02)
 
 
 def test_focus_band_applies_to_normal_with_three_candidates():

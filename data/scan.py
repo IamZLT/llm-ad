@@ -285,6 +285,52 @@ def scan_mvtec(root: str, split: str = "test", min_contour_area: int = 5,
     return samples
 
 
+def augment_synthetic_anomalies(samples: List[dict], data_cfg: dict, seed: int = 42) -> List[dict]:
+    """Append synthetic-anomaly variants of normal samples.
+
+    Each normal sample can spawn ``per_normal`` synthetic anomalies whose defect
+    shape/size/seed is drawn here; the pixels and GT boxes are materialized later
+    in ``PriorCoTDataset._load_pair`` (the image is only opened there). A synthetic
+    sample keeps the normal query as its inspection image and turns it anomalous.
+    """
+    from data.synthetic_anomaly import DEFAULT_SIZE_BINS, sample_defect_spec
+
+    syn_cfg = data_cfg.get("synthetic_anomaly") or {}
+    if not syn_cfg.get("enabled", False):
+        return samples
+    per_normal = int(syn_cfg.get("per_normal", 1))
+    if per_normal <= 0:
+        return samples
+    size_bins = list(syn_cfg.get("size_bins") or DEFAULT_SIZE_BINS)
+    rng = random.Random(seed)
+    normals = [s for s in samples if not _is_anomaly_sample(s)]
+    extra: List[dict] = []
+    for s in normals:
+        for k in range(per_normal):
+            spec = sample_defect_spec(rng, size_bins)
+            extra.append(
+                {
+                    "id": f"{s['id']}_syn{k}",
+                    "full_img_path": s.get("full_img_path") or s.get("image"),
+                    "image": s.get("full_img_path") or s.get("image"),
+                    "metadata": {
+                        **s["metadata"],
+                        "anomaly": True,
+                        "defect_type": "synthetic",
+                        "bbox": None,
+                        "component_bboxes": [],
+                        "num_components": 1,
+                        "mask_area_fraction": 0.0,
+                        "union_area_fraction": 0.0,
+                        "full_mask_path": None,
+                        "gt_source": "synthetic",
+                        "synthetic_defect": spec,
+                    },
+                }
+            )
+    return samples + extra
+
+
 def load_prior_split(cfg: dict) -> tuple[List[dict], List[dict]]:
     """Train / eval from data.train_layout and data.eval_layout (visa | mvtec)."""
     data_cfg = cfg.get("data") or {}
@@ -332,6 +378,7 @@ def load_prior_split(cfg: dict) -> tuple[List[dict], List[dict]]:
     if max_train is not None:
         train = train[: max_train]
     train = balance_normal_anomaly(train, data_cfg, seed=seed)
+    train = augment_synthetic_anomalies(train, data_cfg, seed=seed)
     max_eval = _optional_int(data_cfg.get("max_eval_samples"))
     if max_eval is not None:
         rng = random.Random(seed)

@@ -316,10 +316,14 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None):
                 s_center=locd['s_center'], s_w=locd['s_w'], s_h=locd['s_h'], s_geo=locd['s_geo'])
 
 
-def render_prompt(cfg, class_name: str, region_tokens: str = '') -> str:
+def render_prompt(cfg, class_name: str, region_tokens: str = '', h_candidates: str = '',
+                  h_box_tokens: str = '', h_vpt_tokens: str = '') -> str:
     """Build the user prompt from ``prompt.template`` in the config.
 
-    Supported placeholders: ``{class_name}``, ``{region_tokens}``, ``{max_boxes}``.
+    Supported placeholders: ``{class_name}``, ``{region_tokens}``, ``{max_boxes}``,
+    ``{h_candidates}`` (static H connected-component candidate boxes, search hint),
+    ``{h_box_tokens}`` (H-Box geometry-token placeholders ``<|h_box|>``),
+    ``{h_vpt_tokens}`` (VPT control/feat placeholders ``<|h_ctrl|><|h_feat|>...``).
     ``{max_boxes}`` comes from ``outcome.max_boxes``.
     """
     p = cfg.get('prompt') or {}
@@ -330,5 +334,8 @@ def render_prompt(cfg, class_name: str, region_tokens: str = '') -> str:
     text = template
     text = text.replace('{class_name}', str(class_name))
     text = text.replace('{region_tokens}', str(region_tokens))
+    text = text.replace('{h_candidates}', str(h_candidates))
+    text = text.replace('{h_box_tokens}', str(h_box_tokens))
+    text = text.replace('{h_vpt_tokens}', str(h_vpt_tokens))
     text = text.replace('{max_boxes}', str(max_boxes))
     return text

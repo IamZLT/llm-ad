@@ -20,6 +20,13 @@ ALL_TAGS = ('think',) + TAGS
 BLOCK = re.compile(r'<(think|understand|compare|ground|verify|answer)>(.*?)</\1>', re.S)
 VERIFY = re.compile(r'^\s*(keep|refine|reject|discover|none)\b\s*[;:,\-]?\s*(.*)$', re.I)
 VERIFY_ACTIONS = ('keep', 'refine', 'reject', 'discover', 'none')
+# ``[confirm]`` evaluates the *refine loop itself* — whether this trajectory's
+# refinement improved the final box relative to the first candidate (the sign of
+# ``delta_refine``) — rather than echoing ``[imagine]``'s box-quality verdict.
+# This keeps the two stages orthogonally useful: imagine = "is the box right?",
+# confirm = "did my fix make it better / worse / stay the same?".
+REFINE_VERIFY = re.compile(r'^\s*(improved|unchanged|degraded)\b\s*[;:,\-]?\s*(.*)$', re.I)
+REFINE_VERIFY_ACTIONS = ('improved', 'unchanged', 'degraded')
 
 DEFAULT_MAX_BOXES = 16  # VisA-train findContours GT: no-merge p95=9/p99=20/max=63;
 # merge_kernel_ratio=0.01 → p95=5/p99=10/max=28, so 16 still covers p99 either way
@@ -76,6 +83,18 @@ def parse_verify(text: str):
     return None, stripped
 
 
+def parse_refine_verify(text: str):
+    """Parse a ``[confirm]`` body into ``(improved|unchanged|degraded, evidence)``."""
+    stripped = text.strip()
+    m = REFINE_VERIFY.match(stripped)
+    if m:
+        return m.group(1).lower(), m.group(2).strip()
+    for action in REFINE_VERIFY_ACTIONS:
+        if re.search(rf'\b{action}\b', text, re.I):
+            return action, stripped
+    return None, stripped
+
+
 def parse_output_cfg(text: str, cfg: dict, max_boxes=None) -> dict:
     """parse_output using outcome.max_boxes / outcome.thinking.enabled from cfg."""
     oc = cfg.get('outcome') or {}
@@ -99,7 +118,8 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     """
     result = dict(task_valid=False, decision_valid=False, final_geometry_valid=False,
                   is_anomaly=None, bboxes_2d=[], candidate_bboxes_2d=[], candidate_state='missing',
-                  verify_action=None, verify_evidence='', action=None, description='', tags={},
+                  verify_action=None, imagine_action=None, verify_evidence='', action=None,
+                  description='', tags={},
                   answer_keys=[], protocol_core=False, protocol_strict=False, num_boxes=0,
                   think_ok=False, think_filled=False, think_no_early_boxes=True,
                   think_headers=[], think_bodies={})
@@ -144,6 +164,7 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     result['think_no_early_boxes'] = bool(think_info['no_early_boxes'])
     result['think_headers'] = list(think_info['headers'])
     result['think_bodies'] = dict(think_info['bodies'])
+    result['first_candidate_bboxes_2d'] = []
 
     names = [m[1] for m in blocks]
     has_think = bool(names) and names[0] == 'think'
@@ -152,11 +173,15 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
 
     if thinking_required:
         ground_text = think_info['bodies'].get('localize', '')
+        first_ground_text = think_info['first_bodies'].get('localize', ground_text)
+        imagine_text = think_info['bodies'].get('imagine', '')
         verify_text = think_info['bodies'].get('confirm', '')
         ordered = native_think
         structure = native_think and text.count('<answer>') == text.count('</answer>') == 1
     else:
         ground_text = result['tags'].get('ground', '')
+        first_ground_text = ground_text
+        imagine_text = ''
         verify_text = result['tags'].get('verify', '')
         ordered = names == (['think'] + list(TAGS) if has_think else list(TAGS))
         structure = (ordered
@@ -174,10 +199,28 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     result['candidate_state'] = cstate
     result['candidate_bboxes_2d'] = cboxes
 
-    vaction, vevidence = parse_verify(verify_text)
+    # First-round candidate (the *starting* box before any reject/refine): used by
+    # score_output to measure delta_refine = final - first (the true "did refine help"
+    # improvement), since the last-round candidate equals the final answer in a
+    # well-formed trajectory and would otherwise zero out the refine term.
+    if first_ground_text.strip():
+        _fcstate, _fcboxes = parse_boxes_list(first_ground_text)
+        result['first_candidate_bboxes_2d'] = _fcboxes if _fcstate == 'list' else []
+    else:
+        result['first_candidate_bboxes_2d'] = []
+
+    if thinking_required:
+        # [confirm] evaluates the refine loop (improved/unchanged/degraded), a
+        # different question from [imagine]'s box-quality rehearsal (keep/refine/...).
+        vaction, vevidence = parse_refine_verify(verify_text)
+    else:
+        # Legacy <verify> tag keeps the old box-quality action vocabulary.
+        vaction, vevidence = parse_verify(verify_text)
     result['verify_action'] = vaction
     result['action'] = vaction
     result['verify_evidence'] = vevidence
+    iaction, _ = parse_verify(imagine_text) if imagine_text.strip() else (None, '')
+    result['imagine_action'] = iaction
 
     candidate_ok = cstate in ('null', 'empty', 'list')
     verify_ok = vaction is not None
@@ -257,11 +300,6 @@ def focus_reward(m: int, max_candidates: int = 3) -> float:
     return -0.1
 
 
-def _area_frac_1000(b) -> float:
-    """Box area as a fraction of the image, in the 0-1000 coordinate system."""
-    return max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1])) / 1e6
-
-
 def candidate_hits_comp(cand, comp, iou_threshold: float = 0.10) -> bool:
     """Whether a candidate box 'marks' a GT component.
 
@@ -277,6 +315,65 @@ def candidate_hits_comp(cand, comp, iou_threshold: float = 0.10) -> bool:
     cx = 0.5 * (float(cand[0]) + float(cand[2]))
     cy = 0.5 * (float(cand[1]) + float(cand[3]))
     return float(comp[0]) <= cx <= float(comp[2]) and float(comp[1]) <= cy <= float(comp[3])
+
+
+def objective_verdict(cand_px, comps, iou_threshold: float = 0.10, keep_iou: float = 0.50) -> str:
+    """Three-way objective verdict for a candidate box set against GT.
+
+    This is the ground-truth label the world-model's ``[imagine]`` / ``[confirm]``
+    verdict is *calibrated* against — the model is rewarded for predicting this
+    outcome, not for echoing its own answer:
+
+    * ``'reject'`` — no candidate marks any GT component (false alarm), or there are
+      no GT components but candidates were still emitted.
+    * ``'refine'`` — a candidate marks a GT component but the matched IoU is low,
+      i.e. the box undershoots / is offset from the true extent.
+    * ``'keep'``   — a candidate marks a GT component with high matched IoU.
+    * ``'none'``   — no GT components and no candidate (true normal).
+
+    ``keep_iou`` splits keep (box essentially right) from refine (box too small /
+    shifted), which is what lets verdict-only rehearsal still push extent accuracy:
+    an honestly-predicted ``refine`` on an undersized box is rewarded, so the model
+    learns to recognize and then fix its own undershoot instead of always "keep".
+    """
+    if not comps:
+        return 'none' if not cand_px else 'reject'
+    if not cand_px:
+        return 'reject'
+    matched_ious = []
+    for g in comps:
+        best = 0.0
+        for c in cand_px:
+            iv = iou(c, g)
+            cx = 0.5 * (float(c[0]) + float(c[2]))
+            cy = 0.5 * (float(c[1]) + float(c[3]))
+            if float(g[0]) <= cx <= float(g[2]) and float(g[1]) <= cy <= float(g[3]):
+                iv = max(iv, iou_threshold)
+            best = max(best, iv)
+        matched_ious.append(best)
+    matched = [iv for iv in matched_ious if iv >= iou_threshold]
+    if not matched:
+        return 'reject'
+    mean_iou = sum(matched) / len(matched)
+    return 'keep' if mean_iou >= keep_iou else 'refine'
+
+
+def refine_verdict(delta_refine: float, eps: float = 0.05) -> str:
+    """Sign of the refine loop's net effect, as a three-way verdict.
+
+    ``delta_refine = final_box_reward - first_candidate_box_reward`` measures how
+    much the internal reject/refine loop moved the box. ``[confirm]`` is scored
+    against this objective sign — ``'improved'`` (net gain), ``'unchanged'``
+    (no meaningful change, e.g. a single-round keep or an empty normal), or
+    ``'degraded'`` (refining made it worse). ``eps`` absorbs numeric noise and
+    treats tiny refinements as "unchanged" so a first-round box that is already
+    right does not get rewarded for a no-op re-localization.
+    """
+    if delta_refine > eps:
+        return 'improved'
+    if delta_refine < -eps:
+        return 'degraded'
+    return 'unchanged'
 
 
 def set_localization_reward(pred_boxes, gt_components, orig_size, iou_threshold=0.30, geometry_weight=0.30):
@@ -338,10 +435,8 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     keeps "candidate = loose superset, final = precise" strictly better than
     "candidate == final" without leaving room for refine farming.
     ``focus_reward`` rewards localizing-then-rejecting on normal samples.
-    Candidate boxes larger than ``cand_max_area_frac`` of the image are excluded
-    from coverage/focus accounting (anti giant-box hack). Hungarian
-    ``set_giou`` / ``set_iou`` / ``union_iou`` are reported as diagnostics only,
-    never in reward.
+    Hungarian ``set_giou`` / ``set_iou`` / ``union_iou`` are reported as
+    diagnostics only, never in reward.
     """
     validate_gt(meta)
     if not 0 <= protocol_weight <= 0.1:
@@ -360,46 +455,72 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     refine_weight = float(loc.get('refine_weight', 0.1))
     cand_weight = float(loc.get('cand_weight', 0.2))
     cand_iou_threshold = float(loc.get('cand_iou_threshold', 0.10))
-    cand_max_area_frac = float(loc.get('cand_max_area_frac', 0.10))
     refine_clip = abs(float(loc.get('refine_clip', 0.2)))
     focus_max_candidates = int(loc.get('focus_max_candidates', 3))
-    reject_weight = float(loc.get('reject_weight', 0.0))
+    discrim_weight = float(loc.get('discrim_weight', 0.0))
+    imagine_weight = float(loc.get('imagine_weight', discrim_weight))
+    keep_iou_threshold = float(loc.get('keep_iou_threshold', 0.50))
+    refine_eps = float(loc.get('refine_eps', 0.05))
     correct = parsed['task_valid'] and parsed['is_anomaly'] == bool(meta['is_anomaly'])
     pred_px = [to_pixels(b, meta['orig_size']) for b in parsed['bboxes_2d']]
     union_iou_val = (iou(union_box(pred_px), meta.get('gt_box_px'))
                      if (meta['is_anomaly'] and pred_px) else 0.0)
     comps = meta.get('component_bboxes') or ([meta['gt_box_px']] if meta.get('gt_box_px') else [])
     mask_iou_val = mask_iou(pred_px, comps, meta['orig_size']) if meta['is_anomaly'] else 0.0
-    cand_boxes = [b for b in parsed['candidate_bboxes_2d'] if _area_frac_1000(b) <= cand_max_area_frac]
+    cand_boxes = [b for b in parsed['candidate_bboxes_2d']]
     cand_px = [to_pixels(b, meta['orig_size']) for b in cand_boxes]
+    first_cand_boxes = [b for b in parsed.get('first_candidate_bboxes_2d', [])]
     setd = dict(reward=0.0, matched_pairs=[], s_sum=0.0)
     candd = dict(reward=0.0, matched_pairs=[], s_sum=0.0)
+    first_candd = dict(reward=0.0, matched_pairs=[], s_sum=0.0)
     raw_set_iou = 0.0
     set_giou_val = 0.0
     count_val = 0.0
     focus_val = 0.0
     cand_cov_val = 0.0
-    if meta['is_anomaly'] and correct:
+    if meta['is_anomaly']:
+        # Localization geometry is scored for EVERY anomalous sample, not gated on
+        # ``correct``. Gating it meant a wrong decision froze loc_reward at 0, so the
+        # per-token localization advantage had no gradient during the long cold-start
+        # phase (lz=0) and mIoU never lifted.
         setd = set_localization_reward(parsed['bboxes_2d'], comps, meta['orig_size'], iou_threshold, geometry_weight)
-        raw_set_iou = float(component_metrics(pred_px, comps)['set_iou'])
-        set_giou_val = float(set_giou(pred_px, comps))
+        if pred_px:
+            raw_set_iou = float(component_metrics(pred_px, comps)['set_iou'])
+            set_giou_val = float(set_giou(pred_px, comps))
         count_val = float(count_reward(len(pred_px), len(comps)))
+        candd = set_localization_reward(cand_boxes, comps, meta['orig_size'], iou_threshold, geometry_weight)
+        first_candd = set_localization_reward(first_cand_boxes, comps, meta['orig_size'], iou_threshold, geometry_weight)
         if comps:
             hits = sum(1 for g in comps
                        if any(candidate_hits_comp(c, g, cand_iou_threshold) for c in cand_px))
             cand_cov_val = float(hits / len(comps))
+    # loc_reward = max(final, candidate): the localization advantage rewards "at least
+    # one step of the internal chain localized the defect", so a miss whose [localize]
+    # candidate box was still correct keeps a positive localization signal instead of
+    # collapsing to 0 (world-model: reward the intermediate prediction, not only the
+    # final verdict).
+    loc_reward = max(setd['reward'], candd['reward'])
+    # delta_refine = final - FIRST candidate: the true "did reject/refine improve the
+    # box" increment. Using the last-round candidate here would compare the final box
+    # against itself (== 0) in a well-formed trajectory, killing the refine signal.
+    delta_refine = setd['reward'] - first_candd['reward']
+    # World-model rehearsal calibration. The two stages are scored against two
+    # *different* objective labels so they cannot collapse into echoes:
+    #   * [imagine] predicts the candidate box's objective quality (keep/refine/
+    #     reject/none) — "is this box right?"
+    #   * [confirm] predicts the sign of the refine loop's net effect
+    #     (improved/unchanged/degraded) — "did refining actually fix it?"
+    # ``imagine_correct`` rewards the quality rehearsal; ``discrim_correct`` rewards
+    # the refine-loop verdict (sign of ``delta_refine``), NOT the box-quality label.
+    verify_action = parsed.get('verify_action')
+    imagine_action = parsed.get('imagine_action')
     if meta['is_anomaly']:
-        candd = set_localization_reward(cand_boxes, comps, meta['orig_size'], iou_threshold, geometry_weight)
-    loc_reward = setd['reward']
-    delta_refine = loc_reward - candd['reward']
-    # Reject shaping: a [confirm]=reject triggers the confirm-reloop (a zero-H /
-    # pure-text re-localization). Reward it only when the final localization is
-    # actually good (mask_iou), so a reject that rescues a bad localization is
-    # rewarded while a pointless reject is penalized. (2*mask_iou - 1) makes the
-    # term positive above IoU 0.5 and negative below, tying reject directly to
-    # localization quality. Anomaly-only: normal-sample rejects are covered by
-    # focus_reward / the empty final answer.
-    reject_bonus = 0.0
+        obj_verdict = objective_verdict(cand_px, comps, cand_iou_threshold, keep_iou_threshold)
+    else:
+        obj_verdict = 'none'
+    imagine_correct = 1.0 if imagine_action == obj_verdict else 0.0
+    refine_obj = refine_verdict(delta_refine, refine_eps)
+    discrim_correct = 1.0 if verify_action == refine_obj else 0.0
     if not correct:
         # False positive (normal image declared anomalous) gets a heavier
         # penalty than a miss (anomaly declared normal): in industrial QC a
@@ -416,17 +537,18 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 + dense_weight * loc_reward
                 + cand_weight * cand_cov_val
                 + refine_weight * float(min(max(delta_refine, -refine_clip), refine_clip)))
-        if parsed['verify_action'] == 'reject':
-            reject_bonus = reject_weight * (2.0 * mask_iou_val - 1.0)
-            task = task + reject_bonus
+    task = task + discrim_weight * discrim_correct + imagine_weight * imagine_correct
     protocol_core = float(parsed['protocol_core'])
     return dict(task=task, protocol=protocol_core, protocol_core=protocol_core,
                 protocol_strict=float(parsed['protocol_strict']),
                 total=task + protocol_weight * protocol_core,
-                loc_reward=loc_reward, set_c_reward=candd['reward'], set_f_reward=loc_reward,
+                loc_reward=loc_reward, set_c_reward=candd['reward'], set_f_reward=setd['reward'],
                 delta_refine=delta_refine,
                 mask_iou=mask_iou_val, union_iou=union_iou_val,
                 raw_iou=raw_set_iou, set_iou=raw_set_iou, set_giou=set_giou_val,
                 count_reward=count_val, focus_reward=focus_val, cand_coverage=cand_cov_val,
-                reject_bonus=reject_bonus, verify_action=parsed['verify_action'],
+                discrim_correct=discrim_correct, imagine_correct=imagine_correct,
+                verify_signal=discrim_weight * discrim_correct + imagine_weight * imagine_correct,
+                verify_action=verify_action, imagine_action=imagine_action,
+                objective_verdict=obj_verdict, refine_verdict=refine_obj,
                 correct=bool(correct), matched_pairs=setd['matched_pairs'], s_sum=setd['s_sum'])

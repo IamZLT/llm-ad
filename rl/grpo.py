@@ -11,8 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.qwen35 import unwrap_model
-from models.looped_qwen import is_looped
-from models.region_injection import REGION_INPUT_KEYS
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -28,13 +26,10 @@ def move_batch(batch: dict, device: torch.device) -> dict:
 
 
 def model_inputs(batch: dict) -> dict:
-    # Underscore-prefixed keys are internal transients (e.g. ``_h_H``, ``_meta``)
-    # that are consumed by injection contexts (``bind_h_vpt``) directly, never by
-    # the model's forward. Excluding them here matches ``move_batch``, which also
-    # treats ``_``-prefixed keys as non-model data. Without this, a leftover
-    # ``_h_H`` from a previous resample iteration leaks into ``generate(**kwargs)``
-    # and transformers rejects it as an unknown model kwarg.
-    skip = {"labels", "prompt_len", "image_embeds", "h_box_geom"} | REGION_INPUT_KEYS
+    # Underscore-prefixed keys are internal transients (e.g. ``_meta``) that are
+    # never consumed by the model's forward. Excluding them here matches
+    # ``move_batch``, which also treats ``_``-prefixed keys as non-model data.
+    skip = {"labels", "prompt_len", "image_embeds", "h_box_geom", "h_map"}
     return {k: v for k, v in batch.items()
             if not k.startswith("_") and k not in skip and torch.is_tensor(v)}
 
@@ -92,10 +87,6 @@ def forward_with_vision(model, gen_in: dict, input_ids: torch.Tensor, attention_
             elif cur > seq:
                 v = v[..., :seq]
         kwargs[k] = v
-    # Teacher-forcing on the looped (recurrent-depth) stack must not build a
-    # per-depth K/V cache: it would allocate K full caches for no benefit.
-    if is_looped(model):
-        kwargs["use_cache"] = False
     return model(**kwargs)
 
 
@@ -157,7 +148,14 @@ def clipped_pg_kl(
     clip_high: float,
     kl_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-trajectory mean, then mean over the group (do not pool tokens across sequences)."""
+    """Clipped policy-gradient + KL.
+
+    ``adv`` may be a scalar per sequence (``[B, 1]``) or a per-token advantage
+    (``[B, T]``), matching ``mask``/``new_lp`` (``[B, T]``). Per-token advantage
+    lets localization tokens carry their own (loc_reward-derived) advantage while
+    the prose/confirm tokens carry the task advantage, so coordinate gradients are
+    no longer averaged away by the long thought chain.
+    """
     rho = torch.exp((new_lp - old_lp).clamp(-20.0, 20.0))
     clipped = rho.clamp(1.0 - float(clip_low), 1.0 + float(clip_high))
     surr = torch.minimum(rho * adv, clipped * adv)

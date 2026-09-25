@@ -26,7 +26,7 @@ from PIL import Image
 from outcome.engine_multibox import datasets, load_model, run_train, validate_config
 from outcome.evaluate_multibox import evaluate
 from outcome.inputs_multibox import OutcomeMultiboxCollator
-from outcome.policy import generate_group, generate_group_staged
+from outcome.policy import generate_group
 from outcome.protocol_multibox import VERSION, parse_output_cfg, to_pixels
 from rl.grpo import move_batch
 from utils.common import is_main_process, set_seed
@@ -172,7 +172,7 @@ def main():
                 # ``train_<run_name>__.../tb`` appears as a sub-run on ONE page
                 # (tick runs to compare). Kill-and-restart on a fixed port keeps
                 # all runs visible regardless of launch order.
-                start_tensorboard(Path(cfg['paths']['output_dir']).resolve(), cfg)
+                start_tensorboard(Path(cfg['paths']['output_dir']).resolve().parent, cfg)
             run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output)
     if main_proc:
         print(f'Output: {output}', flush=True)

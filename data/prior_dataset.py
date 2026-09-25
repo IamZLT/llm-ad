@@ -7,6 +7,7 @@ import os
 import random
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
@@ -181,6 +182,21 @@ class PriorCoTDataset(Dataset):
         gt_box = meta.get("bbox")
         test = Image.open(str(img_path)).convert("RGB")
         orig_size = test.size
+        comp_boxes = list(meta.get("component_bboxes") or [])
+        gt_px = None
+        if gt_box is not None and len(gt_box) == 4:
+            gt_px = [float(gt_box[0]), float(gt_box[1]), float(gt_box[2]), float(gt_box[3])]
+        synthetic = meta.get("synthetic_defect")
+        if synthetic is not None:
+            from data.synthetic_anomaly import synthesize_defect
+            rng = np.random.RandomState(int(synthetic["seed"]))
+            arr = np.asarray(test.convert("RGB"))[:, :, ::-1].copy()
+            arr, comps, union = synthesize_defect(arr, rng, str(synthetic.get("size_bin", "medium")))
+            test = Image.fromarray(arr[:, :, ::-1])
+            comp_boxes = [list(b) for b in comps]
+            gt_px = [float(v) for v in union]
+            is_anom = True
+            defect = "synthetic"
         pool_cands = None
         if self.ref_pool is not None:
             pool_cands = list(self.ref_pool.get(cls) or [])
@@ -197,16 +213,13 @@ class PriorCoTDataset(Dataset):
             cands=pool_cands,
         )
         ref = Image.open(ref_path).convert("RGB")
-        gt_px = None
-        if gt_box is not None and len(gt_box) == 4:
-            gt_px = [float(gt_box[0]), float(gt_box[1]), float(gt_box[2]), float(gt_box[3])]
         return {
             "ref": ref,
             "test": test,
             "orig_size": orig_size,
             "gt_box_px": gt_px,
-            "component_bboxes": list(meta.get("component_bboxes") or []),
-            "num_components": meta.get("num_components"),
+            "component_bboxes": comp_boxes,
+            "num_components": len(comp_boxes) if synthetic is not None else meta.get("num_components"),
             "mask_area_fraction": meta.get("mask_area_fraction"),
             "union_area_fraction": meta.get("union_area_fraction"),
             "full_mask_path": meta.get("full_mask_path"),

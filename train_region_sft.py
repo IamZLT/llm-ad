@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""H-VPT SFT: train the VPT-style H cross-attention + language LoRA with real category/bbox.
+"""Outcome-multibox SFT (world-model style, single-pass internal thinking).
 
-Freezes the vision encoder and H/matching computation. Supervises the full five-block
-target: <ground>/<answer> carry the GT category/boxes, while the process blocks
-(<understand>/<compare>/<verify>) are sample-aware templates built from GT meta, and
-the answer description summarizes the reasoning chain in one sentence, so the
-cold-start RL policy reliably emits the whole scaffold with meaningful text.
+Trains a language LoRA on the *full* autoregressive thought chain
+``[understand]...[confirm]</think><answer>`` with no stage-marker masking, so the
+model learns to write its own internal reasoning in one decode (the Qwen-AgentWorld /
+RLVR-World recipe: SFT supervises the complete CoT token-by-token).
 
-After this run, the saved directory is pointed to by ``outcome.sft_adapter`` in the RL
-config: ``load_model`` merges the SFT LoRA into the base weights, mounts the frozen
-H-VPT module, and starts a fresh RL LoRA.
+The H anomaly heatmap is reduced to a static search hint rendered once at the top
+of the prompt (connected-component candidate boxes). It is never the training
+target: ``[localize]`` is always supervised on GT boxes. The confirm stage is taught
+*all five* actions — keep / refine / reject / discover / none — including
+reject→relocalize and refine→refine multi-round intermediate states (P0), so the
+cold-start policy already knows how to correct a bad localization instead of only
+emitting ``keep``.
+
+After this run, point ``outcome.sft_adapter`` at the saved directory in the RL config.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -38,22 +42,21 @@ from torch.utils.tensorboard import SummaryWriter
 from data.prior_dataset import build_train_ref_pool
 from data.scan import load_prior_split, split_holdout_by_class
 from models.anomaly_prior import AnomalyPrior
-from models.looped_qwen import enable_looped_qwen, loop_enabled, set_loop_steps
+from models.h_box_prior import (build_h_box_prior, load_h_box_prior, save_h_box_prior,
+                                ensure_box_token, bind_h_box, compute_g_proj)
+from models.h_vpt import (HVPT, build_h_vpt, load_h_vpt, save_h_vpt,
+                          ensure_control_token, compute_h_H, bind_h_vpt)
 from models.lora import apply_lora
 from models.qwen35 import (setup_model_and_processor, freeze_vision_encoder, force_vision_eval,
                            unwrap_model, print_trainable_params)
-from models.h_vpt import (HVPT, build_h_vpt, load_h_vpt, save_h_vpt,
-                          ensure_control_token, control_token_id_of, feat_token_id_of,
-                          compute_h_H, bind_h_vpt, CONTROL_TOKEN, FEAT_TOKEN)
-from models.h_box_prior import (HBoxProjector, build_h_box_prior, load_h_box_prior,
-                                save_h_box_prior, ensure_box_token, box_token_id_of,
-                                BOX_TOKEN, bind_h_box, compute_g_proj)
 from models.vision_cache import bind_cached_image_features
-from outcome.inputs import OutcomeCollator, OutcomeDataset
+from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_zoom_train_batch)
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.policy import generate_group_staged
+from outcome.policy import generate_group
+from outcome.protocol import iou, to_pixels
 from outcome.protocol_multibox import parse_output_cfg, score_output
-from outcome.thinking import thinking_enabled, staged_sft_target, staged_sft_labels
+from outcome.thinking import thinking_enabled, staged_sft_target
+from outcome.zoom_crop import make_zoom_crop
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
 from utils.config import load_yaml_config
@@ -117,6 +120,25 @@ def _draw_gt_boxes(test, meta):
     if union is not None:
         xy = _scale_box(union, orig, im.size)
         draw.rectangle(xy, outline=(120, 200, 120), width=2)
+    return im
+
+
+def _draw_pred_boxes(test, meta, parsed):
+    """GT (green) + model output: final bboxes_2d (red) + [localize] candidate (orange)."""
+    im = _draw_gt_boxes(test, meta)
+    draw = ImageDraw.Draw(im)
+    font = _font(14)
+    orig = tuple(meta.get('orig_size') or im.size)
+    for box in parsed.get('candidate_bboxes_2d') or []:
+        px = to_pixels(box, orig)
+        xy = _scale_box(px, orig, im.size)
+        draw.rectangle(xy, outline=(255, 170, 0), width=2)
+        draw.text((xy[0] + 3, max(0, xy[1] - 16)), 'CAND', fill=(255, 170, 0), font=font)
+    for box in parsed.get('bboxes_2d') or []:
+        px = to_pixels(box, orig)
+        xy = _scale_box(px, orig, im.size)
+        draw.rectangle(xy, outline=(255, 60, 60), width=3)
+        draw.text((xy[0] + 3, xy[3] + 2), 'PRED', fill=(255, 60, 60), font=font)
     return im
 
 
@@ -205,11 +227,7 @@ def _plural(n: int, singular: str, plural: str) -> str:
 
 
 def _box_where(box_1000) -> str:
-    """Coarse image-frame location from a 0-1000 box. Not a defect-type label.
-
-    Sample-specific spatial words belong in <ground> (next to the candidate
-    coordinates) and the answer description, not in <understand>/<compare>.
-    """
+    """Coarse image-frame location from a 0-1000 box. Not a defect-type label."""
     x1, y1, x2, y2 = [float(v) for v in box_1000]
     area = max(0.0, x2 - x1) * max(0.0, y2 - y1) / 1e6
     if area >= 0.40:
@@ -253,49 +271,177 @@ def _where_join(boxes_1000) -> str:
     return ', '.join(seen[:-1]) + f', and {seen[-1]}'
 
 
-def _ground_multibox(gt_boxes: list = None) -> str:
-    """Localize-stage boxes: always the GT component boxes.
-
-    H is never the training target (its text-coordinate readout was the known
-    small-defect bottleneck). The [localize] stage is supervised on GT boxes; H
-    only conditions the model via the VPT cross-attention (the control/feat tokens
-    are prefixed to this stage by ``localize_prefix``).
-    """
-    boxes = gt_boxes or []
+def _ground_multibox(boxes: list = None) -> str:
+    """Localize-stage candidate boxes (0-1000) with a coarse location phrase."""
+    boxes = boxes or []
     if not boxes:
         return 'candidate_bboxes_2d=[]'
     return f'candidate_bboxes_2d={boxes}; {_where_join(boxes)}'
 
 
-def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False, answer_only: bool = False,
-                     localize_source: str = 'gt', h_vpt_tokens: str = '', h_box_tokens: str = '') -> str:
-    """Five-block target; category/boxes come from GT, process blocks summarize the chain.
+def _shrink_box(box, scale: float) -> list:
+    """Shrink a 0-1000 box about its center (extent-undershoot intermediate state)."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    w, h = (x2 - x1) * scale, (y2 - y1) * scale
+    return [round(cx - w / 2, 3), round(cy - h / 2, 3), round(cx + w / 2, 3), round(cy + h / 2, 3)]
 
-    The process blocks and the answer ``description`` are sample-aware templates built
-    from GT meta (class name, component count, coarse box location): the description
-    restates the understand -> compare -> verify conclusion in one sentence instead of
-    a bare label, so the cold-start policy learns to summarize its own reasoning.
-    When ``thinking=True``, stages go inside native think as
-    ``[understand]/[compare]/[localize]/[confirm]``, then ``</think>`` and
-    ``<answer>`` JSON. The chat template already opened ``<think>``; SFT
-    supervises the four stages and the JSON (no extra XML blocks).
 
-    ``multibox=True`` emits the outcome-multibox-v1 answer schema (``bboxes_2d`` as a
-    list of one box per disconnected GT component, empty list for normal) instead of
-    the single union box (``bbox_2d``). Use it for the SFT that seeds multi-box RL so
-    the language LoRA is already aligned with the multi-box output format.
+def _shift_box(box, frac: float) -> list:
+    """Randomly translate a 0-1000 box (center-offset intermediate state)."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    w, h = x2 - x1, y2 - y1
+    dx = (random.random() * 2 - 1) * w * frac
+    dy = (random.random() * 2 - 1) * h * frac
+    return [round(x1 + dx, 3), round(y1 + dy, 3), round(x2 + dx, 3), round(y2 + dy, 3)]
 
-    Multibox ground/verify semantics (VPT scheme):
 
-    * ``[localize]`` outputs the GT component boxes (``candidate_bboxes_2d``) with
-      the VPT control/feat tokens prefixed via ``localize_prefix``. H is never the
-      training target: it conditions the model only through the cross-attention.
-    * ``[confirm]`` confirms the localized boxes against GT (``keep`` for anomaly,
-      ``none`` for normal).
-    * ``<answer>`` carries the precise per-component GT boxes (or [] for normal).
+def _pick_fp_candidate(meta, gt_boxes, iou_threshold: float = 0.10):
+    """Pick an H candidate box that does NOT mark any GT component (a false alarm).
+
+    H's false positives are the natural negative source for teaching ``reject``:
+    a box the heatmap highlighted but that does not overlap a real defect.
+    """
+    cands = meta.get('prior_candidates') or []
+    order = list(range(len(cands)))
+    random.shuffle(order)
+    for i in order:
+        box = cands[i].get('bbox_2d')
+        if box is None:
+            continue
+        box = [float(v) for v in box]
+        if all(iou(box, g) < iou_threshold for g in gt_boxes):
+            return box
+    return None
+
+
+def _anomaly_rounds(meta, cls, gt_boxes, sft_cfg):
+    """(localize, imagine, confirm) rounds for an anomalous sample.
+
+    ``[imagine]`` rehearses the *candidate box's objective quality*
+    (keep / refine / reject), while ``[confirm]`` evaluates the *refine loop's net
+    effect* (improved / unchanged / degraded). The two stages answer different
+    questions, so SFT can no longer collapse them into the same verdict:
+    a refined trajectory ends in ``[imagine]=keep`` but ``[confirm]=improved``
+    (the box got better relative to the first candidate).
+    """
+    keep_imagine = 'keep; this box matches the observed defect and is absent from the reference'
+    keep_confirm = ('unchanged; the localized boxes already matched the true defect '
+                    'extent, so no refinement was needed')
+    final_ground = _ground_multibox(gt_boxes)
+    if not gt_boxes:
+        return [(final_ground, keep_imagine, keep_confirm)]
+    fp = _pick_fp_candidate(meta, gt_boxes)
+    p_keep = float(sft_cfg.get('p_keep', 0.5))
+    p_refine_small = float(sft_cfg.get('p_refine_small', 0.2))
+    p_refine_shift = float(sft_cfg.get('p_refine_shift', 0.2))
+    p_reject = float(sft_cfg.get('p_reject', 0.1))
+    choices = [('keep', p_keep), ('refine_small', p_refine_small), ('refine_shift', p_refine_shift)]
+    if fp is not None:
+        choices.append(('reject', p_reject))
+    total = sum(w for _, w in choices)
+    if total <= 0:
+        return [(final_ground, keep_imagine, keep_confirm)]
+    r = random.random() * total
+    acc = 0.0
+    mode = 'keep'
+    for name, w in choices:
+        acc += w
+        if r < acc:
+            mode = name
+            break
+    if mode == 'keep':
+        return [(final_ground, keep_imagine, keep_confirm)]
+    if mode == 'refine_small':
+        scale = max(0.1, min(float(sft_cfg.get('refine_small_scale', 0.5)), 0.95))
+        small = [_shrink_box(b, scale) for b in gt_boxes]
+        imagine = ('refine; this box undershoots the true defect extent, so it must '
+                   'expand to cover the full affected region')
+        confirm_r1 = 'improved; expanding the undersized box recovers the true defect extent'
+        confirm_r2 = ('improved; the expanded box now covers the full defect, better '
+                      'than the initial undersized candidate')
+        return [(_ground_multibox(small), imagine, confirm_r1),
+                (final_ground, keep_imagine, confirm_r2)]
+    if mode == 'refine_shift':
+        frac = max(0.05, min(float(sft_cfg.get('refine_shift_frac', 0.3)), 0.6))
+        shifted = [_shift_box(b, frac) for b in gt_boxes]
+        imagine = ('refine; this box is offset from the true defect center, so it must '
+                   'recenter')
+        confirm_r1 = 'improved; recentering the offset box recovers the true defect center'
+        confirm_r2 = ('improved; the recentered box now matches the true defect, better '
+                      'than the initial offset candidate')
+        return [(_ground_multibox(shifted), imagine, confirm_r1),
+                (final_ground, keep_imagine, confirm_r2)]
+    imagine = ('reject; this region is a normal surface feature, not a true defect, '
+               'so it must search elsewhere')
+    confirm_r1 = ('improved; rejecting this false-alarm region and searching elsewhere '
+                  'recovers the true defect')
+    confirm_r2 = ('improved; the re-localized box now marks the true defect, better '
+                  'than the false-alarm candidate')
+    return [(_ground_multibox([fp]), imagine, confirm_r1),
+            (final_ground, keep_imagine, confirm_r2)]
+
+
+def _normal_rounds(meta, cls, sft_cfg):
+    """(localize, imagine, confirm) rounds for a normal sample: reject an H false alarm, then none.
+
+    A normal sample has no GT, so its ``delta_refine`` is always 0 and ``[confirm]``
+    is always ``unchanged``; ``[imagine]`` still rehearses the candidate quality
+    (reject for the false-alarm round, none for the empty round).
+    """
+    none_imagine = f'none; this candidate region shows no true defect on the {cls}'
+    none_confirm = f'unchanged; no true defect on the {cls}, so nothing changed'
+    empty_ground = _ground_multibox([])
+    cands = meta.get('prior_candidates') or []
+    fp = cands[0].get('bbox_2d') if cands else None
+    p_reject_none = float(sft_cfg.get('p_normal_reject_none', 0.5))
+    if fp is not None and random.random() < p_reject_none:
+        imagine = 'reject; this region is a normal surface feature, not a true defect'
+        confirm = f'unchanged; there is no true defect on the {cls} to refine toward'
+        return [(_ground_multibox([fp]), imagine, confirm),
+                (empty_ground, none_imagine, none_confirm)]
+    return [(empty_ground, none_imagine, none_confirm)]
+
+
+def _zoom_anomaly_rounds(meta, cls, gt_boxes, sft_cfg):
+    """(localize, imagine, confirm) rounds for a ZOOM-supervised anomalous sample.
+
+    The first round localizes a deliberately undersized candidate (simulating the
+    global view's known "box too small" failure), then ``[imagine]``/``[confirm]``
+    reference the zoomed crop (Image 3) to judge the extent and correct it to the
+    full GT box. This teaches the model the *tool semantics* of the crop: it exists
+    to fix extent, not to re-run classification or to reject a valid box.
+    """
+    scale = max(0.1, min(float(sft_cfg.get('zoom_shrink_scale', 0.5)), 0.95))
+    small = [_shrink_box(b, scale) for b in gt_boxes]
+    small_ground = _ground_multibox(small)
+    final_ground = _ground_multibox(gt_boxes)
+    zoom_imagine = ('refine; in Image 3 the red box undershoots the true defect '
+                    'extent, so it must expand to cover the full affected region')
+    zoom_confirm = ('improved; consulting the Image 3 crop and expanding the '
+                    'undersized box recovers the full defect extent')
+    keep_imagine = ('keep; in Image 3 the expanded box now aligns with the true '
+                    'defect boundary')
+    keep_confirm = ('improved; the corrected box covers the full defect, better '
+                    'than the initial undersized candidate')
+    return [(small_ground, zoom_imagine, zoom_confirm),
+            (final_ground, keep_imagine, keep_confirm)]
+
+
+def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = False,
+                     answer_only: bool = False, sft_cfg: dict = None, zoom: bool = False) -> str:
+    """Full thought-chain target; category/boxes come from GT.
+
+    ``[localize]`` is supervised on GT boxes (H is never the training target — it only
+    conditions the prompt). ``[imagine]`` rehearses the candidate box's objective
+    quality (keep/refine/reject/none); ``[confirm]`` evaluates the refine loop's net
+    effect (improved/unchanged/degraded). Multi-round reject→relocalize and
+    refine→refine trajectories teach the model to correct its own localization
+    inside a single pass (world-model style).
     """
     is_anom = bool(meta['is_anomaly'])
     cls = str(meta.get('class_name') or 'object').replace('_', ' ')
+    sft_cfg = sft_cfg or {}
     understand = (
         f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
         'material, structure, texture, print, and lighting as expected appearance. '
@@ -310,43 +456,42 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
             if not comps and meta.get('gt_box_px') is not None:
                 comps = [meta['gt_box_px']]
             gt_boxes = _boxes_to_1000(comps, meta['orig_size'])
-        ground = _ground_multibox(gt_boxes)
         if is_anom:
-            boxes = gt_boxes
-            n = len(boxes)
+            n = len(gt_boxes)
             n_txt = _region_count(n)
-            where = _where_join(boxes)
+            where = _where_join(gt_boxes)
             compare = (
                 f'against that Image 1 baseline, {n_txt} of the {cls} '
                 f'{_plural(n, "differs", "differ")} locally in a way material or '
                 'appearance variation on the reference cannot explain, so this is a '
                 'true defect rather than normal variation'
             )
-            verify = ('keep; the localized boxes match the observed difference '
-                      'and are absent from the reference')
             description = (
                 f'A localized defect is present on the {cls} {where}: {n_txt} '
                 f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
                 f'material or appearance variation cannot explain.'
             )
-            answer = json.dumps({'is_anomaly': True, 'bboxes_2d': boxes, 'description': description})
+            answer = json.dumps({'is_anomaly': True, 'bboxes_2d': gt_boxes, 'description': description})
+            rounds = (_zoom_anomaly_rounds(meta, cls, gt_boxes, sft_cfg) if zoom
+                      else _anomaly_rounds(meta, cls, gt_boxes, sft_cfg))
         else:
             compare = (
                 f'against that Image 1 baseline, Image 2 matches the reference {cls}; '
                 'any apparent change is material or appearance variation rather than '
                 'a true defect'
             )
-            verify = f'none; no true defect on the {cls}'
             description = (
                 f'The {cls} inspection image is consistent with the Image 1 baseline; '
                 'apparent changes are material or appearance variation rather than a true defect.'
             )
             answer = json.dumps({'is_anomaly': False, 'bboxes_2d': [], 'description': description})
+            rounds = _normal_rounds(meta, cls, sft_cfg)
         if answer_only:
             return f'<answer>\n{answer}\n</answer>'
+        ground, imagine, verify = rounds[0]
         if thinking:
-            return staged_sft_target(understand, compare, ground, verify, answer,
-                                     localize_prefix=h_box_tokens + h_vpt_tokens)
+            return staged_sft_target(understand, compare, ground, imagine, verify, answer,
+                                     extra_rounds=rounds[1:])
         return (
             f'<understand>\n{understand}\n</understand>\n'
             f'<compare>\n{compare}\n</compare>\n'
@@ -362,7 +507,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
             'in a way material or appearance variation on the reference cannot explain, '
             'so this is a true defect rather than normal variation'
         )
-        verify = 'keep; the grounded region matches the observed difference and is absent from the reference'
+        imagine = 'keep; this region matches the observed difference and is absent from the reference'
+        verify = 'unchanged; the grounded region already matched the true defect, so no refinement was needed'
         description = (
             f'A localized defect is present on the {cls} {where}: the region differs '
             'from the Image 1 baseline in a way material or appearance variation cannot explain.'
@@ -375,7 +521,8 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
             'any apparent change is material or appearance variation rather than '
             'a true defect'
         )
-        verify = f'none; no candidate region confirms a true defect on the {cls}'
+        imagine = f'none; this region shows no true defect on the {cls}'
+        verify = f'unchanged; no true defect on the {cls}, so nothing changed'
         description = (
             f'The {cls} inspection image is consistent with the Image 1 baseline; '
             'apparent changes are material or appearance variation rather than a true defect.'
@@ -385,8 +532,7 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
     if answer_only:
         return f'<answer>\n{answer}\n</answer>'
     if thinking:
-        return staged_sft_target(understand, compare, ground, verify, answer,
-                                 localize_prefix=h_box_tokens + h_vpt_tokens)
+        return staged_sft_target(understand, compare, ground, imagine, verify, answer)
     return (
         f'<understand>\n{understand}\n</understand>\n'
         f'<compare>\n{compare}\n</compare>\n'
@@ -396,49 +542,23 @@ def build_sft_target(meta: dict, multibox: bool = False, thinking: bool = False,
     )
 
 
-def build_labels(prompt_ids, target_ids, target_text=None, tokenizer=None, thinking=False):
-    """Teacher-forced labels: mask the prompt, supervise the target.
+def build_labels(prompt_ids, target_ids):
+    """Teacher-forced labels: mask the prompt, supervise the whole target.
 
-    For thinking SFT the ``[stage]`` headers / ``</think>`` / ``<answer>``
-    wrappers are FSM-controlled markers (``outcome.staged_decode`` injects them,
-    the model never samples them), so they are masked to keep teacher-forcing
-    aligned with the staged decoder. Non-thinking SFT supervises the whole target.
+    The full target (stage headers, bodies, ``</think>``, JSON, closing tags) is
+    supervised so the model learns to write the complete chain in one pass.
     """
-    if thinking and target_text is not None and tokenizer is not None:
-        labels = staged_sft_labels(tokenizer, target_text)
-        if len(labels) != len(target_ids):
-            # Offset-mapping mismatch (should not happen); fall back to full sup.
-            labels = list(target_ids)
-        return [-100] * len(prompt_ids) + labels
     return [-100] * len(prompt_ids) + list(target_ids)
 
 
 def default_batch_size(arch: str) -> int:
-    """Per-GPU batch for ~80GB cards (current 4B SFT is ~21GB at batch=1)."""
+    """Per-GPU batch for ~80GB cards."""
     name = str(arch or '')
     if '9B' in name:
         return 2
     if '4B' in name:
         return 4
     return 8
-
-
-def loop_steps_for_epoch(cfg: dict, epoch: int) -> int:
-    """Recurrent depth K for a training epoch (depth curriculum for the Internal-Loop).
-
-    When ``outcome.loop.curriculum.enabled`` is true, ``schedule`` maps epoch i to
-    its depth (e.g. ``[1, 2, 4]`` -> K=1, then 2, then 4). The final entry repeats
-    for any further epochs. Without a curriculum this is just ``outcome.loop.steps``.
-    """
-    lc = (cfg.get("outcome") or {}).get("loop", {}) or {}
-    curriculum = lc.get("curriculum") or {}
-    if not curriculum.get("enabled", False):
-        return int(lc.get("steps", 1))
-    schedule = curriculum.get("schedule") or []
-    if not schedule:
-        return int(lc.get("steps", 1))
-    idx = min(int(epoch) - 1, len(schedule) - 1)
-    return max(1, int(schedule[idx]))
 
 
 def shard_indices(n, epoch, seed, rank, world, batch_size, device):
@@ -457,11 +577,7 @@ def shard_indices(n, epoch, seed, rank, world, batch_size, device):
 
 
 def _stack_gen_in(singles, max_len):
-    """Merge per-sample multimodal kwargs into a padded language batch.
-
-    ``input_ids`` / ``attention_mask`` are rebuilt from the SFT target in
-    ``pack_sft_batch`` and must not be concatenated here (their lengths differ).
-    """
+    """Merge per-sample multimodal kwargs into a padded language batch."""
     keys = set()
     for batch in singles:
         keys.update(model_inputs(batch).keys())
@@ -493,24 +609,47 @@ def _stack_gen_in(singles, max_len):
     return out
 
 
-def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False, answer_only=False,
-                   localize_source='gt'):
-    """Collate one-at-a-time (vision cache is per-pair), then pad a language batch."""
+def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False,
+                   answer_only=False, sft_cfg=None):
+    """Collate one-at-a-time (vision cache is per-pair), then pad a language batch.
+
+    A fraction (``outcome.sft.zoom_prob``) of single-box anomalous samples are
+    upgraded to a 3-image (ref + test + zoom crop) batch whose target teaches the
+    model to consult the zoomed, outline-drawn crop to correct an undersized
+    candidate box back to the GT extent. Normal samples keep the 2-image path.
+    """
+    sft_cfg = sft_cfg or {}
+    zoom_prob = float(sft_cfg.get('zoom_prob', 0.0))
+    zcfg = (collator.cfg.get('outcome') or {}).get('zoom') or {}
+    expand = float(zcfg.get('expand', 1.0))
+    min_pad_frac = float(zcfg.get('min_pad_frac', 0.12))
+    max_area_frac = float(zcfg.get('max_area_frac', 0.6))
     singles, seqs, labels_list, targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
+        meta = batch['_meta'][0]
+        use_zoom = False
+        if (zoom_prob > 0 and multibox and thinking and not answer_only
+                and bool(meta.get('is_anomaly')) and random.random() < zoom_prob):
+            comps = list(meta.get('component_bboxes') or [])
+            if not comps and meta.get('gt_box_px') is not None:
+                comps = [meta['gt_box_px']]
+            if len(comps) == 1:
+                gt_1000 = _boxes_to_1000(comps, meta['orig_size'])
+                scale = max(0.1, min(float(sft_cfg.get('zoom_shrink_scale', 0.5)), 0.95))
+                cand_1000 = [_shrink_box(gt_1000[0], scale)]
+                crop = make_zoom_crop(meta['test'], cand_1000[0],
+                                      orig_size=tuple(meta['orig_size']), expand=expand,
+                                      min_pad_frac=min_pad_frac, max_area_frac=max_area_frac)
+                if not crop.degenerate:
+                    batch = build_zoom_train_batch(collator.processor, collator.prior,
+                                                   collator.cfg, device, batch, crop.image)
+                    use_zoom = True
         prompt_ids = batch['input_ids'][0].tolist()
-        n_feat = int(batch.get('n_feat_tokens', 0))
-        h_vpt_on = bool(batch.get('h_map') is not None)
-        h_vpt_tokens = (CONTROL_TOKEN + FEAT_TOKEN * n_feat) if h_vpt_on else ''
-        n_box = int(batch.get('n_box_tokens', 0))
-        h_box_tokens = (BOX_TOKEN * n_box) if n_box > 0 else ''
-        target = build_sft_target(batch['_meta'][0], multibox=multibox, thinking=thinking,
-                                  answer_only=answer_only, localize_source=localize_source,
-                                  h_vpt_tokens=h_vpt_tokens, h_box_tokens=h_box_tokens)
+        target = build_sft_target(meta, multibox=multibox, thinking=thinking,
+                                  answer_only=answer_only, sft_cfg=sft_cfg, zoom=use_zoom)
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
-        labels_list.append(build_labels(prompt_ids, target_ids, target_text=target,
-                                        tokenizer=tokenizer, thinking=thinking))
+        labels_list.append(build_labels(prompt_ids, target_ids))
         seqs.append(prompt_ids + target_ids)
         targets.append(target)
         singles.append(batch)
@@ -530,11 +669,11 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         labels=labels_t,
         gen_in=_stack_gen_in(singles, max_len),
         image_embeds=torch.cat([b['image_embeds'] for b in singles], dim=0),
-        control_token_id=int(singles[0]['control_token_id']),
-        feat_token_id=int(singles[0]['feat_token_id']),
         box_token_id=int(singles[0].get('box_token_id', -1)),
-        h_maps=[b['h_map'] for b in singles if b.get('h_map') is not None],
+        control_token_id=int(singles[0].get('control_token_id', -1)),
+        feat_token_id=int(singles[0].get('feat_token_id', -1)),
         h_box_geoms=[b['h_box_geom'] for b in singles if b.get('h_box_geom') is not None],
+        h_maps=[b['h_map'] for b in singles if b.get('h_map') is not None],
         metas=[b['_meta'][0] for b in singles],
         targets=targets,
         seq_lens=[len(s) for s in seqs],
@@ -542,25 +681,27 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
     return packed, int((labels_t != -100).sum())
 
 
-def load_sft_model(cfg, device, init_sft=None, freeze_lora=False):
-    """Load the base model + (optional) LoRA + the H-VPT module for SFT.
+def load_sft_model(cfg, device, init_sft=None):
+    """Load the base model + (optional) LoRA + H-Box projector for SFT.
 
-    ``init_sft`` starts from an existing SFT checkpoint (LoRA via ``PeftModel``,
-    H-VPT from ``h_vpt.pt``) so branches can share a common start point.
-    ``freeze_lora`` freezes the LoRA loaded via ``init_sft`` (used for the mechanism
-    probe that trains only the H-VPT module).
+    ``init_sft`` starts from an existing SFT checkpoint (a merged LoRA), so branches
+    can share a common start point. The H-Box projector is built fresh (or reloaded
+    from ``init_sft/h_box_prior.pt``) and trained alongside the LoRA.
     """
     if device.type == 'cuda':
         torch.cuda.set_device(device)
     model, processor = setup_model_and_processor(cfg, for_inference=False, freeze_vision=True)
-    ensure_control_token(processor, model)
-    ensure_box_token(processor, model)
+    h_box_cfg = (cfg.get('outcome') or {}).get('h_box_prior') or {}
+    h_vpt_cfg = (cfg.get('outcome') or {}).get('h_vpt') or {}
+    if bool(h_box_cfg.get('enabled', False)):
+        ensure_box_token(processor, model)
+    if bool(h_vpt_cfg.get('enabled', False)):
+        ensure_control_token(processor, model)
     if init_sft:
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, init_sft, is_trainable=not freeze_lora)
+        model = PeftModel.from_pretrained(model, init_sft, is_trainable=True)
     else:
         model = apply_lora(model, cfg)
-    enable_looped_qwen(model, cfg)
     freeze_vision_encoder(model)
     model.to(device)
     if cfg['training'].get('gradient_checkpointing', True):
@@ -570,43 +711,30 @@ def load_sft_model(cfg, device, init_sft=None, freeze_lora=False):
     prior = AnomalyPrior.from_qwen(model, cfg)
     hidden_size = int(model.config.text_config.hidden_size)
     dtype = next(model.parameters()).dtype
-    # H-VPT module: the ONLY trainable H channel (H -> z_H -> control cross-attn).
-    hvcfg = (cfg.get('outcome') or {}).get('h_vpt') or {}
-    model.h_vpt = None
-    if bool(hvcfg.get('enabled', False)):
-        if init_sft:
-            h_path = Path(init_sft) / 'h_vpt.pt'
-            if h_path.exists():
-                model.h_vpt = load_h_vpt(HVPT, h_path, hidden_size)
-            else:
-                model.h_vpt = build_h_vpt(cfg, hidden_size)
-        else:
-            model.h_vpt = build_h_vpt(cfg, hidden_size)
-        model.h_vpt.to(device=device, dtype=dtype)
-
-    # H-Box geometry-token prior: static linear projection of connected-component
-    # bbox geometry (parallel to H-VPT for a clean ablation).
-    hbcfg = (cfg.get('outcome') or {}).get('h_box_prior') or {}
     model.h_box_prior = None
-    if bool(hbcfg.get('enabled', False)):
+    if bool(h_box_cfg.get('enabled', False)):
         if init_sft:
             b_path = Path(init_sft) / 'h_box_prior.pt'
-            if b_path.exists():
-                model.h_box_prior = load_h_box_prior(b_path, hidden_size)
-            else:
-                model.h_box_prior = build_h_box_prior(cfg, hidden_size)
+            model.h_box_prior = (load_h_box_prior(b_path, hidden_size) if b_path.exists()
+                                 else build_h_box_prior(cfg, hidden_size))
         else:
             model.h_box_prior = build_h_box_prior(cfg, hidden_size)
         model.h_box_prior.to(device=device, dtype=dtype)
-
-    parts = ['LoRA']
-    if freeze_lora and init_sft:
-        parts = ['冻结 LoRA']
-    if model.h_vpt is not None:
-        parts.append('H-VPT')
+    model.h_vpt = None
+    if bool(h_vpt_cfg.get('enabled', False)):
+        if init_sft:
+            h_path = Path(init_sft) / 'h_vpt.pt'
+            model.h_vpt = (load_h_vpt(HVPT, h_path, hidden_size) if h_path.exists()
+                           else build_h_vpt(cfg, hidden_size))
+        else:
+            model.h_vpt = build_h_vpt(cfg, hidden_size)
+        model.h_vpt.to(device=device, dtype=dtype)
+    note = 'LoRA'
     if model.h_box_prior is not None:
-        parts.append('H-Box')
-    note = ' + '.join(parts) + '（视觉塔已冻结）'
+        note += ' + H-Box'
+    if model.h_vpt is not None:
+        note += ' + H-VPT'
+    note += '（视觉塔已冻结）'
     print_trainable_params(model, note=note)
     return model, processor, prior
 
@@ -614,19 +742,18 @@ def load_sft_model(cfg, device, init_sft=None, freeze_lora=False):
 def _h_vpt_probe_train(model, h_vpt, packed, g_proj_flat=None):
     """Two-pass VPT step 1 (training): forward prompt→control token, return h_H.
 
-    The packed ``input_ids`` carry ``<|h_ctrl|>`` + N ``<|h_feat|>`` inside the
-    ``[localize]`` body. We run a truncated forward up to (and including) the
-    control token to read its last-layer hidden (detached, mirroring VPT's
-    two-turn formulation), then project H into h_H. Returns [B, N, hidden].
+    The prompt carries ``<|h_ctrl|>`` + N ``<|h_feat|>`` placeholders. A truncated
+    forward up to (and including) the control token reads its last-layer hidden
+    (detached, mirroring VPT's two-turn formulation), then projects H into h_H.
+    Returns [B, N, hidden].
 
-    ``g_proj_flat`` (when non-None) scatters the H-Box geometry tokens during the
-    probe so ``h_ctrl`` is the model's hidden state *after* seeing the geometry
-    prior — matching the staged decoder's probe exactly.
+    ``g_proj_flat`` scatters the H-Box geometry tokens during the probe so ``h_ctrl``
+    is the model's hidden state *after* seeing the geometry prior.
     """
     ctrl_id = int(packed['control_token_id'])
     input_ids = packed['input_ids']
     attention_mask = packed['attention_mask']
-    pos = (input_ids == ctrl_id).long().argmax(dim=-1)  # [B], exactly one per row
+    pos = (input_ids == ctrl_id).long().argmax(dim=-1)  # [B], one per row
     max_pos = int(pos.max().item())
     ids_trunc = input_ids[:, :max_pos + 1].contiguous()
     attn_trunc = attention_mask[:, :max_pos + 1].contiguous()
@@ -644,11 +771,11 @@ def _h_vpt_probe_train(model, h_vpt, packed, g_proj_flat=None):
 
 
 def batch_loss(model, packed, backward_scale=None):
-    """Teacher-forced CE with a two-pass VPT H injection + H-Box geometry tokens.
+    """Teacher-forced CE with two-pass VPT H injection + static H-Box geometry tokens.
 
-    Backward stays in the binds. The H-Box geometry tokens are static (linear
-    projection, no probe), so ``g_proj_flat`` is computed once and scattered into
-    the ``<|h_box|>`` slots on both the VPT probe and the main forward.
+    Backward stays inside the binds. The H-Box geometry tokens are static (linear
+    projection, no probe); the H-VPT channel probes the control token's hidden state
+    then scatters the modulated h_H into the ``<|h_feat|>`` slots.
     """
     core = unwrap_model(model)
     h_vpt = getattr(core, 'h_vpt', None)
@@ -679,14 +806,9 @@ def batch_loss(model, packed, backward_scale=None):
     return loss
 
 
-def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch, thinking=False, answer_only=False, localize_source='gt'):
-    """Mean teacher-forced loss on the holdout split (no update).
-
-    Every rank evaluates an equal-length disjoint shard using the unwrapped module
-    (no DDP hooks fire, so eval issues no collectives), then the mean is all-reduced.
-    Running this on rank 0 only deadlocks NCCL: rank 0 would issue DDP-wrapped
-    forwards while rank 1 sits in the epoch-end barrier — mismatched collectives.
-    """
+def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limit, seed, epoch,
+                 thinking=False, answer_only=False, sft_cfg=None):
+    """Mean teacher-forced loss on the holdout split (no update)."""
     raw = unwrap_model(model)
     raw.eval()
     force_vision_eval(raw)
@@ -704,7 +826,8 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     total = 0.0
     with torch.no_grad():
         for i in shard:
-            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox, thinking, answer_only, localize_source)
+            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox,
+                                       thinking, answer_only, sft_cfg)
             total += float(batch_loss(raw, packed))
     count = len(shard)
     if world > 1:
@@ -716,15 +839,9 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     return total / max(1, count), count
 
 
-def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, device, limit, seed, step):
-    """Lightweight FSM rollout smoke eval (real generation + scoring).
-
-    Sharded across ranks like ``evaluate_dev`` so NCCL stays in lockstep; each rank
-    runs ``generate_group_staged`` (greedy) on its shard, then the scalar metrics are
-    all-reduced. Returns a dict ready for logging / console print. This is the "does
-    the VPT H-injection actually help the model emit correct boxes" signal, unlike the
-    teacher-forced dev loss.
-    """
+def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, device, limit, seed, step,
+                       writer=None):
+    """Lightweight single-pass rollout smoke eval (real generation + scoring)."""
     raw = unwrap_model(model)
     raw.eval()
     force_vision_eval(raw)
@@ -749,7 +866,7 @@ def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, devi
     with torch.no_grad():
         for i in shard:
             batch = move_batch(collator([dev_dataset[i]]), device)
-            comp = generate_group_staged(raw, processor, batch, cfg, group=1, sample=False)[0]
+            comp = generate_group(raw, processor, batch, cfg, group=1, sample=False)[0]
             parsed = parse_output_cfg(comp.text, cfg, max_boxes=max_boxes)
             meta = batch['_meta'][0]
             sc = score_output(parsed, meta, protocol_weight, loc_cfg, max_boxes=max_boxes)
@@ -764,6 +881,9 @@ def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, devi
             n_valid += int(bool(parsed.get('task_valid')))
             if rank == 0 and len(samples) < 3:
                 samples.append((str(meta.get('class_name')), is_anom, comp.text))
+                if writer is not None and meta.get('test') is not None:
+                    im = _draw_pred_boxes(meta['test'], meta, parsed)
+                    writer.add_image(f'smoke_case/{len(samples)}_pred_box', _pil_to_tb(im), step)
 
     acc = torch.tensor([float(n_anom), float(n_norm), float(n_correct_anom), float(n_correct_norm),
                         float(n_valid), float(miou_sum)], device=device, dtype=torch.float64)
@@ -781,6 +901,9 @@ def quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, devi
         mask_miou=(miou_sum / n_anom if n_anom else None),
         samples=samples,
     )
+
+
+def _in_distributed_worker() -> bool:
     return os.environ.get('LOCAL_RANK') is not None
 
 
@@ -799,35 +922,8 @@ def _save_adapter(model, processor, path: Path):
     core = unwrap_model(model)
     core.save_pretrained(path)
     processor.save_pretrained(path)
-    save_h_vpt(getattr(core, 'h_vpt', None), path / 'h_vpt.pt')
     save_h_box_prior(getattr(core, 'h_box_prior', None), path / 'h_box_prior.pt')
-
-
-def _build_optimizer(model, args):
-    """AdamW over trainable params; the H-VPT projector gate gets its own LR.
-
-    The projector gate is zero-initialized for exact baseline parity, which mutes
-    the encoder/projector gradients (dOut/dW ∝ tanh(gate)). A separate, larger gate
-    LR lets the gate turn on first so the rest of the module can receive gradients.
-    """
-    base_lr = float(args.lr)
-    gate_lr = float(args.gate_lr) if args.gate_lr is not None else base_lr
-    trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-    if gate_lr == base_lr:
-        return torch.optim.AdamW([p for _, p in trainable], lr=base_lr, weight_decay=0.0)
-
-    def _is_gate(name: str) -> bool:
-        if name.endswith('h_vpt.projector.gate'):
-            return True
-        return '.cross_attns.' in name and name.endswith('.gate')
-
-    gate = [p for n, p in trainable if _is_gate(n)]
-    rest = [p for n, p in trainable if not _is_gate(n)]
-    groups = [{'params': rest, 'lr': base_lr}]
-    if gate:
-        groups.append({'params': gate, 'lr': gate_lr})
-    print(f'[opt] gate_lr={gate_lr} (base={base_lr}) gate_params={len(gate)} rest={len(rest)}', flush=True)
-    return torch.optim.AdamW(groups, weight_decay=0.0)
+    save_h_vpt(getattr(core, 'h_vpt', None), path / 'h_vpt.pt')
 
 
 def main():
@@ -846,19 +942,11 @@ def main():
     parser.add_argument('--dev-eval-samples', type=int, default=64,
                         help='holdout samples for the dev loss reported at each epoch end; 0 disables')
     parser.add_argument('--eval-steps', type=int, default=0,
-                        help='run a quick FSM rollout smoke eval every N optimizer steps (0 disables)')
+                        help='run a quick single-pass rollout smoke eval every N optimizer steps (0 disables)')
     parser.add_argument('--eval-rollout-samples', type=int, default=12,
-                        help='holdout samples per smoke eval for the FSM rollout (sharded across ranks)')
+                        help='holdout samples per smoke eval (sharded across ranks)')
     parser.add_argument('--init-sft', default=None,
-                        help='start from an existing SFT checkpoint (LoRA + H-VPT) '
-                             'so mechanism branches share a common start point')
-    parser.add_argument('--freeze-lora', action='store_true',
-                        help='freeze the LoRA loaded via --init-sft (used for the mechanism probe '
-                             'that trains only the H-VPT module)')
-    parser.add_argument('--gate-lr', type=float, default=None,
-                        help='separate LR for the H-VPT projector gate (scalar). '
-                             'Defaults to --lr; a larger value is needed because the zero-init gate '
-                             'mutes the encoder/projector gradients at gate=0.')
+                        help='start from an existing SFT checkpoint (merged LoRA)')
     args = parser.parse_args()
     _maybe_relaunch_multi_gpu(args.num_gpu)
 
@@ -884,8 +972,7 @@ def main():
     dataset_cls = OutcomeMultiboxDataset if multibox else OutcomeDataset
     collator_cls = OutcomeMultiboxCollator if multibox else OutcomeCollator
 
-    model, processor, prior = load_sft_model(cfg, device, init_sft=args.init_sft,
-                                             freeze_lora=args.freeze_lora)
+    model, processor, prior = load_sft_model(cfg, device, init_sft=args.init_sft)
     if world > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
                     find_unused_parameters=False)
@@ -893,10 +980,7 @@ def main():
     thinking = thinking_enabled(cfg)
     reasoning_mode = str((cfg.get('outcome') or {}).get('reasoning_mode', 'fsm'))
     answer_only = reasoning_mode in ('loop', 'direct')
-    # H is never the training target: [localize] is always supervised on GT boxes
-    # (H conditions the model only via the VPT cross-attention). The old 'h'
-    # "read out H region hints as text" target is removed.
-    localize_source = 'gt'
+    sft_cfg = (cfg.get('outcome') or {}).get('sft') or {}
 
     train, test = load_prior_split(cfg)
     train, dev = split_holdout_by_class(train, float(cfg['data']['holdout_ratio']),
@@ -910,7 +994,8 @@ def main():
         dev_dataset = dataset_cls(dev, cfg, processor, 'eval', pool)
 
     collator = collator_cls(processor, prior, cfg)
-    opt = _build_optimizer(model, args)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable, lr=float(args.lr), weight_decay=0.0)
 
     output_dir = Path(args.output_dir)
     tb_cfg = cfg.get('tensorboard') or {}
@@ -943,19 +1028,14 @@ def main():
     window_samples = 0
     try:
         for epoch in range(1, total_epochs + 1):
-            if loop_enabled(cfg):
-                k = loop_steps_for_epoch(cfg, epoch)
-                set_loop_steps(model, k)
-                writer.add_scalar('train/loop_steps', k, step)
-                if main_proc:
-                    print(f'[sft] recurrent depth K={k}', flush=True)
             model.train()
             force_vision_eval(model)
             indices = shard_indices(len(dataset), epoch, seed, rank, world, batch_size, device)
             for start in range(0, len(indices), batch_size):
                 started = time.perf_counter()
                 samples = [dataset[i] for i in indices[start:start + batch_size]]
-                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking, answer_only, localize_source)
+                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox,
+                                               thinking, answer_only, sft_cfg)
                 loss = batch_loss(model, packed, backward_scale=1.0 / accum)
                 running_loss += float(loss.detach())
                 running_supervised += n_sup
@@ -978,23 +1058,15 @@ def main():
                     writer.add_scalar('train/lr', float(args.lr), step)
                     writer.add_scalar('train/epoch', epoch, step)
                     writer.add_scalar('optimizer/grad_norm', grad_norm, step)
-                    hv = getattr(unwrap_model(model), 'h_vpt', None)
-                    if hv is not None:
-                        g = torch.tanh(hv.projector.gate.detach())
-                        writer.add_scalar('h_vpt/gate', float(g), step)
                     writer.add_scalar('train/seconds_per_step', seconds, step)
                     if device.type == 'cuda':
                         writer.add_scalar('train/gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 1024 ** 3, step)
                     writer.flush()
                     if main_proc and step % log_every == 0:
-                        gate_s = ''
-                        hv = getattr(unwrap_model(model), 'h_vpt', None)
-                        if hv is not None:
-                            gate_s = f' h_gate={float(torch.tanh(hv.projector.gate.detach())):+.3f}'
                         print(f'[sft] step={step} loss={running_loss / max(1, window_samples):.4f} '
                               f'supervised_tok={running_supervised} seq={seq_mean:.0f} '
                               f'anom={anomaly_frac:.2f} gnorm={grad_norm:.2f} '
-                              f'seen={seen * batch_size} ({seconds:.1f}s){gate_s}', flush=True)
+                              f'seen={seen * batch_size} ({seconds:.1f}s)', flush=True)
                         running_loss = 0.0
                         running_supervised = 0
                         window_samples = 0
@@ -1005,10 +1077,13 @@ def main():
                         _save_adapter(model, processor, output_dir / f'checkpoint-{step}')
                     if world > 1 and dist.is_initialized() and args.save_steps > 0 and step % int(args.save_steps) == 0:
                         dist.barrier()
-                    # Quick FSM rollout smoke eval every N steps (real generation + score).
-                    if args.eval_steps > 0 and step % int(args.eval_steps) == 0 and dev_dataset is not None:
-                        q = quick_rollout_eval(model, processor, prior, collator, dev_dataset, cfg, device,
-                                               int(args.eval_rollout_samples), seed, step)
+                    # Quick single-pass rollout smoke eval every N steps. Falls back to
+                    # the train split when holdout_ratio=0 (no dev set), so the model's
+                    # real sampled boxes are always visible in TB (smoke_case/*_pred_box).
+                    if args.eval_steps > 0 and step % int(args.eval_steps) == 0:
+                        smoke_src = dev_dataset if dev_dataset is not None else dataset
+                        q = quick_rollout_eval(model, processor, prior, collator, smoke_src, cfg, device,
+                                               int(args.eval_rollout_samples), seed, step, writer=writer)
                         writer.add_scalar('smoke/recall', q['recall'] if q['recall'] is not None else float('nan'), step)
                         writer.add_scalar('smoke/tnr', q['tnr'] if q['tnr'] is not None else float('nan'), step)
                         writer.add_scalar('smoke/acc', q['acc'], step)
@@ -1029,7 +1104,7 @@ def main():
                 dev_loss, n_dev = evaluate_dev(model, collator, dev_dataset, device, tokenizer,
                                                multibox, int(args.dev_eval_samples), seed, epoch,
                                                thinking=thinking, answer_only=answer_only,
-                                               localize_source=localize_source)
+                                               sft_cfg=sft_cfg)
                 writer.add_scalar('dev/loss', dev_loss, step)
                 writer.add_scalar('dev/n', n_dev, step)
                 writer.flush()
@@ -1047,7 +1122,7 @@ def main():
 
         if main_proc:
             _save_adapter(model, processor, output_dir)
-            print(f'[sft] saved SFT LoRA + H-VPT to {output_dir} (steps={step})', flush=True)
+            print(f'[sft] saved SFT LoRA to {output_dir} (steps={step})', flush=True)
     finally:
         writer.close()
         if world > 1 and dist.is_initialized():

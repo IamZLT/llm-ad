@@ -13,25 +13,26 @@ from outcome.protocol_multibox import parse_output
 from train_region_sft import build_labels, build_sft_target
 
 
-def test_parse_think_requires_four_stages_in_order():
+def test_parse_think_requires_five_stages_in_order():
     ok = parse_think_stages(
         '[understand]\nref is glossy\n[compare]\nscratch vs print\n'
-        '[localize]\nupper left\n[confirm]\nkeep; real defect'
+        '[localize]\nupper left\n[imagine]\nkeep; box matches the defect\n'
+        '[confirm]\nkeep; real defect'
     )
     assert ok['ok'] and ok['filled'] and ok['no_early_boxes']
     assert ok['headers'] == list(THINK_STAGES)
     assert 'glossy' in ok['bodies']['understand']
 
 
-def test_parse_think_accepts_chinese_headers():
+def test_parse_think_rejects_chinese_headers():
     ok = parse_think_stages('[理解]\na\n[对比]\nb\n[定位]\nc\n[确认]\nd')
-    assert ok['ok'] and ok['filled']
+    assert not ok['ok']
 
 
 def test_parse_think_rejects_missing_or_shuffled_stages():
     assert not parse_think_stages('[understand]\nx\n[confirm]\ny')['ok']
     assert not parse_think_stages(
-        '[compare]\na\n[understand]\nb\n[localize]\nc\n[confirm]\nd'
+        '[compare]\na\n[understand]\nb\n[localize]\nc\n[imagine]\nd\n[confirm]\ne'
     )['ok']
 
 
@@ -44,7 +45,7 @@ def test_parse_think_placeholder_is_not_filled():
 def test_early_box_leak_in_understand():
     info = parse_think_stages(
         '[understand]\ncandidate_bboxes_2d=[[1,2,3,4]]\n[compare]\nok\n'
-        '[localize]\nleft\n[confirm]\nkeep; x'
+        '[localize]\nleft\n[imagine]\nkeep; ok\n[confirm]\nkeep; x'
     )
     assert info['ok'] and not info['no_early_boxes']
 
@@ -73,50 +74,11 @@ def test_sft_masks_tokens_before_answer():
             assert labels[i] == ids[i]
 
 
-def test_build_labels_masks_fsm_markers_supervises_bodies():
-    class _Tok:
-        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
-            ids = list(range(1, len(text) + 1))
-            out = {'input_ids': ids}
-            if return_offsets_mapping:
-                out['offset_mapping'] = [(i, i + 1) for i in range(len(text))]
-            return out
-
-        def convert_tokens_to_ids(self, token):
-            return -1  # no special tokens in this mock
-
-    text = staged_sft_target('ref', 'diff', 'candidate_bboxes_2d=[]', 'none; x',
-                             '{"is_anomaly": false, "bboxes_2d": [], "description": "ok"}')
-    tok = _Tok()
-    ids = tok(text)['input_ids']
-    labels = build_labels([0, 0], ids, target_text=text, tokenizer=tok, thinking=True)
-    assert labels[:2] == [-100, -100]
-    # FSM-controlled markers are masked.
-    for marker in ('[understand]', '[compare]', '[localize]', '[confirm]',
-                   '</think>', '<answer>'):
-        assert labels[2 + text.index(marker)] == -100, marker
-    # </answer> is the model's own stop signal: supervised.
-    assert labels[2 + text.index('</answer>')] != -100
-    # Stage bodies and the JSON answer are supervised.
-    assert labels[2 + text.index('ref')] != -100
-    assert labels[2 + text.index('diff')] != -100
-    assert labels[2 + text.index('candidate_bboxes_2d=[]')] != -100
-    assert labels[2 + text.index('"is_anomaly"')] != -100
-
-
-def test_build_labels_non_thinking_supervises_whole_target():
-    class _Tok:
-        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
-            ids = list(range(1, len(text) + 1))
-            out = {'input_ids': ids}
-            if return_offsets_mapping:
-                out['offset_mapping'] = [(i, i + 1) for i in range(len(text))]
-            return out
-
-    text = '<answer>\n{"is_anomaly": false, "bboxes_2d": [], "description": "ok"}\n</answer>'
-    tok = _Tok()
-    ids = tok(text)['input_ids']
-    labels = build_labels([0, 0], ids, target_text=text, tokenizer=tok, thinking=False)
+def test_build_labels_masks_prompt_supervises_whole_target():
+    # Single-pass SFT: the entire target (stage headers, bodies, </think>, JSON,
+    # closing tags) is supervised; only the prompt is masked.
+    ids = list(range(1, 50))
+    labels = build_labels([0, 0], ids)
     assert labels[:2] == [-100, -100]
     assert labels[2:] == ids
 
@@ -155,13 +117,15 @@ def test_thinking_required_still_parses_optional_stages():
     text = (
         '<think>\n[understand]\nref looks smooth\n[compare]\nlocal scratch not print\n'
         '[localize]\ncandidate_bboxes_2d=[[100,100,200,200]]; in the upper left\n'
-        '[confirm]\nkeep; matches the difference\n</think>\n'
+        '[imagine]\nkeep; this box matches the defect\n'
+        '[confirm]\nunchanged; matches the difference\n</think>\n'
         '<answer>\n{"is_anomaly":true,"bboxes_2d":[[100,100,200,200]],"description":"d"}\n</answer>'
     )
     p = parse_output(text, thinking_required=True)
     assert p['think_ok'] and p['think_filled']
     assert p['candidate_bboxes_2d'] == [[100, 100, 200, 200]]
-    assert p['verify_action'] == 'keep'
+    assert p['verify_action'] == 'unchanged'
+    assert p['imagine_action'] == 'keep'
     assert p['protocol_core'] and p['protocol_strict']
 
 
@@ -171,14 +135,15 @@ def test_sft_target_with_thinking_uses_stage_headers_not_xml():
                 prior_candidates=[dict(bbox_2d=[100, 100, 200, 200])])
     target = build_sft_target(meta, multibox=True, thinking=True)
     assert target.startswith('[understand]')
-    assert '[compare]' in target and '[localize]' in target and '[confirm]' in target
+    assert '[compare]' in target and '[localize]' in target and '[imagine]' in target and '[confirm]' in target
     assert '</think>' in target and '<answer>' in target
     assert '<understand>' not in target and '<ground>' not in target and '<think>' not in target
     p = parse_output(target, thinking_required=True)
     assert p['think_ok'] and p['think_filled']
     assert p['protocol_core'] and p['protocol_strict']
     assert p['candidate_bboxes_2d'] == [[100.0, 100.0, 200.0, 200.0]]
-    assert p['verify_action'] in ('keep', 'refine', 'discover')
+    assert p['verify_action'] in ('improved', 'unchanged', 'degraded')
+    assert p['imagine_action'] in ('keep', 'refine', 'reject')
     assert p['bboxes_2d'] == [[100.0, 100.0, 200.0, 200.0]]
     assert 'scratch' not in target
 

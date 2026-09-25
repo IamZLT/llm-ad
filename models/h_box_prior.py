@@ -1,16 +1,11 @@
 """H-Box geometry-token prior: inject H connected-component boxes as geometry tokens.
 
-IAD-Unify style (arXiv:2604.12440): a frozen region expert supplies anomaly
-evidence, and its *geometry* (bounding-box centre + size) is projected into a
-token that is injected via placeholder replacement — giving the VLM a region
-prior WITHOUT dense-feature cross-attention. Its key finding ("region grounding
-is the decisive mechanism; removing it degrades location accuracy by >76pp") is
-exactly the gap our VPT dense-feature channel failed to fill: the model detects
-"where" but not "how big", so it emits under-sized boxes (see decompose_loc_miss).
-
-Here the region expert is the frozen anomaly-prior H map. Connected components of
-the thresholded H give K candidate boxes — the *extent* signal that dense-feature
-VPT could not convey (VPT's softmax projector also caused KL explosion in RL).
+IAD-Unify style: a frozen region expert (the anomaly-prior H map) supplies anomaly
+evidence, and its *geometry* (bounding-box centre + size) is projected into a token
+that is injected via placeholder replacement — giving the VLM a region prior WITHOUT
+dense-feature cross-attention. The decisive mechanism is *region grounding* (extent):
+the model must learn not just "where" but "how big", which is exactly the signal a
+dense-feature VPT channel failed to convey (it emits under-sized boxes).
 
 Pipeline:
 
@@ -18,11 +13,11 @@ Pipeline:
         -> connected components (threshold)           (region_proposals in inputs.py)
         -> K candidate boxes -> geom [K, GEOM_DIM]     (geometry_from_proposals)
         -> HBoxProjector (linear, static) -> g_proj [K, hidden]
-        -> scattered into K <|h_box|> placeholder slots inside [localize]
+        -> scattered into K <|h_box|> placeholder slots (static search prior)
 
-This is a STATIC, linear injection (no control-token cross-attention, no gate),
-so it avoids VPT's softmax instability and gives the model a direct, interpretable
-"look here, at this size" prior that it refines into precise bboxes_2d.
+This is a STATIC, linear injection (no control-token cross-attention, no gate), so it
+avoids VPT's softmax instability and gives the model a direct, interpretable "look
+here, at this size" prior that it refines into precise bboxes_2d.
 """
 
 from __future__ import annotations
@@ -36,7 +31,6 @@ import torch
 import torch.nn as nn
 
 from models.h_vpt import _embedding_consumer, _language_hidden_size
-from models.qwen35 import unwrap_model
 
 BOX_TOKEN = "<|h_box|>"
 # x1, y1, x2, y2, cx, cy, w, h, area, peak, is_valid  (all [0,1] except is_valid)
@@ -73,9 +67,9 @@ def geometry_from_proposals(proposals, K: int, h_min: float = 0.0,
                             h_max: float = 1.0) -> np.ndarray:
     """Convert ``region_proposals`` output into a [K, GEOM_DIM] geometry matrix.
 
-    Each box is normalised to [0,1] (bbox / 1000, peak / (h_max-h_min)). Rows
-    beyond ``len(proposals)`` are all-zero with ``is_valid=0`` (an explicit "no
-    candidate here" token the model learns to ignore).
+    Each box is normalised to [0,1] (bbox / 1000, peak / (h_max-h_min)). Rows beyond
+    ``len(proposals)`` are all-zero with ``is_valid=0`` (an explicit "no candidate
+    here" token the model learns to ignore).
     """
     K = max(0, int(K))
     g = np.zeros((K, GEOM_DIM), dtype=np.float32)
@@ -109,6 +103,11 @@ def ensure_box_token(processor, model) -> int:
 def box_token_id_of(processor) -> int:
     tok = getattr(processor, "tokenizer", processor)
     return int(tok.convert_tokens_to_ids(BOX_TOKEN))
+
+
+def format_h_box_tokens(K: int) -> str:
+    """Render K ``<|h_box|>`` placeholders as prompt text (space-separated)."""
+    return " ".join([BOX_TOKEN] * max(0, int(K)))
 
 
 def build_h_box_prior(cfg: dict, hidden_size: int) -> HBoxProjector:
