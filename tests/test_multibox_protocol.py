@@ -44,6 +44,17 @@ def test_parse_boxes_list_states():
     assert state == 'list' and boxes == [[100, 100, 200, 200], [300, 300, 400, 400]]
 
 
+def test_parse_boxes_list_full_chain_not_swallowed():
+    # Regression: a full stage-1 think chain ends with a [imagine] header after the
+    # box list. A greedy DOTALL regex used to swallow the header's ']' and misparse.
+    text = (
+        '[understand]\nbaseline\n[compare]\ndiffers\n[localize]\n'
+        'candidate_bboxes_2d=[[125.0, 468.75, 148.81, 491.071]]; on the left\n'
+        '[imagine]\nkeep; matches the observed defect')
+    state, boxes = parse_boxes_list(text)
+    assert state == 'list' and boxes == [[125.0, 468.75, 148.81, 491.071]]
+
+
 def test_parse_verify_action():
     assert parse_verify('keep; both look anomalous')[0] == 'keep'
     assert parse_verify('reject; looks like noise')[0] == 'reject'
@@ -282,9 +293,13 @@ def test_refine_term_is_two_sided_and_clipped():
     p = parse_output(text)
     s = score_output(p, _anomaly_meta(), protocol_weight=0.01)
     assert s['delta_refine'] == pytest.approx(-0.5)
-    # loc_reward = max(final, candidate) = 1.0 (candidate covers both), so dense = 0.3*1.0
-    # 0.5*0.5 + 0.2*0.5 + 0.3*1.0 + 0.2*1.0 (candidate covers both) - 0.1*0.2
-    assert s['task'] == pytest.approx(0.25 + 0.1 + 0.3 + 0.2 - 0.02)
+    # Decoupled Q0/Q1: loc_reward = Q1 = final-box quality = 0.5 (the single final
+    # box matches one of two GT components under Hungarian matching), NOT
+    # max(final, candidate)=1.0. dense = 0.3*0.5 = 0.15.
+    # 0.5*0.5 (mask_iou) + 0.2*0.5 (count) + 0.3*0.5 (dense) + 0.2*1.0 (coverage) - 0.1*0.2
+    assert s['q0'] == pytest.approx(1.0)   # candidate covers both components
+    assert s['q1'] == pytest.approx(0.5)   # final covers one component
+    assert s['task'] == pytest.approx(0.25 + 0.1 + 0.15 + 0.2 - 0.02)
 
 
 def test_focus_band_applies_to_normal_with_three_candidates():

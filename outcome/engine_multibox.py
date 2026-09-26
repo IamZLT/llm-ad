@@ -28,7 +28,8 @@ from models.qwen35 import setup_model_and_processor, freeze_vision_encoder, forc
 from outcome.evaluate_multibox import evaluate, make_record
 from outcome.inputs import build_zoom_train_batch
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.policy import generate_group, group_advantages, optimize_group
+from outcome.policy import (generate_group, generate_inspection_rollouts, group_advantages,
+                             optimize_group, optimize_inspection_group)
 from outcome.zoom_crop import make_zoom_crop
 from outcome.protocol_multibox import VERSION, parse_output_cfg, score_output
 from outcome.thinking import thinking_enabled as _thinking_enabled
@@ -268,6 +269,7 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
         (output_dir/'split_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     try:
         loc_cfg = {**(oc.get('localization') or {}), **(oc.get('reward') or {})}
+        zoom_enabled = bool((oc.get('zoom') or {}).get('enabled', False))
         resample_cfg = oc.get('resampling') or {}
         max_group_resamples = int(resample_cfg.get('max_group_resamples', 3))
         min_loc_range = float(resample_cfg.get('min_loc_range', 0.001))
@@ -279,16 +281,27 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     rng.shuffle(idx)
                     order = idx[rank::world]
                 batch = move_batch(collator([train_set[order.pop()]]), device)
-                batch = _maybe_zoom_train_batch(cfg, processor, prior, device, batch, rng)
+                # Scheme-B fixed shrink-GT zoom is only for the single-pass path;
+                # the two-stage flow crops the model's own B0 inside the rollout.
+                if not zoom_enabled:
+                    batch = _maybe_zoom_train_batch(cfg, processor, prior, device, batch, rng)
                 started = time.perf_counter()
                 meta = batch['_meta'][0]
                 is_anomaly = bool(meta.get('is_anomaly'))
                 completions = parsed = scores = None
+                traces = None
                 task_std = loc_std = loc_range = 0.0
                 rollout_sec = 0.0
                 for resamples in range(max_group_resamples + 1):
                     t_gen = time.perf_counter()
-                    completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
+                    if zoom_enabled:
+                        rollouts = generate_inspection_rollouts(model, processor, prior, batch, cfg,
+                                                                group=int(gc['group_size']), sample=True)
+                        completions = [c for c, _t in rollouts]
+                        traces = [t for _c, t in rollouts]
+                    else:
+                        rollouts = None
+                        completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
                     rollout_sec += time.perf_counter() - t_gen
                     parsed = [parse_output_cfg(c.text, cfg, max_boxes=max_boxes) for c in completions]
                     scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg, max_boxes=max_boxes) for p in parsed]
@@ -314,6 +327,14 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                                   if bool(gc.get('per_token_advantage', True)) else None)
                 if loc_advantages is not None and bool(loc_advantages.abs().max().item() <= 1e-8):
                     loc_advantages = None
+                # Candidate (B0) quality advantage: in the two-stage flow the initial
+                # boxes carry Q0 while the final boxes carry Q1 (=loc_rewards), so the
+                # candidate tokens are not scored by the final-box signal.
+                cand_rewards = torch.tensor([s.get('q0', 0.0) for s in scores], device=device)
+                cand_advantages = (group_advantages(cand_rewards, bool(gc.get('scale_rewards', False)))
+                                   if zoom_enabled and bool(gc.get('per_token_advantage', True)) else None)
+                if cand_advantages is not None and bool(cand_advantages.abs().max().item() <= 1e-8):
+                    cand_advantages = None
                 # Rehearsal/verification calibration advantage: [imagine]/[confirm]
                 # tokens get a focused advantage from the discriminator + imagine
                 # calibration signal, so the "is my box right?" reasoning learns.
@@ -322,7 +343,12 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                                      if bool(gc.get('per_token_advantage', True)) else None)
                 if verify_advantages is not None and bool(verify_advantages.abs().max().item() <= 1e-8):
                     verify_advantages = None
+                # Skip the update only when EVERY valid-token advantage collapsed
+                # (task + candidate + final + verify), not just the task term.
                 zero = bool(advantages.abs().max().item() <= 1e-8)
+                for a in (cand_advantages, loc_advantages, verify_advantages):
+                    if a is not None:
+                        zero = zero and bool(a.abs().max().item() <= 1e-8)
                 if world > 1:
                     zero_t = torch.tensor([1 if zero else 0], device=device, dtype=torch.int64)
                     dist.all_reduce(zero_t, op=dist.ReduceOp.SUM)
@@ -349,6 +375,13 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     confirm_discrim_acc=sum(s.get('discrim_correct', 0.0) for s in scores)/len(scores),
                     imagine_calib_acc=sum(s.get('imagine_correct', 0.0) for s in scores)/len(scores),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
+                if zoom_enabled and traces:
+                    metrics.update(
+                        zoom_executed_rate=sum(bool(t.zoom_executed) for t in traces)/len(traces),
+                        zoom_skip_rate=sum(bool(t.zoom_skip_reason) for t in traces)/len(traces),
+                        mean_quality_before=sum(s.get('q0', 0.0) for s in scores)/len(scores),
+                        mean_quality_after=sum(s.get('q1', 0.0) for s in scores)/len(scores),
+                        mean_delta_refine=sum(s['delta_refine'] for s in scores)/len(scores))
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
                                mean_new_tokens=sum(len(c.ids)-int(batch['prompt_len'][0]) for c in completions)/len(completions))
                 # Average the per-sample metrics across ranks so TB/console show the
@@ -370,9 +403,20 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                 writer.flush()
                 loss_stats = None
                 if not all_zero:
-                    loss_stats = optimize_group(model, processor, batch, completions, advantages, opt, cfg, skip=zero,
-                                                loc_advantages=loc_advantages,
-                                                verify_advantages=verify_advantages)
+                    if zoom_enabled and traces is not None:
+                        # Real two-stage trajectory: each trace carries its own
+                        # per-segment conditioning (stage-2 crops differ), so use
+                        # the two-stage optimizer. Candidate/final boxes carry their
+                        # own Q0/Q1 advantages, decoupled from the max() entanglement.
+                        loss_stats = optimize_inspection_group(
+                            model, processor, rollouts, advantages, opt, cfg, skip=zero,
+                            cand_advantages=cand_advantages,
+                            final_advantages=loc_advantages,
+                            verify_advantages=verify_advantages)
+                    else:
+                        loss_stats = optimize_group(model, processor, batch, completions, advantages, opt, cfg, skip=zero,
+                                                    loc_advantages=loc_advantages,
+                                                    verify_advantages=verify_advantages)
                     updates += 1
                     for name,value in loss_stats.items():
                         writer.add_scalar(f'optimizer/{name}', value, updates)

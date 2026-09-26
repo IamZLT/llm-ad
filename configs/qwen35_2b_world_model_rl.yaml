@@ -151,7 +151,7 @@ distributed:
   num_gpu: 1
   deepspeed: null
   local_rank: -1
-  ddp_find_unused_parameters: false
+  ddp_find_unused_parameters: true
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
@@ -191,7 +191,7 @@ outcome:
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/world_model_sft_2b_hvpt_768_zoom
+  sft_adapter: outputs/train/world_model_sft_2b_hvpt_768_zoom_staged
   # H-Box geometry-token prior (static linear projection, no gate / no cross-attn):
   # H connected-component boxes -> geometry vectors -> <|h_box|> placeholder embeddings.
   h_box_prior:

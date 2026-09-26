@@ -20,6 +20,8 @@ from typing import List, Optional, Tuple
 
 from PIL import Image
 
+from outcome.inspection_trace import (SKIP_INVALID_BOX, SKIP_NO_CANDIDATE,
+                                      SKIP_OVERSIZED_WINDOW)
 from utils.common import qwen_norm1000_to_original_pixels
 
 
@@ -31,6 +33,7 @@ class ZoomCrop:
     box_px: Tuple[int, int, int, int]      # candidate box on the ORIGINAL image
     orig_size: Tuple[int, int]
     degenerate: bool                        # True when the crop is skipped (no-op)
+    skip_reason: str = ''                   # one of SKIP_* when degenerate
 
 
 def _clamp_window(box: Tuple[int, int, int, int], w: int, h: int,
@@ -94,15 +97,49 @@ def make_zoom_crop(test_img: Image.Image, box_2d: Optional[List[float]],
     w, h = int(w), int(h)
     if not box_2d or len(box_2d) != 4:
         return ZoomCrop(image=test_img, window_px=(0, 0, w, h),
-                        box_px=(0, 0, 0, 0), orig_size=(w, h), degenerate=True)
+                        box_px=(0, 0, 0, 0), orig_size=(w, h), degenerate=True,
+                        skip_reason=SKIP_NO_CANDIDATE)
     box = qwen_norm1000_to_original_pixels(list(box_2d), (w, h))
+    if not (box[0] < box[2] and box[1] < box[3]):
+        return ZoomCrop(image=test_img, window_px=(0, 0, w, h),
+                        box_px=tuple(box), orig_size=(w, h), degenerate=True,
+                        skip_reason=SKIP_INVALID_BOX)
     window = _clamp_window(tuple(box), w, h, float(expand), float(min_pad_frac))
     wx1, wy1, wx2, wy2 = window
     area = (wx2 - wx1) * (wy2 - wy1)
     if area <= 0 or area >= max_area_frac * w * h:
         return ZoomCrop(image=test_img, window_px=(0, 0, w, h),
-                        box_px=tuple(box), orig_size=(w, h), degenerate=True)
+                        box_px=tuple(box), orig_size=(w, h), degenerate=True,
+                        skip_reason=SKIP_OVERSIZED_WINDOW)
     crop = test_img.crop((wx1, wy1, wx2, wy2))
     crop = _draw_box(crop, tuple(box), window)
     return ZoomCrop(image=crop, window_px=window, box_px=tuple(box),
-                    orig_size=(w, h), degenerate=False)
+                    orig_size=(w, h), degenerate=False, skip_reason='')
+
+
+def crop_local_to_full(box_local_1000, crop_size, window_px, orig_size):
+    """Map a box expressed in crop-local 0-1000 coords back to full-image 0-1000.
+
+    If a stage internally allows the model to emit crop-local coordinates, this is
+    the single public function that must convert them. ``box_local_1000`` is a
+    [x1,y1,x2,y2] box normalized to 0-1000 *within the crop* (i.e. x1/1000 is the
+    fractional position across the crop). Because Qwen's 0-1000 normalization is
+    resolution-independent, the mapping needs only the crop's full-image window
+    ``window_px`` and the original size ``orig_size``; ``crop_size`` is accepted for
+    call-site compatibility but does not enter the math (the crop's pixel width may
+    differ from ``window_px``'s span only through resizing, which leaves fractional
+    positions unchanged). Stage 2 currently emits full-image coords directly, so
+    this is kept for the phase-2 action module and for asserting round-trips in tests.
+    """
+    wx1, wy1, wx2, wy2 = [float(v) for v in window_px]
+    ow, oh = float(orig_size[0]), float(orig_size[1])
+
+    def _px(v: float, a: float, b: float) -> float:
+        return a + v * (b - a) / 1000.0
+
+    x1 = _px(box_local_1000[0], wx1, wx2)
+    y1 = _px(box_local_1000[1], wy1, wy2)
+    x2 = _px(box_local_1000[2], wx1, wx2)
+    y2 = _px(box_local_1000[3], wy1, wy2)
+    return [round(x1 * 1000.0 / ow, 3), round(y1 * 1000.0 / oh, 3),
+            round(x2 * 1000.0 / ow, 3), round(y2 * 1000.0 / oh, 3)]

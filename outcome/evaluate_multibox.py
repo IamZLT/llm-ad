@@ -17,7 +17,7 @@ import torch
 
 from outcome.inputs_multibox import OutcomeMultiboxCollator
 from outcome.metrics import component_metrics, detection_metrics, union_iou
-from outcome.policy import generate_group, generate_group_zoom
+from outcome.policy import generate_inspection_group
 from outcome.protocol import iou, to_pixels
 from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.visualize_multibox import log_outcome_eval_grid
@@ -41,7 +41,7 @@ def _component_bins(meta, anomaly):
     return 'multi' if int(meta.get('num_components') or 1) >= 2 else 'single'
 
 
-def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes):
+def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes, trace=None):
     anomaly = bool(meta['is_anomaly'])
     gt = meta.get('gt_box_px')
     comps = list(meta.get('component_bboxes') or [])
@@ -101,6 +101,19 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes)
         visual_tokens=meta.get('visual_tokens'), prior_hint_tokens=meta.get('prior_hint_tokens'),
         zoom_enabled=meta.get('zoom_enabled'), zoom_h_size=meta.get('zoom_h_size'),
         zoom_n_crops=meta.get('zoom_n_crops'),
+        # Phase-1 observation bookkeeping: B0/B1 kept separate, zoom truth read
+        # from the InspectionTrace (not the pre-zoom batch `_meta`).
+        initial_boxes=(trace.initial_boxes if trace is not None else parsed['candidate_bboxes_2d']),
+        final_boxes=parsed['bboxes_2d'],
+        zoom_executed=bool(trace.zoom_executed) if trace is not None else False,
+        zoom_skip_reason=(trace.zoom_skip_reason if trace is not None else None),
+        selected_box_index=(trace.selected_box_index if trace is not None else -1),
+        crop_window_px=(list(trace.crop_window_px) if trace is not None and trace.crop_window_px else None),
+        selected_action=parsed.get('selected_action'),
+        predicted_effect=parsed.get('predicted_effect'),
+        pre_observation_prediction=parsed.get('pre_observation_prediction', ''),
+        stage1_early_end=(trace.stage1_early_end if trace is not None else None),
+        quality_before=score.get('q0'), quality_after=score.get('q1'),
         stop_reason=completion.stop_reason, new_tokens=len(completion.ids)-prompt_len,
         seconds=elapsed, text=completion.text)
     if cm is not None:
@@ -234,6 +247,31 @@ def summarize(rows):
     out['macro_union_miou'] = mean(v['union_miou'] for v in out['per_class'].values() if v['union_miou'] is not None)
     out['macro_det_f1_at_50'] = mean(v['det_f1_at_50'] for v in out['per_class'].values() if v['det_f1_at_50'] is not None)
     out['macro_det_f1_at_75'] = mean(v['det_f1_at_75'] for v in out['per_class'].values() if v['det_f1_at_75'] is not None)
+    # Phase-1 observation / refinement transition metrics. Denominators are
+    # explicit: refinement success/degradation are computed only on anomalous
+    # samples where a crop actually executed (so "unchanged" normals and
+    # no-crop degenerates don't dilute the improvement signal).
+    zoomed_anom = [r for r in abnormal if r.get('zoom_executed') and r.get('refine_verdict') is not None]
+    fp_candidates = [r for r in normal if r.get('initial_boxes')]
+    out['n_zoom_executed'] = sum(bool(r.get('zoom_executed')) for r in rows)
+    out['zoom_executed_rate'] = mean(r.get('zoom_executed') for r in rows)
+    out['stage1_format_rate'] = mean(r.get('stage1_early_end') is None for r in rows)
+    out['refine_success_rate'] = mean(r['refine_verdict'] == 'improved' for r in zoomed_anom)
+    out['refine_degrade_rate'] = mean(r['refine_verdict'] == 'degraded' for r in zoomed_anom)
+    out['n_refined'] = len(zoomed_anom)
+    out['mean_quality_before'] = mean(r.get('quality_before') for r in abnormal if r.get('quality_before') is not None)
+    out['mean_quality_after'] = mean(r.get('quality_after') for r in abnormal if r.get('quality_after') is not None)
+    out['mean_delta_refine_zoom'] = mean(r['delta_refine'] for r in zoomed_anom if r.get('delta_refine') is not None)
+    # False-positive rejection: among normal samples where the model proposed at
+    # least one candidate (a would-be false alarm), how many were rejected in the
+    # final answer. Measures whether the observation actually walks back FPs.
+    out['n_fp_candidates'] = len(fp_candidates)
+    out['fp_rejection_rate'] = mean(r['pred'] is False for r in fp_candidates)
+    skip_counts = defaultdict(int)
+    for r in rows:
+        if r.get('zoom_skip_reason'):
+            skip_counts[r['zoom_skip_reason']] += 1
+    out['zoom_skip_reasons'] = dict(skip_counts)
     return out
 
 
@@ -327,13 +365,22 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
         for pos, index in enumerate(indices):
             started = time.perf_counter()
             batch = move_batch(collator([dataset[index]]), device)
-            completion = generate_group_zoom(model, processor, prior, batch, cfg)[0]
+            completion, trace = generate_inspection_group(model, processor, prior, batch, cfg)
             parsed = parse_output_cfg(completion.text, cfg, max_boxes=max_boxes)
             meta = batch['_meta'][0]
             reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),
                                   {**cfg['outcome'].get('localization', {}),
                                    **cfg['outcome'].get('reward', {})}, max_boxes=max_boxes)
-            row = make_record(parsed, reward, meta, completion, int(batch['prompt_len'][0]), time.perf_counter()-started, max_boxes)
+            # Backfill the trace's B1 / action / effect from the parsed chain (only
+            # available after parsing); B0 may already be set by the generator.
+            if trace is not None:
+                if not trace.initial_boxes and parsed['candidate_bboxes_2d']:
+                    trace.initial_boxes = [list(b) for b in parsed['candidate_bboxes_2d']]
+                trace.final_boxes = [list(b) for b in parsed['bboxes_2d']]
+                trace.selected_action = parsed.get('selected_action')
+                trace.predicted_effect = parsed.get('predicted_effect')
+            row = make_record(parsed, reward, meta, completion, int(batch['prompt_len'][0]),
+                              time.perf_counter()-started, max_boxes, trace)
             rows.append(row)
             cases.append(dict(meta=meta, parsed=parsed, response=completion.text,
                               union_iou=reward['union_iou'], loc_reward=reward['loc_reward'],

@@ -10,7 +10,9 @@ from transformers import GenerationConfig, StoppingCriteriaList, StopStringCrite
 
 from models.qwen35 import force_vision_eval, unwrap_model
 from models.vision_cache import bind_cached_image_features
-from outcome.thinking import loc_token_mask, verify_token_mask
+from outcome.inspection_trace import InspectionTrace, RolloutSegment, SKIP_NO_ORIG_SIZE
+from outcome.thinking import (candidate_token_mask, final_box_token_mask, loc_token_mask,
+                               parse_think_stages, verify_token_mask)
 from rl.grpo import (clipped_pg_kl, disable_adapter_ctx, dropout_eval, expand_gen_in_for_group,
                      forward_with_vision, micro_batch_ranges, model_inputs, move_batch,
                      padded_completion_tensors, token_logprobs, token_logprobs_nograd)
@@ -188,10 +190,13 @@ def _trim_to_first_stop(text: str, stop_strings) -> str:
 
 
 def _generate_stage1(model, processor, batch, cfg, sample):
-    """Latent pass: generate up to (but not including) ``[imagine]`` / ``[confirm]``.
+    """Stage-1 pass: generate ``[understand][compare][localize][imagine]`` and stop
+    *before* ``[confirm]``.
 
-    Mirrors ``generate_group`` but stops at the first stage marker so the candidate
-    boxes in ``[localize]`` can be extracted for the zoom observation pass.
+    ``[imagine]`` is now the **pre-observation** prediction (is the candidate a true
+    anomaly, does it need correction, likely problem type), written *before* the crop
+    is read. The normal stop boundary is the ``[confirm]`` header; hitting ``</think>``,
+    ``<answer>``, or EOS first is recorded as an early end, not a completed stage 1.
     """
     tokenizer = getattr(processor, 'tokenizer', processor)
     gcfg = cfg['grpo']
@@ -201,7 +206,7 @@ def _generate_stage1(model, processor, batch, cfg, sample):
     generation = GenerationConfig(max_new_tokens=limit, do_sample=sample,
         temperature=1.0, top_p=1.0, top_k=0, typical_p=1.0, repetition_penalty=1.0,
         eos_token_id=ends or None, pad_token_id=pad, use_cache=True, num_beams=1)
-    stop_strings = ['[imagine]', '[confirm]', '</think>', '<answer>']
+    stop_strings = ['[confirm]', '</think>', '<answer>']
     stops = StoppingCriteriaList([StopStringCriteria(tokenizer=tokenizer, stop_strings=stop_strings)])
     core = unwrap_model(model)
     was_training = core.training
@@ -220,41 +225,87 @@ def _generate_stage1(model, processor, batch, cfg, sample):
     ids = row.detach().clone()
     raw = tokenizer.decode(ids[prompt_len:], skip_special_tokens=True)
     text = _trim_to_first_stop(raw, stop_strings)
-    return Completion(ids, text, 'stage1')
+    suffix = raw[len(text):] if len(raw) > len(text) else ''
+    if suffix.startswith('[confirm]'):
+        reason = 'stage1'
+    elif suffix.startswith('</think>'):
+        reason = 'early_think'
+    elif suffix.startswith('<answer>'):
+        reason = 'early_answer'
+    elif suffix == '':
+        reason = 'eos'
+    else:
+        reason = 'length'
+    return Completion(ids, text, reason)
 
 
-def _zoom_continuation_text(cfg, class_name: str) -> str:
-    """Second-pass prompt: re-observe the candidate box's extent from the crop."""
+def _window_1000(window_px, orig_size):
+    if not window_px or not orig_size:
+        return None
+    w, h = float(orig_size[0]), float(orig_size[1])
+    return [round(float(window_px[0]) * 1000.0 / w, 1), round(float(window_px[1]) * 1000.0 / h, 1),
+            round(float(window_px[2]) * 1000.0 / w, 1), round(float(window_px[3]) * 1000.0 / h, 1)]
+
+
+def _zoom_continuation_text(cfg, class_name: str, selected_index: int,
+                            window_1000, has_crop: bool, skip_reason: str = '') -> str:
+    """Stage-2 prompt: verify the candidate box from the crop (or full image if no crop).
+
+    Explicitly tells the model that ``[imagine]`` was a **pre-observation** prediction
+    and that ``[confirm]`` must now use Image 3 (when present) to correct the box.
+    """
+    if has_crop:
+        box_ref = f'candidate box #{selected_index + 1}' if selected_index >= 0 else 'the candidate box'
+        window = f' The crop window spans the full-image region {window_1000} (0-1000).' if window_1000 else ''
+        return (
+            f"Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection "
+            f"image. Image 3 is a zoomed crop around {box_ref}; the red rectangle marks that "
+            f"candidate box.{window} You already wrote your understand / compare / localize "
+            "reasoning and your [imagine] PRE-observation prediction above. Now inspect Image 3 "
+            "and verify the candidate box's extent against the true defect boundary: is it too "
+            "small / too large / shifted, or a false alarm? Write [confirm] with your final "
+            "boxes, then close your thinking with </think> and output <answer>."
+        )
+    reason = f' ({skip_reason})' if skip_reason else ''
     return (
-        f"Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection "
-        "image. Image 3 is a zoomed crop centered on your first candidate box; the red "
-        "rectangle is that candidate box outline. You have already written your "
-        "understand / compare / localize reasoning above. Now look closely at the crop: "
-        "does the candidate box's extent match the true defect boundary, or is it too "
-        "small / too large / shifted? Continue your thinking from [imagine] (judge the "
-        "candidate box quality: keep / refine / reject / none), then [confirm] (whether "
-        "your refinement improved / was unchanged / degraded the box). Close your "
-        "thinking with </think> and output <answer>."
+        f"Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image. "
+        "You already wrote your understand / compare / localize reasoning and your [imagine] "
+        f"PRE-observation prediction above. No zoom crop was available{reason}, so verify the "
+        "candidate box from the full image alone. Write [confirm] with your final boxes, then "
+        "close your thinking with </think> and output <answer>."
     )
 
 
-def generate_group_zoom(model, processor, prior, batch, cfg, group=1, sample=False):
-    """Two-stage world-model rollout with a zoom-crop observation step.
+def _imagine_body(stage1_text: str) -> str:
+    """Extract the ``[imagine]`` body from stage-1 text (the pre-observation prediction)."""
+    info = parse_think_stages(stage1_text or '')
+    return info['bodies'].get('imagine', '') or info['first_bodies'].get('imagine', '')
 
-    Stage 1 writes ``[understand][compare][localize]`` in latent space. The first
-    candidate box is cropped (padded window + drawn outline) and re-encoded; stage 2
-    prefills a 3-image prompt (ref + test + crop) so the model *sees* the box extent
-    before committing in ``[imagine][confirm]``. The two texts are concatenated so the
-    downstream parser sees one uninterrupted think chain.
 
-    This path is used for evaluation / prediction (``group==1``). For group sampling
-    the per-trajectory crop makes a batched prefill non-trivial, so it falls back to
-    the single-pass rollout (which keeps the training loop correct).
+def _think_stage_body(stage1_text: str, stage: str) -> str:
+    """Extract one ``[stage]`` body from stage-1 text (last occurrence wins)."""
+    info = parse_think_stages(stage1_text or '')
+    return info['bodies'].get(stage, '') or info['first_bodies'].get(stage, '')
+
+
+def generate_inspection_group(model, processor, prior, batch, cfg, group=1, sample=False):
+    """Unified two-stage world-model inspection flow (train & eval share this).
+
+    Stage 1 writes ``[understand][compare][localize][imagine]`` (pre-observation
+    prediction). The selected candidate box is then cropped (padded window + drawn
+    outline) and re-encoded; stage 2 continues from ``[confirm]`` conditioned on
+    ref + test + crop (or ref + test when the crop degenerates). ``B0`` and ``B1``
+    are kept separate in the returned ``InspectionTrace``.
+
+    Returns ``(completion, trace)``. ``completion.text`` is the concatenated think
+    chain for the parser. ``trace.final_boxes`` / ``selected_action`` /
+    ``predicted_effect`` are left for the caller to fill from ``parse_output``.
+
+    For ``group > 1`` the per-trajectory crop breaks batched sampling; callers
+    should use the single-pass ``generate_group`` (the training loop) until the
+    two-stage GRPO optimizer lands (phase 3).
     """
     zcfg = (cfg.get('outcome') or {}).get('zoom') or {}
-    if not bool(zcfg.get('enabled', False)) or group != 1:
-        return generate_group(model, processor, batch, cfg, group=group, sample=sample)
-
     stage1 = _generate_stage1(model, processor, batch, cfg, sample)
     meta = (batch.get('_meta') or [{}])[0]
     test_img = meta.get('test')
@@ -262,40 +313,125 @@ def generate_group_zoom(model, processor, prior, batch, cfg, group=1, sample=Fal
     class_name = str(meta.get('class_name', 'object'))
     orig_size = meta.get('orig_size') or (test_img.size if test_img is not None else None)
 
-    if test_img is None or orig_size is None:
-        return [stage1]
+    trace = InspectionTrace(segments=[RolloutSegment(
+        input_ids=batch.get('input_ids'),
+        prompt_len=int(batch['prompt_len'][0]),
+        attention_mask=batch.get('attention_mask'),
+        image_embeds=batch.get('image_embeds'),
+        pixel_values=batch.get('pixel_values'),
+        image_grid_thw=batch.get('image_grid_thw'),
+        mm_token_type_ids=batch.get('mm_token_type_ids'),
+        box_token_id=int(batch.get('box_token_id', -1)),
+        h_box_geom=batch.get('h_box_geom'),
+        control_token_id=int(batch.get('control_token_id', -1)),
+        feat_token_id=int(batch.get('feat_token_id', -1)),
+        h_map=batch.get('h_map'),
+        completion=stage1)])
+    trace.stage1_early_end = None if stage1.stop_reason == 'stage1' else stage1.stop_reason
+    trace.pre_observation_prediction = _imagine_body(stage1.text)
+
+    if not bool(zcfg.get('enabled', False)) or group != 1:
+        completion = generate_group(model, processor, batch, cfg, group=group, sample=sample)[0]
+        return completion, trace
 
     from outcome.protocol_multibox import parse_boxes_list
     from outcome.zoom_crop import make_zoom_crop
-    from outcome.inputs import build_zoom_batch
+    from outcome.inputs import build_observation_batch
 
-    state, boxes = parse_boxes_list(stage1.text)
-    zoom = make_zoom_crop(
-        test_img, boxes[0] if (state == 'list' and boxes) else None,
-        orig_size=orig_size,
-        expand=float(zcfg.get('expand', 1.0)),
-        min_pad_frac=float(zcfg.get('min_pad_frac', 0.12)),
-        max_area_frac=float(zcfg.get('max_area_frac', 0.6)),
-    )
-    if zoom.degenerate:
-        # No meaningful crop (no box, or a whole-image window): complete single-pass.
-        return generate_group(model, processor, batch, cfg, group=1, sample=sample)
+    if test_img is None or orig_size is None:
+        # Should not happen (the collator always sets test/orig_size), but a missing
+        # original image makes cropping impossible: complete single-pass.
+        trace.zoom_skip_reason = SKIP_NO_ORIG_SIZE
+        completion = generate_group(model, processor, batch, cfg, group=1, sample=sample)[0]
+        return completion, trace
+
+    # Parse the candidate boxes from the [localize] *body* (not the whole stage-1
+    # text): parse_boxes_list's box-list regex is greedy and DOTALL, so feeding it
+    # the full chain would over-match the trailing [imagine] header and return
+    # 'invalid'. Extracting the body mirrors how parse_output reads ground_text.
+    localize_body = (_think_stage_body(stage1.text, 'localize'))
+    state, boxes = parse_boxes_list(localize_body)
+    selected_index = 0 if (state == 'list' and boxes) else -1
+    trace.initial_boxes = [list(b) for b in boxes] if state == 'list' else []
+    trace.selected_box_index = selected_index
+
+    crop_img = None
+    window_px = None
+    if selected_index >= 0:
+        zoom = make_zoom_crop(
+            test_img, boxes[selected_index],
+            orig_size=orig_size,
+            expand=float(zcfg.get('expand', 1.0)),
+            min_pad_frac=float(zcfg.get('min_pad_frac', 0.12)),
+            max_area_frac=float(zcfg.get('max_area_frac', 0.6)),
+        )
+        if zoom.degenerate:
+            trace.zoom_skip_reason = zoom.skip_reason
+        else:
+            crop_img = zoom.image
+            window_px = zoom.window_px
+            trace.crop_window_px = tuple(window_px)
+            trace.zoom_executed = True
+    else:
+        from outcome.inspection_trace import SKIP_NO_CANDIDATE
+        trace.zoom_skip_reason = SKIP_NO_CANDIDATE
 
     device = batch['input_ids'].device
-    zbatch = build_zoom_batch(processor, prior, cfg, ref_img, test_img, zoom.image,
-                              _zoom_continuation_text(cfg, class_name), device,
-                              crop_min_pixels=zcfg.get('crop_min_pixels'),
-                              prefill_text=stage1.text)
+    cont = _zoom_continuation_text(cfg, class_name, selected_index,
+                                   _window_1000(window_px, orig_size),
+                                   has_crop=crop_img is not None,
+                                   skip_reason=trace.zoom_skip_reason or '')
+    zbatch = build_observation_batch(processor, prior, cfg, ref_img, test_img, crop_img,
+                                     cont, device, crop_min_pixels=zcfg.get('crop_min_pixels'),
+                                     prefill_text=stage1.text)
     zbatch = move_batch(zbatch, device)
     stage2 = generate_group(model, processor, zbatch, cfg, group=1, sample=sample)[0]
+    trace.segments.append(RolloutSegment(
+        input_ids=zbatch.get('input_ids'),
+        prompt_len=int(zbatch['prompt_len'][0]),
+        attention_mask=zbatch.get('attention_mask'),
+        image_embeds=zbatch.get('image_embeds'),
+        pixel_values=zbatch.get('pixel_values'),
+        image_grid_thw=zbatch.get('image_grid_thw'),
+        mm_token_type_ids=zbatch.get('mm_token_type_ids'),
+        completion=stage2))
 
-    # stage2 continues from the prefilled [understand][compare][localize] prefix,
-    # so its text starts at [imagine]. Concatenate the two spans into one think
-    # chain for the parser; ids are synthesized for `new_tokens` accounting only.
+    # stage2 continues from the prefilled [understand]...[imagine] prefix, so its
+    # text starts at [confirm]. Concatenate the two spans into one think chain for
+    # the parser; ids are synthesized for `new_tokens` accounting only.
     p1 = int(batch['prompt_len'][0])
     p2 = int(zbatch['prompt_len'][0])
     ids = torch.cat([stage1.ids[:p1], stage1.ids[p1:], stage2.ids[p2:]])
-    return [Completion(ids, stage1.text + stage2.text, stage2.stop_reason)]
+    return Completion(ids, stage1.text + stage2.text, stage2.stop_reason), trace
+
+
+def generate_group_zoom(model, processor, prior, batch, cfg, group=1, sample=False):
+    """Backward-compatible wrapper returning ``[Completion]`` from the unified flow."""
+    completion, _trace = generate_inspection_group(model, processor, prior, batch, cfg,
+                                                   group=group, sample=sample)
+    return [completion]
+
+
+def generate_inspection_rollouts(model, processor, prior, batch, cfg, group=1, sample=True):
+    """``group`` independent two-stage trajectories, each ``(Completion, InspectionTrace)``.
+
+    Each trace carries two ``RolloutSegment``s with full per-segment conditioning
+    (stage-1 prompt + H, stage-2 continuation + crop), so the two-stage GRPO
+    optimizer can replay logprobs against the *actual* input each trajectory saw.
+
+    When zoom is disabled this falls back to ``group`` single-pass rollouts (the
+    trace is None), preserving the shared-prefill fast path.
+    """
+    zcfg = (cfg.get('outcome') or {}).get('zoom') or {}
+    if not bool(zcfg.get('enabled', False)):
+        comps = generate_group(model, processor, batch, cfg, group=group, sample=sample)
+        return [(c, None) for c in comps]
+    results = []
+    for _ in range(group):
+        completion, trace = generate_inspection_group(model, processor, prior, batch, cfg,
+                                                      group=1, sample=sample)
+        results.append((completion, trace))
+    return results
 
 
 def _sample_tokens(logits: torch.Tensor, sample: bool) -> torch.Tensor:
@@ -523,6 +659,161 @@ def optimize_group(model, processor, batch, completions, advantages, optimizer, 
         totals[key] /= policy_epochs
     totals['grad_norm'] = last_grad_norm
     totals['effective_tokens'] = sum(len(c.ids)-prompt_len for c in completions)
+    totals['seconds_old_ref'] = t_oldref - t_start
+    totals['seconds_optimize'] = time.perf_counter() - t_start
+    return totals
+
+
+def _segment_tensors(segment, pad, device):
+    """(outputs, attn, labels) for one segment (prompt positions are label=-100)."""
+    return padded_completion_tensors([segment.completion.ids], int(segment.prompt_len), pad, device)
+
+
+def _segment_advantage(segment, stage_idx, traj_idx, advantages, cand_advantages,
+                       final_advantages, verify_advantages, tokenizer, device):
+    """Per-token advantage [1, max_t] for one segment, split B0 / B1 / verify.
+
+    Stage 1's ``[localize]`` candidate tokens (B0) carry ``cand_advantages``;
+    stage 2's final ``bboxes_2d`` tokens (B1) carry ``final_advantages``; the
+    ``[imagine]``/``[confirm]`` reasoning carries ``verify_advantages``. All other
+    sampled tokens carry the trajectory's task advantage.
+    """
+    n_comp = int(segment.completion.ids.numel()) - int(segment.prompt_len)
+    max_t = int(segment.completion.ids.numel())
+    adv = torch.full((1, max_t), float(advantages[traj_idx]), device=device)
+    text = segment.completion.text or ''
+    if stage_idx == 0 and cand_advantages is not None:
+        flags = candidate_token_mask(tokenizer, text)
+        for j, flag in enumerate(flags[:n_comp]):
+            if flag:
+                adv[0, int(segment.prompt_len) + j] = float(cand_advantages[traj_idx])
+    elif stage_idx == 1 and final_advantages is not None:
+        flags = final_box_token_mask(tokenizer, text)
+        for j, flag in enumerate(flags[:n_comp]):
+            if flag:
+                adv[0, int(segment.prompt_len) + j] = float(final_advantages[traj_idx])
+    if verify_advantages is not None:
+        flags = verify_token_mask(tokenizer, text)
+        for j, flag in enumerate(flags[:n_comp]):
+            if flag:
+                adv[0, int(segment.prompt_len) + j] = float(verify_advantages[traj_idx])
+    return adv
+
+
+def optimize_inspection_group(model, processor, trajectories, advantages, optimizer, cfg,
+                              skip=False, cand_advantages=None, final_advantages=None,
+                              verify_advantages=None):
+    """Two-stage on-policy PPO update over real ``RolloutSegment`` trajectories.
+
+    Unlike ``optimize_group`` (which assumes every trajectory shares one ``batch``
+    and vision cache), each trajectory here carries two segments with their *own*
+    conditioning (stage-2 crops differ). old/ref/new logprobs are computed per
+    segment against that segment's actual inputs, and the policy objective is
+    aggregated across segments as a token-weighted mean over the whole group. The
+    replayed stage-1 prefix (stage-2 ``prompt_len``) and any controller-inserted
+    text (``sampled_mask``) are excluded from the sampled-token loss because they
+    are label=-100.
+
+    ``advantages`` is the trajectory-level task advantage; ``cand_advantages`` /
+    ``final_advantages`` / ``verify_advantages`` (optional, ``[group]``) drive the
+    per-token B0 / B1 / verify split (see ``_segment_advantage``).
+    """
+    gc = cfg['grpo']
+    policy_epochs = max(1, int(gc.get('policy_epochs', 1)))
+    if policy_epochs == 1 and not bool(gc.get('allow_single_epoch', False)):
+        raise ValueError('policy_epochs=1 pins ratio to 1.0 (clip never fires); '
+                         'use policy_epochs>=2 or set allow_single_epoch=true')
+    tokenizer = getattr(processor, 'tokenizer', processor)
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    device = next(model.parameters()).device
+    group = len(trajectories)
+
+    # Flatten (traj_idx, stage_idx, segment) for every segment of every trajectory.
+    seg_meta = []
+    for i, (_completion, trace) in enumerate(trajectories):
+        for s_idx, seg in enumerate(trace.segments):
+            outputs, attn, labels = _segment_tensors(seg, pad, device)
+            adv = _segment_advantage(seg, s_idx, i, advantages, cand_advantages,
+                                     final_advantages, verify_advantages, tokenizer, device)
+            n_comp = int(seg.completion.ids.numel()) - int(seg.prompt_len)
+            seg_meta.append(dict(seg=seg, outputs=outputs, attn=attn, labels=labels,
+                                 adv=adv, n_comp=n_comp))
+    total_tokens = max(1, sum(m['n_comp'] for m in seg_meta))
+
+    t_start = time.perf_counter()
+    old_lps = ref_lps = None
+    if not skip:
+        old_lps, ref_lps = [], []
+        for m in seg_meta:
+            seg = m['seg']
+            sb = seg.as_batch()
+            gen_in = model_inputs(sb)
+            with torch.no_grad(), bind_cached_image_features(model, sb['image_embeds']):
+                h_H = _h_vpt_h_H(model, sb)
+            with bind_cached_image_features(model, sb['image_embeds']), \
+                    _h_box_ctx(model, sb), _h_vpt_ctx(model, sb, h_H):
+                old, _ = token_logprobs_nograd(model, gen_in, m['outputs'], m['attn'], m['labels'])
+                if float(gc['kl_beta']) > 0:
+                    with disable_adapter_ctx(model):
+                        ref, _ = token_logprobs_nograd(model, gen_in, m['outputs'], m['attn'], m['labels'])
+                else:
+                    ref = old
+            old_lps.append(old)
+            ref_lps.append(ref)
+    t_oldref = time.perf_counter()
+
+    totals = dict(loss=0., pg=0., kl=0., ratio=0., clip_fraction=0., logprob_max_error=0.)
+    model.train()
+    force_vision_eval(model)
+    last_grad_norm = 0.0
+    err_tol = float(gc.get('logprob_error_tolerance', .1))
+    for pe in range(policy_epochs):
+        t_pe = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        pe_totals = dict(loss=0., pg=0., kl=0., ratio=0., clip_fraction=0., logprob_max_error=0.)
+        for k, m in enumerate(seg_meta):
+            seg = m['seg']
+            sb = seg.as_batch()
+            gen_in = model_inputs(sb)
+            with torch.no_grad(), bind_cached_image_features(model, sb['image_embeds']):
+                h_H = _h_vpt_h_H(model, sb)
+            with dropout_eval(model), bind_cached_image_features(model, sb['image_embeds']), \
+                    _h_box_ctx(model, sb), _h_vpt_ctx(model, sb, h_H, with_grad=True):
+                out = forward_with_vision(model, gen_in, m['outputs'], m['attn'])
+                if skip:
+                    loss = out.logits.float().sum() * 0.0
+                    pg = kl = ratio = clipped = torch.zeros((), device=device)
+                else:
+                    new_lp, mask = token_logprobs(out.logits, m['labels'])
+                    error = ((new_lp.detach() - old_lps[k]).abs() * mask).max().item()
+                    pe_totals['logprob_max_error'] = max(pe_totals['logprob_max_error'], error)
+                    if not torch.isfinite(new_lp).all() or (pe == 0 and error > err_tol):
+                        optimizer.zero_grad(set_to_none=True)
+                        raise RuntimeError(f'behavior/new logprob mismatch before update: max={error}')
+                    loss, pg, kl, ratio, clipped = clipped_pg_kl(
+                        new_lp, mask, old_lps[k], ref_lps[k], m['adv'][:, 1:],
+                        float(gc['clip_low']), float(gc['clip_high']), float(gc['kl_beta']))
+                if not torch.isfinite(loss):
+                    raise RuntimeError('nonfinite policy loss')
+                weight = m['n_comp'] / total_tokens
+                (loss * weight).backward()
+                for key, value in zip(('loss', 'pg', 'kl', 'ratio', 'clip_fraction'),
+                                      (loss, pg, kl, ratio, clipped)):
+                    pe_totals[key] += float(value.detach()) * weight
+                del out, loss
+                if not skip:
+                    del new_lp
+        params = [p for p in model.parameters() if p.requires_grad]
+        last_grad_norm = float(torch.nn.utils.clip_grad_norm_(params, float(gc['max_grad_norm']), error_if_nonfinite=True))
+        optimizer.step()
+        totals[f'seconds_actor_epoch_{pe}'] = time.perf_counter() - t_pe
+        for key in ('loss', 'pg', 'kl', 'ratio', 'clip_fraction', 'logprob_max_error'):
+            totals[key] += pe_totals[key]
+    for key in ('loss', 'pg', 'kl', 'ratio', 'clip_fraction', 'logprob_max_error'):
+        totals[key] /= policy_epochs
+    totals['grad_norm'] = last_grad_norm
+    totals['effective_tokens'] = total_tokens
+    totals['n_segments'] = len(seg_meta)
     totals['seconds_old_ref'] = t_oldref - t_start
     totals['seconds_optimize'] = time.perf_counter() - t_start
     return totals

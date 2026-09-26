@@ -42,9 +42,32 @@ def parse_boxes_list(text: str):
     'invalid' and boxes is a list of validated [x1,y1,x2,y2] floats.
     """
     text = text.strip()
-    assigned = re.search(r'candidate_bboxes_2d\s*=\s*(null|\[.*\])', text, flags=re.I | re.S)
+    assigned = re.search(r'candidate_bboxes_2d\s*=', text, flags=re.I)
     if assigned:
-        text = assigned.group(1).strip()
+        rest = text[assigned.end():].lstrip()
+        if rest.lower().startswith('null'):
+            text = 'null'
+        elif rest.startswith('['):
+            # Bracket-match the box list so a trailing ``; location`` suffix or a
+            # following ``[imagine]``/``[confirm]`` header cannot be swallowed by a
+            # greedy regex (a greedy ``\[.*\]`` over-matches past ``]]`` into the
+            # next bracketed stage header, corrupting the parse).
+            depth = 0
+            end = -1
+            for j, c in enumerate(rest):
+                if c == '[':
+                    depth += 1
+                elif c == ']':
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 1
+                        break
+            if end > 0:
+                text = rest[:end].strip()
+            else:
+                text = rest
+        else:
+            text = rest
     else:
         text = re.sub(r'^\s*candidate_bboxes_2d\s*=\s*', '', text, flags=re.I)
     if text == '':
@@ -122,7 +145,10 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
                   description='', tags={},
                   answer_keys=[], protocol_core=False, protocol_strict=False, num_boxes=0,
                   think_ok=False, think_filled=False, think_no_early_boxes=True,
-                  think_headers=[], think_bodies={})
+                  think_headers=[], think_bodies={},
+                  # Two-stage observation bookkeeping (phase 1): B0/B1 are the initial
+                  # [localize] boxes and the final <answer> boxes respectively.
+                  pre_observation_prediction='', selected_action=None, predicted_effect=None)
     blocks = list(BLOCK.finditer(text))
     result['tags'] = {m[1]: m[2].strip() for m in blocks}
     answers = list(re.finditer(r'<answer>(.*?)</answer>', text, re.S))
@@ -221,6 +247,14 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     result['verify_evidence'] = vevidence
     iaction, _ = parse_verify(imagine_text) if imagine_text.strip() else (None, '')
     result['imagine_action'] = iaction
+    # Phase-1 observation fields. ``pre_observation_prediction`` is the raw
+    # [imagine] body (written before the crop); ``predicted_effect`` is the
+    # [confirm] verdict (improved/unchanged/degraded — a *prediction*, not a
+    # verified fact, since inference has no GT). ``selected_action`` stays None
+    # until the phase-2 geometric action module introduces keep/expand/.../reject.
+    result['pre_observation_prediction'] = imagine_text.strip()
+    result['predicted_effect'] = vaction
+    result['selected_action'] = None
 
     candidate_ok = cstate in ('null', 'empty', 'list')
     verify_ok = vaction is not None
@@ -494,16 +528,20 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
             hits = sum(1 for g in comps
                        if any(candidate_hits_comp(c, g, cand_iou_threshold) for c in cand_px))
             cand_cov_val = float(hits / len(comps))
-    # loc_reward = max(final, candidate): the localization advantage rewards "at least
-    # one step of the internal chain localized the defect", so a miss whose [localize]
-    # candidate box was still correct keeps a positive localization signal instead of
-    # collapsing to 0 (world-model: reward the intermediate prediction, not only the
-    # final verdict).
-    loc_reward = max(setd['reward'], candd['reward'])
-    # delta_refine = final - FIRST candidate: the true "did reject/refine improve the
-    # box" increment. Using the last-round candidate here would compare the final box
-    # against itself (== 0) in a well-formed trajectory, killing the refine signal.
-    delta_refine = setd['reward'] - first_candd['reward']
+    # Q0 = candidate-box quality (B0), Q1 = final-box quality (B1). The final
+    # answer's coordinates are supervised by Q1 only; the candidate boxes carry
+    # their own Q0 signal through cand_weight. We no longer take max(Q0, Q1) for
+    # the final-coordinate advantage — that rewarded a correct candidate even when
+    # the final box degraded, giving the final coords a positive signal they did
+    # not earn (and hiding refinement regressions).
+    q0 = candd['reward']
+    q1 = setd['reward']
+    loc_reward = q1
+    cand_reward = q0
+    # delta_refine = final - first candidate: the true "did observation/refinement
+    # improve the box" increment (Q1 - Q(B0)). Using the last-round candidate here
+    # would compare the final box against itself (== 0) in a well-formed trajectory.
+    delta_refine = q1 - first_candd['reward']
     # World-model rehearsal calibration. The two stages are scored against two
     # *different* objective labels so they cannot collapse into echoes:
     #   * [imagine] predicts the candidate box's objective quality (keep/refine/
@@ -542,7 +580,8 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     return dict(task=task, protocol=protocol_core, protocol_core=protocol_core,
                 protocol_strict=float(parsed['protocol_strict']),
                 total=task + protocol_weight * protocol_core,
-                loc_reward=loc_reward, set_c_reward=candd['reward'], set_f_reward=setd['reward'],
+                loc_reward=loc_reward, cand_reward=cand_reward, q0=q0, q1=q1,
+                set_c_reward=candd['reward'], set_f_reward=setd['reward'],
                 delta_refine=delta_refine,
                 mask_iou=mask_iou_val, union_iou=union_iou_val,
                 raw_iou=raw_set_iou, set_iou=raw_set_iou, set_giou=set_giou_val,
@@ -550,5 +589,8 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 discrim_correct=discrim_correct, imagine_correct=imagine_correct,
                 verify_signal=discrim_weight * discrim_correct + imagine_weight * imagine_correct,
                 verify_action=verify_action, imagine_action=imagine_action,
+                selected_action=parsed.get('selected_action'),
+                pre_observation_prediction=parsed.get('pre_observation_prediction', ''),
+                predicted_effect=parsed.get('predicted_effect'),
                 objective_verdict=obj_verdict, refine_verdict=refine_obj,
                 correct=bool(correct), matched_pairs=setd['matched_pairs'], s_sum=setd['s_sum'])

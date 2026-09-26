@@ -270,16 +270,21 @@ def loc_char_spans(text: str) -> list:
     body, and (2) the final ``bboxes_2d`` value in the ``<answer>`` JSON. Returns
     ``(start, end)`` char offsets into ``text`` (decoded completion).
     """
-    spans = []
-    for m in LOCALIZE_SPAN_RE.finditer(text or ''):
-        spans.append((m.start(), m.end()))
-    for m in BBOX_VAL_RE.finditer(text or ''):
-        spans.append((m.start(), m.end()))
-    return spans
+    return candidate_char_spans(text) + final_box_char_spans(text)
 
 
-def loc_token_mask(tokenizer, text: str) -> list:
-    """Per-token 0/1 mask over ``text`` (decoded completion): 1 = localization token.
+def candidate_char_spans(text: str) -> list:
+    """Character spans of the *initial* boxes (``[localize]`` candidate = B0)."""
+    return [(m.start(), m.end()) for m in LOCALIZE_SPAN_RE.finditer(text or '')]
+
+
+def final_box_char_spans(text: str) -> list:
+    """Character spans of the *final* boxes (``bboxes_2d`` in the answer = B1)."""
+    return [(m.start(), m.end()) for m in BBOX_VAL_RE.finditer(text or '')]
+
+
+def _spans_to_token_mask(tokenizer, text: str, spans: list) -> list:
+    """Per-token 0/1 mask over ``text`` (decoded completion) for char spans.
 
     Re-tokenizes the decoded completion with char offsets and marks any token whose
     char span overlaps a localization span. Mirrors ``unsupervised_think_labels``.
@@ -292,7 +297,6 @@ def loc_token_mask(tokenizer, text: str) -> list:
         return []
     ids, offs = _encoding_fields(enc)
     mask = [0] * len(ids)
-    spans = loc_char_spans(text)
     if not spans or not offs:
         return mask
     for i, pair in enumerate(offs):
@@ -306,12 +310,27 @@ def loc_token_mask(tokenizer, text: str) -> list:
     return mask
 
 
+def loc_token_mask(tokenizer, text: str) -> list:
+    """Per-token 0/1 mask over ``text``: 1 = any localization token (candidate or final)."""
+    return _spans_to_token_mask(tokenizer, text, loc_char_spans(text))
+
+
+def candidate_token_mask(tokenizer, text: str) -> list:
+    """Per-token 0/1 mask: 1 = initial ``[localize]`` candidate-box token (B0)."""
+    return _spans_to_token_mask(tokenizer, text, candidate_char_spans(text))
+
+
+def final_box_token_mask(tokenizer, text: str) -> list:
+    """Per-token 0/1 mask: 1 = final ``bboxes_2d`` value token (B1)."""
+    return _spans_to_token_mask(tokenizer, text, final_box_char_spans(text))
+
+
 IMAGINE_SPAN_RE = re.compile(
-    r'\[imagine\](.*?)(?=\[confirm\]|\</think\>|<answer>)',
+    r'\[imagine\](.*?)(?=\[confirm\]|\</think\>|<answer>|$)',
     re.S | re.I,
 )
 CONFIRM_SPAN_RE = re.compile(
-    r'\[confirm\](.*?)(?=\</think\>|<answer>)',
+    r'\[confirm\](.*?)(?=\</think\>|<answer>|$)',
     re.S | re.I,
 )
 

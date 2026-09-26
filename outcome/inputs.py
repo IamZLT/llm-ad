@@ -434,6 +434,64 @@ def build_zoom_batch(processor, prior, cfg: dict, ref_img: Image.Image,
     return full
 
 
+def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
+                            test_img: Image.Image, crop_img: Image.Image,
+                            continuation_text: str, device, crop_min_pixels: int = None,
+                            prefill_text: str = '') -> dict:
+    """Build the stage-2 observation batch (ref + test + optional crop).
+
+    Merges the old train 3-image and eval H-free paths into one constructor: stage 2
+    is always H-free and continues from ``prefill_text`` (the stage-1
+    ``[understand][compare][localize][imagine]`` prefix). When ``crop_img`` is None
+    (degenerate crop / no candidate), the batch is ref + test only, so the model still
+    commits from the *same* candidate without the local observation — it never re-rolls
+    a fresh single-pass trajectory, which would forfeit evaluating that candidate.
+    """
+    data = cfg.get('data') or {}
+    max_size = int(data.get('max_image_size', 768))
+    factor = qwen_vision_factor(processor, getattr(prior, 'visual', None))
+    cap = max_size * max_size
+    test_rs = _smart_resize_image(test_img, max_size, factor, 256 * 256, cap)
+    ref_rs = ref_img.resize(test_rs.size, Image.Resampling.BICUBIC)
+    images = [ref_rs, test_rs]
+    if crop_img is not None:
+        if crop_min_pixels is None:
+            crop_min_pixels = max(cap // 2, 256 * 256)
+        crop_rs = _smart_resize_image(crop_img, max_size, factor, crop_min_pixels, cap)
+        images.append(crop_rs)
+
+    img_proc = getattr(processor, 'image_processor', None)
+    if img_proc is None:
+        raise RuntimeError('processor.image_processor is required for the observation pass')
+    enc = img_proc(images=images, return_tensors='pt')
+
+    # Merger tokens only (no H hooks): the second pass re-observes the crop.
+    vis = encode_visual_merged(prior, enc['pixel_values'].to(device),
+                               enc['image_grid_thw'].to(device))
+
+    user = dict(role='user', content=[
+        dict(type='image', image=im) for im in images
+    ] + [dict(type='text', text=continuation_text)])
+    enable_thinking = bool((cfg.get('prompt') or {}).get('enable_thinking', False))
+    rendered = apply_chat_template_safe(processor, [user], True, enable_thinking)
+    combined = rendered + (prefill_text or '')
+    full = processor(text=[combined], images=images,
+                     return_tensors='pt', truncation=False)
+    length = int(full['input_ids'].shape[-1])
+    maximum = int(cfg['training']['max_length'])
+    if length > maximum:
+        raise ValueError(f'observation prompt has {length} tokens > {maximum}; refusing silent truncation')
+    full['image_embeds'] = vis
+    full['prompt_len'] = torch.tensor([length])
+    # Stage 2 is H-free: no h_box_geom / h_map / control-feat-box token ids.
+    full['box_token_id'] = -1
+    full['n_box_tokens'] = 0
+    full['control_token_id'] = -1
+    full['feat_token_id'] = -1
+    full['n_feat_tokens'] = 0
+    return full
+
+
 ZOOM_PROMPT_SUFFIX = (
     'Image 3 is a zoomed crop around the candidate box: the red rectangle marks '
     'that candidate box, and the surrounding context reveals whether the box '

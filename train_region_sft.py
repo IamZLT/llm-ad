@@ -50,12 +50,13 @@ from models.lora import apply_lora
 from models.qwen35 import (setup_model_and_processor, freeze_vision_encoder, force_vision_eval,
                            unwrap_model, print_trainable_params)
 from models.vision_cache import bind_cached_image_features
-from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_zoom_train_batch)
+from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_observation_batch,
+                            build_zoom_train_batch)
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.policy import generate_group
+from outcome.policy import _window_1000, _zoom_continuation_text, generate_group
 from outcome.protocol import iou, to_pixels
 from outcome.protocol_multibox import parse_output_cfg, score_output
-from outcome.thinking import thinking_enabled, staged_sft_target
+from outcome.thinking import THINK_CLOSE_PREFIX, thinking_enabled, staged_sft_target
 from outcome.zoom_crop import make_zoom_crop
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
@@ -428,6 +429,109 @@ def _zoom_anomaly_rounds(meta, cls, gt_boxes, sft_cfg):
             (final_ground, keep_imagine, keep_confirm)]
 
 
+def _expand_box(box, scale: float) -> list:
+    """Expand a 0-1000 box about its center (extent-overshoot intermediate state)."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    w, h = (x2 - x1) * scale, (y2 - y1) * scale
+    return [round(max(0.0, cx - w / 2.0), 3), round(max(0.0, cy - h / 2.0), 3),
+            round(min(1000.0, cx + w / 2.0), 3), round(min(1000.0, cy + h / 2.0), 3)]
+
+
+def _zoom_candidate(meta, gt_boxes, sft_cfg):
+    """Pick a perturbed B0 candidate + its pre-obs [imagine] and post-obs [confirm].
+
+    Returns ``(candidate_boxes_1000, imagine_text, confirm_text)`` or ``(None, None,
+    None)`` when no perturbation is selected. The candidate is a perturbation of the
+    *true* defect box (undershoot / overshoot / shift) so the crop observation has a
+    concrete, correctable error; ``[imagine]`` is written *before* the crop and only
+    predicts the likely problem, while ``[confirm]`` (post-crop) cites Image 3.
+    """
+    p_keep = float(sft_cfg.get('zoom_p_keep', 0.2))
+    p_under = float(sft_cfg.get('zoom_p_undershoot', 0.4))
+    p_over = float(sft_cfg.get('zoom_p_overshoot', 0.15))
+    p_shift = float(sft_cfg.get('zoom_p_shift', 0.25))
+    choices = [('keep', p_keep), ('under', p_under), ('over', p_over), ('shift', p_shift)]
+    total = sum(w for _, w in choices)
+    if total <= 0:
+        return None, None, None
+    r = random.random() * total
+    acc = 0.0
+    mode = 'keep'
+    for name, w in choices:
+        acc += w
+        if r < acc:
+            mode = name
+            break
+    if mode == 'keep':
+        return (list(gt_boxes),
+                'keep; this candidate already matches the true defect extent, so no correction should be needed',
+                'unchanged; the Image 3 crop confirms the candidate already matches the true defect, so no correction was needed')
+    if mode == 'under':
+        scale = max(0.1, min(float(sft_cfg.get('zoom_shrink_scale', 0.5)), 0.95))
+        return ([_shrink_box(b, scale) for b in gt_boxes],
+                'refine; this candidate is likely undersized relative to the true defect, so it may need expansion',
+                'improved; the Image 3 crop shows the candidate undershoots the defect, and the corrected box now covers the full extent')
+    if mode == 'over':
+        scale = min(1.5, max(1.05, float(sft_cfg.get('zoom_expand_scale', 1.3))))
+        return ([_expand_box(b, scale) for b in gt_boxes],
+                'refine; this candidate is likely oversized relative to the true defect, so it may need contraction',
+                'improved; the Image 3 crop shows the candidate overshoots the defect, and the corrected box now fits the true boundary')
+    frac = max(0.05, min(float(sft_cfg.get('refine_shift_frac', 0.3)), 0.6))
+    return ([_shift_box(b, frac) for b in gt_boxes],
+            'refine; this candidate is likely offset from the true defect center, so it may need recentering',
+            'improved; the Image 3 crop shows the candidate is offset, and the corrected box now matches the true defect center')
+
+
+def build_zoom_staged_targets(meta, *, sft_cfg=None):
+    """Two-stage zoom SFT targets: (pre_obs_text, post_obs_text, candidate_boxes).
+
+    ``pre_obs_text`` is the stage-1 chain ``[understand][compare][localize][imagine]``
+    (fully supervised). ``post_obs_text`` is ``[confirm]</think><answer>`` (supervised
+    in the post-observation sample, whose stage-1 prefix is replayed with label=-100).
+    ``candidate_boxes`` is the GT-perturbed B0 used to build the crop.
+    """
+    cls = str(meta.get('class_name') or 'object').replace('_', ' ')
+    sft_cfg = sft_cfg or {}
+    is_anom = bool(meta['is_anomaly'])
+    comps = list(meta.get('component_bboxes') or [])
+    if not comps and meta.get('gt_box_px') is not None:
+        comps = [meta['gt_box_px']]
+    gt_boxes = _boxes_to_1000(comps, meta['orig_size']) if is_anom else []
+    understand = (
+        f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
+        'material, structure, texture, print, and lighting as expected appearance. '
+        f'Image 2 shows the same {cls} under inspection and should match that '
+        'baseline aside from a true defect. Weigh the anomaly heatmap as a fallible '
+        'search hint; do not decide anomaly or coordinates yet'
+    )
+    if not is_anom:
+        raise ValueError('build_zoom_staged_targets is only for anomalous zoom samples')
+    n = len(gt_boxes)
+    where = _where_join(gt_boxes)
+    compare = (
+        f'against that Image 1 baseline, {_region_count(n)} of the {cls} '
+        f'{_plural(n, "differs", "differ")} locally in a way material or '
+        'appearance variation on the reference cannot explain, so this is a '
+        'true defect rather than normal variation'
+    )
+    description = (
+        f'A localized defect is present on the {cls} {where}: {_region_count(n)} '
+        f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
+        f'material or appearance variation cannot explain.'
+    )
+    answer = json.dumps({'is_anomaly': True, 'bboxes_2d': gt_boxes, 'description': description})
+    candidate, imagine, confirm = _zoom_candidate(meta, gt_boxes, sft_cfg)
+    if candidate is None:
+        candidate = list(gt_boxes)
+        imagine = 'keep; this candidate already matches the true defect extent'
+        confirm = 'unchanged; the crop confirms the candidate already matches the true defect'
+    localize = _ground_multibox(candidate)
+    pre = f'[understand]\n{understand}\n[compare]\n{compare}\n[localize]\n{localize}\n[imagine]\n{imagine}\n'
+    post = f'[confirm]\n{confirm}\n{THINK_CLOSE_PREFIX}<answer>\n{answer}\n</answer>'
+    return pre, post, candidate
+
+
 def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = False,
                      answer_only: bool = False, sft_cfg: dict = None, zoom: bool = False) -> str:
     """Full thought-chain target; category/boxes come from GT.
@@ -609,50 +713,8 @@ def _stack_gen_in(singles, max_len):
     return out
 
 
-def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False,
-                   answer_only=False, sft_cfg=None):
-    """Collate one-at-a-time (vision cache is per-pair), then pad a language batch.
-
-    A fraction (``outcome.sft.zoom_prob``) of single-box anomalous samples are
-    upgraded to a 3-image (ref + test + zoom crop) batch whose target teaches the
-    model to consult the zoomed, outline-drawn crop to correct an undersized
-    candidate box back to the GT extent. Normal samples keep the 2-image path.
-    """
-    sft_cfg = sft_cfg or {}
-    zoom_prob = float(sft_cfg.get('zoom_prob', 0.0))
-    zcfg = (collator.cfg.get('outcome') or {}).get('zoom') or {}
-    expand = float(zcfg.get('expand', 1.0))
-    min_pad_frac = float(zcfg.get('min_pad_frac', 0.12))
-    max_area_frac = float(zcfg.get('max_area_frac', 0.6))
-    singles, seqs, labels_list, targets = [], [], [], []
-    for sample in samples:
-        batch = move_batch(collator([sample]), device)
-        meta = batch['_meta'][0]
-        use_zoom = False
-        if (zoom_prob > 0 and multibox and thinking and not answer_only
-                and bool(meta.get('is_anomaly')) and random.random() < zoom_prob):
-            comps = list(meta.get('component_bboxes') or [])
-            if not comps and meta.get('gt_box_px') is not None:
-                comps = [meta['gt_box_px']]
-            if len(comps) == 1:
-                gt_1000 = _boxes_to_1000(comps, meta['orig_size'])
-                scale = max(0.1, min(float(sft_cfg.get('zoom_shrink_scale', 0.5)), 0.95))
-                cand_1000 = [_shrink_box(gt_1000[0], scale)]
-                crop = make_zoom_crop(meta['test'], cand_1000[0],
-                                      orig_size=tuple(meta['orig_size']), expand=expand,
-                                      min_pad_frac=min_pad_frac, max_area_frac=max_area_frac)
-                if not crop.degenerate:
-                    batch = build_zoom_train_batch(collator.processor, collator.prior,
-                                                   collator.cfg, device, batch, crop.image)
-                    use_zoom = True
-        prompt_ids = batch['input_ids'][0].tolist()
-        target = build_sft_target(meta, multibox=multibox, thinking=thinking,
-                                  answer_only=answer_only, sft_cfg=sft_cfg, zoom=use_zoom)
-        target_ids = tokenizer(target, add_special_tokens=False).input_ids
-        labels_list.append(build_labels(prompt_ids, target_ids))
-        seqs.append(prompt_ids + target_ids)
-        targets.append(target)
-        singles.append(batch)
+def _pack_group(singles, seqs, labels_list, targets, tokenizer, device):
+    """Pad one H-consistent group of (batch, target) pairs into a packed dict."""
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     max_len = max(len(s) for s in seqs)
     input_ids = torch.full((len(seqs), max_len), int(pad_id), device=device, dtype=torch.long)
@@ -679,6 +741,98 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         seq_lens=[len(s) for s in seqs],
     )
     return packed, int((labels_t != -100).sum())
+
+
+def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=False,
+                   answer_only=False, sft_cfg=None):
+    """Collate one-at-a-time, then return a LIST of H-consistent packed batches.
+
+    Two-stage zoom supervision: a zoom-upgraded anomalous sample produces TWO
+    supervision samples —
+
+    * pre-observation: 2-image (ref + test + H) prompt, target = stage-1
+      ``[understand][compare][localize][imagine]`` (fully supervised);
+    * post-observation: 3-image H-free continuation prompt + stage-1 prefix,
+      target = ``[confirm]</think><answer>`` (the replayed stage-1 prefix and the
+      prompt are label=-100; only the stage-2 chain is supervised).
+
+    Pre-observation samples share the H channels with the regular single-chain
+    samples, so they pack together; the H-free post-observation samples pack in a
+    separate batch so the H-Box / H-VPT injection stays consistent within a batch.
+    """
+    sft_cfg = sft_cfg or {}
+    zoom_prob = float(sft_cfg.get('zoom_prob', 0.0))
+    zcfg = (collator.cfg.get('outcome') or {}).get('zoom') or {}
+    expand = float(zcfg.get('expand', 1.0))
+    min_pad_frac = float(zcfg.get('min_pad_frac', 0.12))
+    max_area_frac = float(zcfg.get('max_area_frac', 0.6))
+    crop_min_pixels = zcfg.get('crop_min_pixels')
+    h_singles, h_seqs, h_labels, h_targets = [], [], [], []
+    post_singles, post_seqs, post_labels, post_targets = [], [], [], []
+    for sample in samples:
+        batch = move_batch(collator([sample]), device)
+        meta = batch['_meta'][0]
+        do_zoom = False
+        if (zoom_prob > 0 and multibox and thinking and not answer_only
+                and bool(meta.get('is_anomaly')) and random.random() < zoom_prob):
+            comps = list(meta.get('component_bboxes') or [])
+            if not comps and meta.get('gt_box_px') is not None:
+                comps = [meta['gt_box_px']]
+            do_zoom = len(comps) == 1
+        if not do_zoom:
+            prompt_ids = batch['input_ids'][0].tolist()
+            target = build_sft_target(meta, multibox=multibox, thinking=thinking,
+                                      answer_only=answer_only, sft_cfg=sft_cfg, zoom=False)
+            target_ids = tokenizer(target, add_special_tokens=False).input_ids
+            h_labels.append(build_labels(prompt_ids, target_ids))
+            h_seqs.append(prompt_ids + target_ids)
+            h_targets.append(target)
+            h_singles.append(batch)
+            continue
+        pre_text, post_text, cand_boxes = build_zoom_staged_targets(meta, sft_cfg=sft_cfg)
+        # Pre-observation sample (H, 2-image).
+        prompt_ids = batch['input_ids'][0].tolist()
+        pre_ids = tokenizer(pre_text, add_special_tokens=False).input_ids
+        h_labels.append(build_labels(prompt_ids, pre_ids))
+        h_seqs.append(prompt_ids + pre_ids)
+        h_targets.append(pre_text)
+        h_singles.append(batch)
+        # Post-observation sample (H-free, 3-image continuation).
+        crop = make_zoom_crop(meta['test'], cand_boxes[0], orig_size=tuple(meta['orig_size']),
+                              expand=expand, min_pad_frac=min_pad_frac,
+                              max_area_frac=max_area_frac)
+        if crop.degenerate:
+            post_crop_img, window = None, None
+        else:
+            post_crop_img, window = crop.image, tuple(crop.window_px)
+        cont = _zoom_continuation_text(collator.cfg, str(meta.get('class_name', 'object')),
+                                       0, _window_1000(window, tuple(meta['orig_size'])),
+                                       has_crop=post_crop_img is not None,
+                                       skip_reason=crop.skip_reason if crop.degenerate else '')
+        zbatch = build_observation_batch(collator.processor, collator.prior, collator.cfg,
+                                         meta['ref'], meta['test'], post_crop_img, cont, device,
+                                         crop_min_pixels=crop_min_pixels, prefill_text=pre_text)
+        # build_observation_batch returns CPU tensors (only image_embeds is on device);
+        # move the whole batch to device like the collator path does, then re-attach the
+        # collator's meta (H-free builder has no _meta) so _pack_group can build metas.
+        zbatch = move_batch(zbatch, device)
+        zbatch['_meta'] = [meta]
+        zprompt_ids = zbatch['input_ids'][0].tolist()
+        post_ids = tokenizer(post_text, add_special_tokens=False).input_ids
+        post_labels.append(build_labels(zprompt_ids, post_ids))
+        post_seqs.append(zprompt_ids + post_ids)
+        post_targets.append(post_text)
+        post_singles.append(zbatch)
+    packed_list, n_sup = [], 0
+    if h_singles:
+        packed, ns = _pack_group(h_singles, h_seqs, h_labels, h_targets, tokenizer, device)
+        packed_list.append(packed)
+        n_sup += ns
+    if post_singles:
+        packed, ns = _pack_group(post_singles, post_seqs, post_labels, post_targets, tokenizer, device)
+        packed_list.append(packed)
+        n_sup += ns
+    return packed_list, n_sup
 
 
 def load_sft_model(cfg, device, init_sft=None):
@@ -801,6 +955,15 @@ def batch_loss(model, packed, backward_scale=None):
         shift_labels = packed['labels'][:, 1:].contiguous()
         loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
                                shift_labels.view(-1), ignore_index=-100)
+        # Keep the always-present H modules in the autograd graph even when this
+        # batch is H-free (the post-observation stage has no h_box_geoms / h_map).
+        # Without a (zero-weight) edge to their parameters, DDP sees different
+        # parameter sets across ranks/stages and deadlocks in the gradient
+        # all-reduce (NCCL spin, GPU pinned at 100%).
+        for _m in (h_box, h_vpt):
+            if _m is not None:
+                for _p in _m.parameters():
+                    loss = loss + (_p.sum() * 0.0).to(loss.dtype)
         if backward_scale is not None:
             (loss * float(backward_scale)).backward()
     return loss
@@ -826,9 +989,10 @@ def evaluate_dev(model, collator, dev_dataset, device, tokenizer, multibox, limi
     total = 0.0
     with torch.no_grad():
         for i in shard:
-            packed, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox,
-                                       thinking, answer_only, sft_cfg)
-            total += float(batch_loss(raw, packed))
+            packed_list, _ = pack_sft_batch(collator, device, [dev_dataset[i]], tokenizer, multibox,
+                                            thinking, answer_only, sft_cfg)
+            for packed in packed_list:
+                total += float(batch_loss(raw, packed))
     count = len(shard)
     if world > 1:
         t = torch.tensor([total, float(count)], device=device, dtype=torch.float64)
@@ -974,8 +1138,14 @@ def main():
 
     model, processor, prior = load_sft_model(cfg, device, init_sft=args.init_sft)
     if world > 1:
+        # Two-stage zoom supervision packs an H-free post-observation batch whose
+        # forward omits h_box_prior / h_vpt, so within one optimizer step those
+        # parameters receive no grad from that sub-batch. DDP's reducer rejects a
+        # forward whose parameter set differs from the prior one unless it is told
+        # to track unused parameters.
+        find_unused = bool(cfg.get('distributed', {}).get('ddp_find_unused_parameters', True))
         model = DDP(model, device_ids=[local_rank] if device.type == 'cuda' else None,
-                    find_unused_parameters=False)
+                    find_unused_parameters=find_unused)
     tokenizer = getattr(processor, 'tokenizer', processor)
     thinking = thinking_enabled(cfg)
     reasoning_mode = str((cfg.get('outcome') or {}).get('reasoning_mode', 'fsm'))
@@ -1034,13 +1204,28 @@ def main():
             for start in range(0, len(indices), batch_size):
                 started = time.perf_counter()
                 samples = [dataset[i] for i in indices[start:start + batch_size]]
-                packed, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox,
-                                               thinking, answer_only, sft_cfg)
-                loss = batch_loss(model, packed, backward_scale=1.0 / accum)
+                packed_list, n_sup = pack_sft_batch(collator, device, samples, tokenizer, multibox,
+                                                    thinking, answer_only, sft_cfg)
+                loss = None
+                all_metas = []
+                all_targets = []
+                all_seq_lens = []
+                for packed in packed_list:
+                    l = batch_loss(model, packed)
+                    loss = l if loss is None else loss + l
+                    all_metas.extend(packed['metas'])
+                    all_targets.extend(packed['targets'])
+                    all_seq_lens.extend(packed['seq_lens'])
                 running_loss += float(loss.detach())
                 running_supervised += n_sup
                 window_samples += len(samples)
                 seen += 1
+                # Single backward per outer batch: the number of packed sub-batches
+                # (h_batch + optional H-free post-observation batch) differs across
+                # ranks depending on whether a zoom-upgraded sample landed in each
+                # rank's shard. One `.backward()` here keeps DDP's reducer in lockstep
+                # and avoids an NCCL deadlock from asymmetric backward counts.
+                (loss / accum).backward()
                 if seen % accum == 0:
                     grad_norm = float(torch.nn.utils.clip_grad_norm_(
                         [p for p in model.parameters() if p.requires_grad],
@@ -1048,8 +1233,8 @@ def main():
                     opt.step()
                     opt.zero_grad(set_to_none=True)
                     step += 1
-                    anomaly_frac = sum(bool(m.get('is_anomaly')) for m in packed['metas']) / max(1, len(packed['metas']))
-                    seq_mean = sum(packed['seq_lens']) / max(1, len(packed['seq_lens']))
+                    anomaly_frac = sum(bool(m.get('is_anomaly')) for m in all_metas) / max(1, len(all_metas))
+                    seq_mean = sum(all_seq_lens) / max(1, len(all_seq_lens))
                     seconds = time.perf_counter() - started
                     writer.add_scalar('train/loss', float(loss.detach()), step)
                     writer.add_scalar('train/supervised_tokens', n_sup, step)
@@ -1071,7 +1256,7 @@ def main():
                         running_supervised = 0
                         window_samples = 0
                     if main_proc and vis_every > 0 and step % vis_every == 0:
-                        log_sft_case(writer, step, packed['metas'][0], packed['targets'][0],
+                        log_sft_case(writer, step, all_metas[0], all_targets[0],
                                      overlay_alpha=overlay_alpha)
                     if main_proc and args.save_steps > 0 and step % int(args.save_steps) == 0:
                         _save_adapter(model, processor, output_dir / f'checkpoint-{step}')
