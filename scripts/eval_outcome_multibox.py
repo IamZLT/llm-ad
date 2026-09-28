@@ -41,6 +41,10 @@ def main():
                         help='RL adapter dir (adapter_final / checkpoint-N); '
                              'omit to evaluate the SFT reference in outcome.sft_adapter')
     parser.add_argument('--limit', type=int, default=None, help='sample count; omit = full split')
+    parser.add_argument('--shard-id', type=int, default=None,
+                        help='0-based shard index for multi-GPU parallel eval (stride-split)')
+    parser.add_argument('--num-shards', type=int, default=1,
+                        help='total shard count; requires --shard-id')
     parser.add_argument('--output', default=None,
                         help='summary .json path (default: ./outputs/eval_<split>.json)')
     args = parser.parse_args()
@@ -54,8 +58,17 @@ def main():
     selected = test_set if args.split == 'test' else dev_set
 
     output = Path(args.output) if args.output else Path('outputs') / f'eval_{args.split}.json'
+
+    indices = None
+    if args.shard_id is not None:
+        if not (0 <= args.shard_id < args.num_shards):
+            raise SystemExit(f'--shard-id {args.shard_id} out of range for --num-shards {args.num_shards}')
+        # Stride-split keeps normal/anomaly and class mix balanced across shards.
+        indices = list(range(len(selected)))[args.shard_id::args.num_shards]
+        output = output.with_name(f'{output.stem}_shard{args.shard_id}of{args.num_shards}{output.suffix}')
+
     stats = evaluate(cfg, model, processor, prior, selected, output, args.limit,
-                     namespace=args.split)
+                     namespace=args.split, indices=indices)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     print(f'Summary: {output}', flush=True)
 

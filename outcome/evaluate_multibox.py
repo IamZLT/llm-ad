@@ -86,6 +86,10 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes,
         candidate_bboxes_2d=parsed['candidate_bboxes_2d'], num_boxes=parsed['num_boxes'],
         discrim_correct=score.get('discrim_correct'), imagine_correct=score.get('imagine_correct'),
         objective_verdict=score.get('objective_verdict'), refine_verdict=score.get('refine_verdict'),
+        candidate_tp=score.get('candidate_tp'), candidate_fp=score.get('candidate_fp'),
+        candidate_fn=score.get('candidate_fn'), final_tp=score.get('final_tp'),
+        final_fp=score.get('final_fp'), final_fn=score.get('final_fn'),
+        final_set_complete=score.get('final_set_complete'), false_keep=score.get('false_keep'),
         num_components=int(meta.get('num_components') or (len(comps) if anomaly else 0)),
         iou_h_top1=iou_h_top1, iou_h_bestk=iou_h_bestk,
         prior_any_top1_iou=prior_any_top1_iou, prior_any_best_iou=prior_any_best_iou,
@@ -107,6 +111,9 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes,
         final_boxes=parsed['bboxes_2d'],
         zoom_executed=bool(trace.zoom_executed) if trace is not None else False,
         zoom_skip_reason=(trace.zoom_skip_reason if trace is not None else None),
+        candidate_parse_state=(trace.candidate_parse_state if trace is not None else None),
+        observation_executed=bool(trace.observation_executed) if trace is not None else False,
+        observations=(trace.observations if trace is not None else []),
         selected_box_index=(trace.selected_box_index if trace is not None else -1),
         crop_window_px=(list(trace.crop_window_px) if trace is not None and trace.crop_window_px else None),
         selected_action=parsed.get('selected_action'),
@@ -255,6 +262,12 @@ def summarize(rows):
     fp_candidates = [r for r in normal if r.get('initial_boxes')]
     out['n_zoom_executed'] = sum(bool(r.get('zoom_executed')) for r in rows)
     out['zoom_executed_rate'] = mean(r.get('zoom_executed') for r in rows)
+    # ``observation_executed`` covers BOTH the candidate zoom and the global scan,
+    # so a scan-only stage 2 is not misread as an observation failure.
+    out['n_observation_executed'] = sum(bool(r.get('observation_executed')) for r in rows)
+    out['observation_executed_rate'] = mean(r.get('observation_executed') for r in rows)
+    out['n_false_keep'] = sum(bool(r.get('false_keep')) for r in rows)
+    out['final_set_complete_rate'] = mean(r.get('final_set_complete') for r in abnormal)
     out['stage1_format_rate'] = mean(r.get('stage1_early_end') is None for r in rows)
     out['refine_success_rate'] = mean(r['refine_verdict'] == 'improved' for r in zoomed_anom)
     out['refine_degrade_rate'] = mean(r['refine_verdict'] == 'degraded' for r in zoomed_anom)

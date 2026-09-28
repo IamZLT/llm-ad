@@ -239,43 +239,6 @@ def _generate_stage1(model, processor, batch, cfg, sample):
     return Completion(ids, text, reason)
 
 
-def _window_1000(window_px, orig_size):
-    if not window_px or not orig_size:
-        return None
-    w, h = float(orig_size[0]), float(orig_size[1])
-    return [round(float(window_px[0]) * 1000.0 / w, 1), round(float(window_px[1]) * 1000.0 / h, 1),
-            round(float(window_px[2]) * 1000.0 / w, 1), round(float(window_px[3]) * 1000.0 / h, 1)]
-
-
-def _zoom_continuation_text(cfg, class_name: str, selected_index: int,
-                            window_1000, has_crop: bool, skip_reason: str = '') -> str:
-    """Stage-2 prompt: verify the candidate box from the crop (or full image if no crop).
-
-    Explicitly tells the model that ``[imagine]`` was a **pre-observation** prediction
-    and that ``[confirm]`` must now use Image 3 (when present) to correct the box.
-    """
-    if has_crop:
-        box_ref = f'candidate box #{selected_index + 1}' if selected_index >= 0 else 'the candidate box'
-        window = f' The crop window spans the full-image region {window_1000} (0-1000).' if window_1000 else ''
-        return (
-            f"Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection "
-            f"image. Image 3 is a zoomed crop around {box_ref}; the red rectangle marks that "
-            f"candidate box.{window} You already wrote your understand / compare / localize "
-            "reasoning and your [imagine] PRE-observation prediction above. Now inspect Image 3 "
-            "and verify the candidate box's extent against the true defect boundary: is it too "
-            "small / too large / shifted, or a false alarm? Write [confirm] with your final "
-            "boxes, then close your thinking with </think> and output <answer>."
-        )
-    reason = f' ({skip_reason})' if skip_reason else ''
-    return (
-        f"Image 1 is a defect-free reference of {class_name}. Image 2 is the inspection image. "
-        "You already wrote your understand / compare / localize reasoning and your [imagine] "
-        f"PRE-observation prediction above. No zoom crop was available{reason}, so verify the "
-        "candidate box from the full image alone. Write [confirm] with your final boxes, then "
-        "close your thinking with </think> and output <answer>."
-    )
-
-
 def _imagine_body(stage1_text: str) -> str:
     """Extract the ``[imagine]`` body from stage-1 text (the pre-observation prediction)."""
     info = parse_think_stages(stage1_text or '')
@@ -292,18 +255,19 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
     """Unified two-stage world-model inspection flow (train & eval share this).
 
     Stage 1 writes ``[understand][compare][localize][imagine]`` (pre-observation
-    prediction). The selected candidate box is then cropped (padded window + drawn
-    outline) and re-encoded; stage 2 continues from ``[confirm]`` conditioned on
-    ref + test + crop (or ref + test when the crop degenerates). ``B0`` and ``B1``
-    are kept separate in the returned ``InspectionTrace``.
+    prediction). ``plan_observations`` then decides what to re-encode for stage 2:
+    a candidate-centric crop for a single candidate, or two overlapping full-image
+    partitions (``global_scan``) for empty/multi/oversized candidates; stage 2
+    continues from ``[confirm]`` conditioned on ref + test + those observation
+    windows. ``B0`` and ``B1`` are kept separate in the returned ``InspectionTrace``.
 
     Returns ``(completion, trace)``. ``completion.text`` is the concatenated think
     chain for the parser. ``trace.final_boxes`` / ``selected_action`` /
     ``predicted_effect`` are left for the caller to fill from ``parse_output``.
 
-    For ``group > 1`` the per-trajectory crop breaks batched sampling; callers
-    should use the single-pass ``generate_group`` (the training loop) until the
-    two-stage GRPO optimizer lands (phase 3).
+    For ``group > 1`` the per-trajectory observation breaks batched sampling;
+    callers should use the single-pass ``generate_group`` (the training loop) until
+    the two-stage GRPO optimizer lands (phase 3).
     """
     zcfg = (cfg.get('outcome') or {}).get('zoom') or {}
     stage1 = _generate_stage1(model, processor, batch, cfg, sample)
@@ -335,8 +299,8 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
         return completion, trace
 
     from outcome.protocol_multibox import parse_boxes_list
-    from outcome.zoom_crop import make_zoom_crop
     from outcome.inputs import build_observation_batch
+    from outcome.observation import plan_observations, observation_prompt
 
     if test_img is None or orig_size is None:
         # Should not happen (the collator always sets test/orig_size), but a missing
@@ -349,41 +313,59 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
     # text): parse_boxes_list's box-list regex is greedy and DOTALL, so feeding it
     # the full chain would over-match the trailing [imagine] header and return
     # 'invalid'. Extracting the body mirrors how parse_output reads ground_text.
-    localize_body = (_think_stage_body(stage1.text, 'localize'))
+    localize_body = _think_stage_body(stage1.text, 'localize')
     state, boxes = parse_boxes_list(localize_body)
-    selected_index = 0 if (state == 'list' and boxes) else -1
-    trace.initial_boxes = [list(b) for b in boxes] if state == 'list' else []
-    trace.selected_box_index = selected_index
+    boxes = boxes if state == 'list' else []
 
-    crop_img = None
-    window_px = None
-    if selected_index >= 0:
-        zoom = make_zoom_crop(
-            test_img, boxes[selected_index],
-            orig_size=orig_size,
-            expand=float(zcfg.get('expand', 1.0)),
-            min_pad_frac=float(zcfg.get('min_pad_frac', 0.12)),
-            max_area_frac=float(zcfg.get('max_area_frac', 0.6)),
-        )
-        if zoom.degenerate:
-            trace.zoom_skip_reason = zoom.skip_reason
-        else:
-            crop_img = zoom.image
-            window_px = zoom.window_px
-            trace.crop_window_px = tuple(window_px)
-            trace.zoom_executed = True
-    else:
-        from outcome.inspection_trace import SKIP_NO_CANDIDATE
-        trace.zoom_skip_reason = SKIP_NO_CANDIDATE
+    trace.initial_boxes = [list(b) for b in boxes]
+    trace.candidate_parse_state = state
+
+    observations = plan_observations(test_img, boxes, orig_size, cfg)
+
+    trace.observations = [
+        {
+            'kind': obs.kind,
+            'window_px': list(obs.window_px),
+            'candidate_index': obs.candidate_index,
+        }
+        for obs in observations
+    ]
+    trace.observation_executed = bool(observations)
+
+    # Back-compat fields: ``zoom_*`` specifically mean the candidate-centric crop.
+    candidate_obs = next(
+        (obs for obs in observations if obs.kind == 'candidate'),
+        None,
+    )
+
+    trace.zoom_executed = candidate_obs is not None
+    trace.selected_box_index = (
+        candidate_obs.candidate_index
+        if candidate_obs is not None else -1
+    )
+    trace.crop_window_px = (
+        candidate_obs.window_px
+        if candidate_obs is not None else None
+    )
+    trace.zoom_skip_reason = (
+        None if candidate_obs is not None else 'scan_instead'
+    )
+
+    cont = observation_prompt(class_name, observations, orig_size)
 
     device = batch['input_ids'].device
-    cont = _zoom_continuation_text(cfg, class_name, selected_index,
-                                   _window_1000(window_px, orig_size),
-                                   has_crop=crop_img is not None,
-                                   skip_reason=trace.zoom_skip_reason or '')
-    zbatch = build_observation_batch(processor, prior, cfg, ref_img, test_img, crop_img,
-                                     cont, device, crop_min_pixels=zcfg.get('crop_min_pixels'),
-                                     prefill_text=stage1.text)
+    zbatch = build_observation_batch(
+        processor,
+        prior,
+        cfg,
+        ref_img,
+        test_img,
+        [obs.image for obs in observations],
+        cont,
+        device,
+        crop_min_pixels=zcfg.get('crop_min_pixels'),
+        prefill_text=stage1.text,
+    )
     zbatch = move_batch(zbatch, device)
     stage2 = generate_group(model, processor, zbatch, cfg, group=1, sample=sample)[0]
     trace.segments.append(RolloutSegment(

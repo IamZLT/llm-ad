@@ -53,11 +53,12 @@ from models.vision_cache import bind_cached_image_features
 from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_observation_batch,
                             build_zoom_train_batch)
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.policy import _window_1000, _zoom_continuation_text, generate_group
-from outcome.protocol import iou, to_pixels
-from outcome.protocol_multibox import parse_output_cfg, score_output
+from outcome.observation import observation_prompt, plan_observations
+from outcome.policy import generate_group
+from outcome.protocol import iou, to_pixels, valid_box
+from outcome.protocol_multibox import (objective_verdict, parse_output_cfg, refine_verdict,
+                                       score_output, set_localization_reward)
 from outcome.thinking import THINK_CLOSE_PREFIX, thinking_enabled, staged_sft_target
-from outcome.zoom_crop import make_zoom_crop
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
 from utils.config import load_yaml_config
@@ -483,21 +484,89 @@ def _zoom_candidate(meta, gt_boxes, sft_cfg):
             'improved; the Image 3 crop shows the candidate is offset, and the corrected box now matches the true defect center')
 
 
-def build_zoom_staged_targets(meta, *, sft_cfg=None):
-    """Two-stage zoom SFT targets: (pre_obs_text, post_obs_text, candidate_boxes).
+def sample_correction_candidates(meta, gt_boxes, sft_cfg):
+    """Synthetic first-stage candidate set for the stage-2 correction prefix.
 
-    ``pre_obs_text`` is the stage-1 chain ``[understand][compare][localize][imagine]``
-    (fully supervised). ``post_obs_text`` is ``[confirm]</think><answer>`` (supervised
-    in the post-observation sample, whose stage-1 prefix is replayed with label=-100).
-    ``candidate_boxes`` is the GT-perturbed B0 used to build the crop.
+    These candidates are ONLY the conditional stage-2 input prefix (label=-100);
+    they are never supervised as a stage-1 target, otherwise the model would be
+    taught to emit intentionally incomplete candidate sets.
+
+    Normal samples reuse the prior's suspicious regions (up to 2) as the false
+    alarms to reject; anomalous samples return an empty set, a subset of the GT
+    components, or a perturbed version, per ``correction_p_empty`` /
+    ``correction_p_drop``.
+    """
+    if not meta['is_anomaly']:
+        candidates = []
+        for item in meta.get('prior_candidates') or []:
+            box = item.get('bbox_2d')
+            if box is not None and valid_box(box):
+                candidates.append(list(box))
+        return candidates[:2]
+
+    p_empty = float(sft_cfg.get('correction_p_empty', 0.15))
+    p_drop = float(sft_cfg.get('correction_p_drop', 0.35))
+    u = random.random()
+
+    if u < p_empty:
+        return []
+
+    if len(gt_boxes) > 1 and u < p_empty + p_drop:
+        n_keep = random.randint(1, len(gt_boxes) - 1)
+        indices = sorted(random.sample(range(len(gt_boxes)), n_keep))
+        return [list(gt_boxes[i]) for i in indices]
+
+    boxes, _, _ = _zoom_candidate(meta, gt_boxes, sft_cfg)
+    boxes = list(gt_boxes) if boxes is None else boxes
+
+    # Drop out-of-range perturbations so invalid boxes don't become routine
+    # correction trajectories.
+    return [
+        list(box) for box in boxes
+        if valid_box(box)
+    ]
+
+
+def _verdict_imagine(verdict, cls):
+    """Objective-verdict -> [imagine] rehearsal text (candidate quality)."""
+    if verdict == 'keep':
+        return 'keep; this candidate set matches the observed defect and is absent from the reference'
+    if verdict == 'refine':
+        return 'refine; this candidate set marks a defect but its extent or coverage needs correction'
+    if verdict == 'reject':
+        return 'reject; this candidate is not supported by a real defect and must be discarded'
+    if verdict == 'discover':
+        return 'discover; no candidate was proposed but a defect may still be present, so keep searching'
+    return f'none; this candidate region shows no true defect on the {cls}'
+
+
+def _effect_confirm(effect):
+    """Refine-effect -> [confirm] text (did the correction help)."""
+    if effect == 'improved':
+        return 'improved; correcting the candidate set recovers the complete defect set'
+    if effect == 'degraded':
+        return 'degraded; the correction worsened the set relative to the original candidate'
+    return 'unchanged; the candidate set already matched, so no correction was needed'
+
+
+def build_correction_staged_targets(meta, collator, sft_cfg):
+    """Two-stage correction targets driven by real set-level scoring.
+
+    Returns ``(pre_text, post_text, cand_boxes)``. ``pre_text`` is the stage-1
+    chain carrying an *artificial wrong* candidate set (used only as the stage-2
+    condition, label=-100). ``post_text`` is ``[confirm]</think><answer>`` whose
+    ``[confirm]`` comes from the true set-localization effect (not hardcoded
+    'improved') and whose answer is the GT box set (or empty for normal samples).
     """
     cls = str(meta.get('class_name') or 'object').replace('_', ' ')
-    sft_cfg = sft_cfg or {}
     is_anom = bool(meta['is_anomaly'])
     comps = list(meta.get('component_bboxes') or [])
     if not comps and meta.get('gt_box_px') is not None:
         comps = [meta['gt_box_px']]
     gt_boxes = _boxes_to_1000(comps, meta['orig_size']) if is_anom else []
+
+    cand_boxes = sample_correction_candidates(meta, gt_boxes, sft_cfg)
+
     understand = (
         f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
         'material, structure, texture, print, and lighting as expected appearance. '
@@ -505,31 +574,53 @@ def build_zoom_staged_targets(meta, *, sft_cfg=None):
         'baseline aside from a true defect. Weigh the anomaly heatmap as a fallible '
         'search hint; do not decide anomaly or coordinates yet'
     )
-    if not is_anom:
-        raise ValueError('build_zoom_staged_targets is only for anomalous zoom samples')
-    n = len(gt_boxes)
-    where = _where_join(gt_boxes)
+    # Deliberately non-leaking: never state how many regions the GT has.
     compare = (
-        f'against that Image 1 baseline, {_region_count(n)} of the {cls} '
-        f'{_plural(n, "differs", "differ")} locally in a way material or '
-        'appearance variation on the reference cannot explain, so this is a '
-        'true defect rather than normal variation'
+        'Compare the inspection image against the normal reference. '
+        'The current candidate set is provisional; both its validity '
+        'and its coverage require verification.'
     )
-    description = (
-        f'A localized defect is present on the {cls} {where}: {_region_count(n)} '
-        f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
-        f'material or appearance variation cannot explain.'
+    localize = _ground_multibox(cand_boxes)
+
+    loc_cfg = {
+        **((collator.cfg.get('outcome') or {}).get('localization') or {}),
+        **((collator.cfg.get('outcome') or {}).get('reward') or {}),
+    }
+    loc_args = {
+        'iou_threshold': float(loc_cfg.get('iou_threshold', 0.30)),
+        'geometry_weight': float(loc_cfg.get('geometry_weight', 0.30)),
+    }
+    q0 = set_localization_reward(cand_boxes, comps, meta['orig_size'], **loc_args)['reward']
+    q1 = set_localization_reward(gt_boxes, comps, meta['orig_size'], **loc_args)['reward']
+    effect = refine_verdict(q1 - q0, float(loc_cfg.get('refine_eps', 0.05)))
+    cand_px = [to_pixels(b, meta['orig_size']) for b in cand_boxes]
+    verdict = objective_verdict(
+        cand_px, comps,
+        float(loc_cfg.get('cand_iou_threshold', 0.10)),
+        float(loc_cfg.get('keep_iou_threshold', 0.50)),
     )
-    answer = json.dumps({'is_anomaly': True, 'bboxes_2d': gt_boxes, 'description': description})
-    candidate, imagine, confirm = _zoom_candidate(meta, gt_boxes, sft_cfg)
-    if candidate is None:
-        candidate = list(gt_boxes)
-        imagine = 'keep; this candidate already matches the true defect extent'
-        confirm = 'unchanged; the crop confirms the candidate already matches the true defect'
-    localize = _ground_multibox(candidate)
+
+    imagine = _verdict_imagine(verdict, cls)
+    confirm = _effect_confirm(effect)
+
+    if is_anom:
+        n = len(gt_boxes)
+        description = (
+            f'A localized defect is present on the {cls}: {_region_count(n)} '
+            f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
+            f'material or appearance variation cannot explain.'
+        )
+        answer = json.dumps({'is_anomaly': True, 'bboxes_2d': gt_boxes, 'description': description})
+    else:
+        answer = json.dumps({
+            'is_anomaly': False,
+            'bboxes_2d': [],
+            'description': 'No defect is identified after reviewing the image.',
+        })
+
     pre = f'[understand]\n{understand}\n[compare]\n{compare}\n[localize]\n{localize}\n[imagine]\n{imagine}\n'
     post = f'[confirm]\n{confirm}\n{THINK_CLOSE_PREFIX}<answer>\n{answer}\n</answer>'
-    return pre, post, candidate
+    return pre, post, cand_boxes
 
 
 def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = False,
@@ -747,71 +838,69 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
                    answer_only=False, sft_cfg=None):
     """Collate one-at-a-time, then return a LIST of H-consistent packed batches.
 
-    Two-stage zoom supervision: a zoom-upgraded anomalous sample produces TWO
-    supervision samples —
+    Every sample always keeps its normal single-pass SFT target (fully supervised).
+    With probability ``zoom_prob`` a sample *additionally* produces one correction
+    continuation sample:
 
-    * pre-observation: 2-image (ref + test + H) prompt, target = stage-1
-      ``[understand][compare][localize][imagine]`` (fully supervised);
-    * post-observation: 3-image H-free continuation prompt + stage-1 prefix,
-      target = ``[confirm]</think><answer>`` (the replayed stage-1 prefix and the
-      prompt are label=-100; only the stage-2 chain is supervised).
+    * normal target: 2-image (ref + test + H) prompt, target = full single-pass
+      ``[understand]...[confirm]</think><answer>`` (fully supervised);
+    * correction continuation: H-free multi-observation prompt + an *artificial
+      wrong* stage-1 prefix (empty / dropped / perturbed candidates), target =
+      ``[confirm]</think><answer>`` only. The replayed wrong prefix and the prompt
+      are label=-100; only the stage-2 chain is supervised, so the model is never
+      taught to emit incomplete candidates as a first-stage answer.
 
-    Pre-observation samples share the H channels with the regular single-chain
-    samples, so they pack together; the H-free post-observation samples pack in a
-    separate batch so the H-Box / H-VPT injection stays consistent within a batch.
+    Normal targets share the H channels and pack together; the H-free correction
+    continuation samples pack in a separate batch so the H-Box / H-VPT injection
+    stays consistent within a batch.
     """
     sft_cfg = sft_cfg or {}
     zoom_prob = float(sft_cfg.get('zoom_prob', 0.0))
     zcfg = (collator.cfg.get('outcome') or {}).get('zoom') or {}
-    expand = float(zcfg.get('expand', 1.0))
-    min_pad_frac = float(zcfg.get('min_pad_frac', 0.12))
-    max_area_frac = float(zcfg.get('max_area_frac', 0.6))
     crop_min_pixels = zcfg.get('crop_min_pixels')
     h_singles, h_seqs, h_labels, h_targets = [], [], [], []
     post_singles, post_seqs, post_labels, post_targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         meta = batch['_meta'][0]
-        do_zoom = False
-        if (zoom_prob > 0 and multibox and thinking and not answer_only
-                and bool(meta.get('is_anomaly')) and random.random() < zoom_prob):
-            comps = list(meta.get('component_bboxes') or [])
-            if not comps and meta.get('gt_box_px') is not None:
-                comps = [meta['gt_box_px']]
-            do_zoom = len(comps) == 1
-        if not do_zoom:
-            prompt_ids = batch['input_ids'][0].tolist()
-            target = build_sft_target(meta, multibox=multibox, thinking=thinking,
-                                      answer_only=answer_only, sft_cfg=sft_cfg, zoom=False)
-            target_ids = tokenizer(target, add_special_tokens=False).input_ids
-            h_labels.append(build_labels(prompt_ids, target_ids))
-            h_seqs.append(prompt_ids + target_ids)
-            h_targets.append(target)
-            h_singles.append(batch)
-            continue
-        pre_text, post_text, cand_boxes = build_zoom_staged_targets(meta, sft_cfg=sft_cfg)
-        # Pre-observation sample (H, 2-image).
+
+        # Every sample always keeps its normal (single-pass) SFT target.
         prompt_ids = batch['input_ids'][0].tolist()
-        pre_ids = tokenizer(pre_text, add_special_tokens=False).input_ids
-        h_labels.append(build_labels(prompt_ids, pre_ids))
-        h_seqs.append(prompt_ids + pre_ids)
-        h_targets.append(pre_text)
+        target = build_sft_target(meta, multibox=multibox, thinking=thinking,
+                                  answer_only=answer_only, sft_cfg=sft_cfg, zoom=False)
+        target_ids = tokenizer(target, add_special_tokens=False).input_ids
+        h_labels.append(build_labels(prompt_ids, target_ids))
+        h_seqs.append(prompt_ids + target_ids)
+        h_targets.append(target)
         h_singles.append(batch)
-        # Post-observation sample (H-free, 3-image continuation).
-        crop = make_zoom_crop(meta['test'], cand_boxes[0], orig_size=tuple(meta['orig_size']),
-                              expand=expand, min_pad_frac=min_pad_frac,
-                              max_area_frac=max_area_frac)
-        if crop.degenerate:
-            post_crop_img, window = None, None
-        else:
-            post_crop_img, window = crop.image, tuple(crop.window_px)
-        cont = _zoom_continuation_text(collator.cfg, str(meta.get('class_name', 'object')),
-                                       0, _window_1000(window, tuple(meta['orig_size'])),
-                                       has_crop=post_crop_img is not None,
-                                       skip_reason=crop.skip_reason if crop.degenerate else '')
-        zbatch = build_observation_batch(collator.processor, collator.prior, collator.cfg,
-                                         meta['ref'], meta['test'], post_crop_img, cont, device,
-                                         crop_min_pixels=crop_min_pixels, prefill_text=pre_text)
+
+        # Optional stage-2 correction continuation (H-free, multi-observation).
+        do_correction = (
+            zoom_prob > 0
+            and multibox
+            and thinking
+            and not answer_only
+            and random.random() < zoom_prob
+        )
+        if not do_correction:
+            continue
+
+        pre_text, post_text, cand_boxes = build_correction_staged_targets(meta, collator, sft_cfg)
+
+        observations = plan_observations(
+            meta['test'], cand_boxes, tuple(meta['orig_size']), collator.cfg
+        )
+        cont = observation_prompt(
+            str(meta.get('class_name', 'object')), observations, tuple(meta['orig_size'])
+        )
+        zbatch = build_observation_batch(
+            collator.processor, collator.prior, collator.cfg,
+            meta['ref'], meta['test'],
+            [obs.image for obs in observations],
+            cont, device,
+            crop_min_pixels=crop_min_pixels,
+            prefill_text=pre_text,
+        )
         # build_observation_batch returns CPU tensors (only image_embeds is on device);
         # move the whole batch to device like the collator path does, then re-attach the
         # collator's meta (H-free builder has no _meta) so _pack_group can build metas.

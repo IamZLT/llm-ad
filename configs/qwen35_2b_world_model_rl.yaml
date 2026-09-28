@@ -220,9 +220,10 @@ outcome:
   # rollout falls back to single-pass.
   zoom:
     enabled: true
-    expand: 1.0            # per-side pad = expand * box size
-    min_pad_frac: 0.12     # window floor = min_pad_frac * image longer side
+    expand: 0.3            # per-side pad = expand * box size
+    min_pad_frac: 0.04     # window floor = min_pad_frac * image longer side
     max_area_frac: 0.6     # degrade to global view when the window covers this fraction
+    coverage_scan: false   # also scan the whole image for single candidates (ablation)
     crop_min_pixels: null  # crop upscale budget floor (null -> max_image_size^2 // 2)
     # Scheme-B RL zoom: this fraction of single-box anomalous training samples is
     # upgraded to a 3-image batch whose crop is built from a fixed shrink-GT

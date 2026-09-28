@@ -94,6 +94,10 @@ class InspectionTrace:
     zoom_executed: bool = False
     zoom_skip_reason: Optional[str] = None                            # one of SKIP_* / None
 
+    candidate_parse_state: Optional[str] = None                       # parse_boxes_list state
+    observation_executed: bool = False                                # any stage-2 observation ran
+    observations: List[dict] = field(default_factory=list)            # [{kind,window_px,candidate_index}]
+
     action_candidates: List[str] = field(default_factory=list)        # proposed actions (phase 2)
     selected_action: Optional[str] = None                             # keep/expand/.../reject
     predicted_effect: Optional[str] = None                            # improved/unchanged/degraded
@@ -111,6 +115,9 @@ class InspectionTrace:
             crop_window_px=list(self.crop_window_px) if self.crop_window_px else None,
             zoom_executed=self.zoom_executed,
             zoom_skip_reason=self.zoom_skip_reason,
+            candidate_parse_state=self.candidate_parse_state,
+            observation_executed=self.observation_executed,
+            observations=self.observations,
             selected_action=self.selected_action,
             predicted_effect=self.predicted_effect,
             final_boxes=self.final_boxes,

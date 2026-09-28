@@ -165,6 +165,12 @@ outcome:
     # remaining anomaly samples keep the 2-image path.
     zoom_prob: 0.3
     zoom_shrink_scale: 0.5   # candidate box is shrunk to this scale to simulate undershoot
+    # Correction-continuation SFT (stage-2 prefix perturbation, NOT supervised as a
+    # stage-1 target). correction_p_empty returns an empty candidate set (teaches
+    # "discover"); correction_p_drop drops some GT components (teaches recovering
+    # missing boxes). Start values, not yet validated optima.
+    correction_p_empty: 0.15
+    correction_p_drop: 0.35
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -203,11 +209,13 @@ outcome:
     num_heads: 8
     init_gate: 0.001
   final_test: false
-  # Zoom-crop geometry used by the SFT zoom trajectories (train_region_sft.py).
+  # Zoom-crop geometry used by the SFT observation planning (train_region_sft.py).
   zoom:
-    expand: 1.0            # per-side pad = expand * box size
-    min_pad_frac: 0.12     # window floor = min_pad_frac * image longer side
+    enabled: true
+    expand: 0.3            # per-side pad = expand * box size
+    min_pad_frac: 0.04     # window floor = min_pad_frac * image longer side
     max_area_frac: 0.6     # degrade to global view when the window covers this fraction
+    coverage_scan: false   # also scan the whole image for single candidates (ablation)
     crop_min_pixels: null  # crop upscale budget floor (null -> max_image_size^2 // 2)
   prior:
     relative_threshold: 0.7

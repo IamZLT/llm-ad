@@ -438,14 +438,16 @@ def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
                             test_img: Image.Image, crop_img: Image.Image,
                             continuation_text: str, device, crop_min_pixels: int = None,
                             prefill_text: str = '') -> dict:
-    """Build the stage-2 observation batch (ref + test + optional crop).
+    """Build the stage-2 observation batch (ref + test + observation images).
 
     Merges the old train 3-image and eval H-free paths into one constructor: stage 2
     is always H-free and continues from ``prefill_text`` (the stage-1
-    ``[understand][compare][localize][imagine]`` prefix). When ``crop_img`` is None
-    (degenerate crop / no candidate), the batch is ref + test only, so the model still
-    commits from the *same* candidate without the local observation — it never re-rolls
-    a fresh single-pass trajectory, which would forfeit evaluating that candidate.
+    ``[understand][compare][localize][imagine]`` prefix). ``crop_img`` may be a
+    single PIL image (one local crop) or a list/tuple of images (e.g. the two
+    ``global_scan`` partitions); when it is None/empty (degenerate crop / no
+    candidate), the batch is ref + test only, so the model still commits from the
+    *same* candidate without the local observation — it never re-rolls a fresh
+    single-pass trajectory, which would forfeit evaluating that candidate.
     """
     data = cfg.get('data') or {}
     max_size = int(data.get('max_image_size', 768))
@@ -454,10 +456,20 @@ def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
     test_rs = _smart_resize_image(test_img, max_size, factor, 256 * 256, cap)
     ref_rs = ref_img.resize(test_rs.size, Image.Resampling.BICUBIC)
     images = [ref_rs, test_rs]
-    if crop_img is not None:
-        if crop_min_pixels is None:
-            crop_min_pixels = max(cap // 2, 256 * 256)
-        crop_rs = _smart_resize_image(crop_img, max_size, factor, crop_min_pixels, cap)
+    if crop_img is None:
+        crops = []
+    elif isinstance(crop_img, (list, tuple)):
+        crops = list(crop_img)
+    else:
+        crops = [crop_img]
+    if crop_min_pixels is None:
+        # Spread the default minimum-pixel budget across multiple crops.
+        crop_min_pixels = max(
+            cap // max(2, len(crops)),
+            128 * 128,
+        )
+    for crop in crops:
+        crop_rs = _smart_resize_image(crop, max_size, factor, crop_min_pixels, cap)
         images.append(crop_rs)
 
     img_proc = getattr(processor, 'image_processor', None)

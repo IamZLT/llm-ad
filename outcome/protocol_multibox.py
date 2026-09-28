@@ -351,45 +351,99 @@ def candidate_hits_comp(cand, comp, iou_threshold: float = 0.10) -> bool:
     return float(comp[0]) <= cx <= float(comp[2]) and float(comp[1]) <= cy <= float(comp[3])
 
 
+def match_boxes_at_iou(pred_boxes, gt_boxes, threshold=0.5):
+    """One-to-one matching: maximize threshold-satisfying matches, then IoU.
+
+    ``pred_boxes`` and ``gt_boxes`` must use the same coordinate system. A valid
+    match (IoU >= ``threshold``) is worth more than all secondary IoU terms summed,
+    so the Hungarian assignment first maximizes the number of matches and only then
+    breaks ties by raw IoU.
+    """
+    if not pred_boxes or not gt_boxes:
+        return []
+
+    ious = [
+        [iou(p, g) for g in gt_boxes]
+        for p in pred_boxes
+    ]
+
+    bonus = min(len(pred_boxes), len(gt_boxes)) + 1.0
+    scores = [
+        [
+            bonus * float(v >= threshold) + v
+            for v in row
+        ]
+        for row in ious
+    ]
+
+    pairs = hungarian_matching(scores)
+    return [
+        (i, j, float(ious[i][j]))
+        for i, j in pairs
+        if ious[i][j] >= threshold
+    ]
+
+
+def diagnose_box_set(pred_boxes, gt_boxes, threshold=0.5):
+    """Set-level tp/fp/fn from one-to-one IoU matching.
+
+    ``fn`` counts GT components unmatched at the given IoU threshold, so it bundles
+    both "region entirely missed" and "region found but poorly localized" — it must
+    not be read as "no box was emitted anywhere near this region".
+    """
+    matches = match_boxes_at_iou(
+        pred_boxes, gt_boxes, threshold=threshold
+    )
+    tp = len(matches)
+    fp = len(pred_boxes) - tp
+    fn = len(gt_boxes) - tp
+
+    return {
+        "matches": matches,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "complete": fn == 0 and fp == 0,
+    }
+
+
 def objective_verdict(cand_px, comps, iou_threshold: float = 0.10, keep_iou: float = 0.50) -> str:
-    """Three-way objective verdict for a candidate box set against GT.
+    """Objective verdict for a candidate box *set* against GT components.
 
     This is the ground-truth label the world-model's ``[imagine]`` / ``[confirm]``
     verdict is *calibrated* against — the model is rewarded for predicting this
     outcome, not for echoing its own answer:
 
-    * ``'reject'`` — no candidate marks any GT component (false alarm), or there are
-      no GT components but candidates were still emitted.
-    * ``'refine'`` — a candidate marks a GT component but the matched IoU is low,
-      i.e. the box undershoots / is offset from the true extent.
-    * ``'keep'``   — a candidate marks a GT component with high matched IoU.
-    * ``'none'``   — no GT components and no candidate (true normal).
+    * ``'keep'``    — the candidate set exactly covers every GT component (complete).
+    * ``'refine'``  — some GT component is only loosely supported (correctable), or
+      the set is a superset/duplicate (fp>0).
+    * ``'reject'``  — no candidate has support from any GT component, yet candidates
+      were emitted (false alarm / unrelated region).
+    * ``'discover'`` — no candidate at all, but GT components exist (must search).
+    * ``'none'``    — no GT components and no candidate (true normal).
 
-    ``keep_iou`` splits keep (box essentially right) from refine (box too small /
-    shifted), which is what lets verdict-only rehearsal still push extent accuracy:
-    an honestly-predicted ``refine`` on an undersized box is rewarded, so the model
-    learns to recognize and then fix its own undershoot instead of always "keep".
+    A candidate that marks a GT component with low IoU is still ``'refine'`` (it has
+    support and is fixable); only a completely unsupported candidate set becomes
+    ``'reject'``. The ``keep`` decision is set-level, so a set that misses any GT
+    component can never be ``'keep'`` no matter how precisely the found boxes fit.
     """
     if not comps:
         return 'none' if not cand_px else 'reject'
+
     if not cand_px:
-        return 'reject'
-    matched_ious = []
-    for g in comps:
-        best = 0.0
-        for c in cand_px:
-            iv = iou(c, g)
-            cx = 0.5 * (float(c[0]) + float(c[2]))
-            cy = 0.5 * (float(c[1]) + float(c[3]))
-            if float(g[0]) <= cx <= float(g[2]) and float(g[1]) <= cy <= float(g[3]):
-                iv = max(iv, iou_threshold)
-            best = max(best, iv)
-        matched_ious.append(best)
-    matched = [iv for iv in matched_ious if iv >= iou_threshold]
-    if not matched:
-        return 'reject'
-    mean_iou = sum(matched) / len(matched)
-    return 'keep' if mean_iou >= keep_iou else 'refine'
+        return 'discover'
+
+    diag = diagnose_box_set(cand_px, comps, keep_iou)
+    if diag['complete']:
+        return 'keep'
+
+    has_support = any(
+        candidate_hits_comp(c, g, iou_threshold)
+        for c in cand_px
+        for g in comps
+    )
+
+    return 'refine' if has_support else 'reject'
 
 
 def refine_verdict(delta_refine: float, eps: float = 0.05) -> str:
@@ -552,10 +606,9 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
     # the refine-loop verdict (sign of ``delta_refine``), NOT the box-quality label.
     verify_action = parsed.get('verify_action')
     imagine_action = parsed.get('imagine_action')
-    if meta['is_anomaly']:
-        obj_verdict = objective_verdict(cand_px, comps, cand_iou_threshold, keep_iou_threshold)
-    else:
-        obj_verdict = 'none'
+    obj_verdict = objective_verdict(cand_px, comps, cand_iou_threshold, keep_iou_threshold)
+    candidate_diag = diagnose_box_set(cand_px, comps, keep_iou_threshold)
+    final_diag = diagnose_box_set(pred_px, comps, keep_iou_threshold)
     imagine_correct = 1.0 if imagine_action == obj_verdict else 0.0
     refine_obj = refine_verdict(delta_refine, refine_eps)
     discrim_correct = 1.0 if verify_action == refine_obj else 0.0
@@ -593,4 +646,9 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 pre_observation_prediction=parsed.get('pre_observation_prediction', ''),
                 predicted_effect=parsed.get('predicted_effect'),
                 objective_verdict=obj_verdict, refine_verdict=refine_obj,
-                correct=bool(correct), matched_pairs=setd['matched_pairs'], s_sum=setd['s_sum'])
+                correct=bool(correct), matched_pairs=setd['matched_pairs'], s_sum=setd['s_sum'],
+                candidate_tp=candidate_diag['tp'], candidate_fp=candidate_diag['fp'],
+                candidate_fn=candidate_diag['fn'], final_tp=final_diag['tp'],
+                final_fp=final_diag['fp'], final_fn=final_diag['fn'],
+                final_set_complete=bool(parsed['task_valid'] and final_diag['complete']),
+                false_keep=bool(imagine_action == 'keep' and not candidate_diag['complete']))
