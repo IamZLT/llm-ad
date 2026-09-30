@@ -263,6 +263,91 @@ def unsupervised_think_labels(tokenizer, target_text: str) -> list:
     return labels
 
 
+def selective_sft_encoding(tokenizer, text):
+    """Supervise structure, boxes and action words; mask natural-language prose.
+
+    Unlike ``unsupervised_think_labels`` (which masks everything before ``<answer>``),
+    this keeps exactly the tokens whose quality is measured by the detector: the stage
+    headers, the ``[localize]`` candidate boxes, the ``[imagine]``/``[confirm]`` action
+    words, and the JSON fields (classification + final boxes) — while masking the free
+    prose bodies (``[understand]``/``[compare]``, the ``;``-suffixed location phrases,
+    and the ``description`` value). This stops the model from being cross-entropy-penalized
+    for not reproducing a fixed ``A localized defect ...`` explanation.
+    """
+    enc = tokenizer(
+        text,
+        add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    ids, offsets = _encoding_fields(enc)
+
+    if offsets is None:
+        raise ValueError("A fast tokenizer with offsets is required")
+
+    masked_spans = []
+    headers = list(STAGE_HEADER_RE.finditer(text))
+
+    for idx, header in enumerate(headers):
+        stage = header.group(1).lower()
+        start = header.end()
+        end = (
+            headers[idx + 1].start()
+            if idx + 1 < len(headers)
+            else len(text)
+        )
+
+        stop = re.search(r"</think>|<answer>", text[start:end], re.I)
+        if stop:
+            end = start + stop.start()
+
+        body = text[start:end]
+
+        if stage in ("understand", "compare"):
+            # Keep the stage label, mask the prose body.
+            masked_spans.append((start, end))
+
+        elif stage == "localize":
+            # Keep the candidate boxes, mask the location phrase after the semicolon.
+            separator = body.find(";")
+            if separator >= 0:
+                masked_spans.append(
+                    (start + separator + 1, end)
+                )
+
+        elif stage in ("imagine", "confirm"):
+            action = re.match(
+                r"\s*(keep|refine|reject|discover|none|"
+                r"improved|unchanged|degraded)\b",
+                body,
+                re.I,
+            )
+            if action is None:
+                raise ValueError(
+                    f"Invalid action in [{stage}]: {body[:80]}"
+                )
+
+            # Keep the action word, mask the explanation after it.
+            masked_spans.append((start + action.end(), end))
+
+    # description: supervise the field name and JSON structure, not the prose value.
+    for match in re.finditer(
+        r'"description"\s*:\s*"((?:\\.|[^"\\])*)"',
+        text,
+        re.S,
+    ):
+        masked_spans.append(match.span(1))
+
+    labels = list(ids)
+    for idx, (start, end) in enumerate(offsets):
+        if end > start and any(
+            start < right and end > left
+            for left, right in masked_spans
+        ):
+            labels[idx] = -100
+
+    return ids, labels
+
+
 def loc_char_spans(text: str) -> list:
     """Character spans carrying localization signal (the actual coordinates).
 

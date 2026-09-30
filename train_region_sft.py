@@ -58,7 +58,8 @@ from outcome.policy import generate_group
 from outcome.protocol import iou, to_pixels, valid_box
 from outcome.protocol_multibox import (objective_verdict, parse_output_cfg, refine_verdict,
                                        score_output, set_localization_reward)
-from outcome.thinking import THINK_CLOSE_PREFIX, thinking_enabled, staged_sft_target
+from outcome.thinking import (THINK_CLOSE_PREFIX, selective_sft_encoding,
+                              staged_sft_target, thinking_enabled)
 from rl.grpo import forward_with_vision, model_inputs, move_batch
 from utils.common import is_main_process, set_seed
 from utils.config import load_yaml_config
@@ -868,9 +869,11 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         prompt_ids = batch['input_ids'][0].tolist()
         target = build_sft_target(meta, multibox=multibox, thinking=thinking,
                                   answer_only=answer_only, sft_cfg=sft_cfg, zoom=False)
-        target_ids = tokenizer(target, add_special_tokens=False).input_ids
-        h_labels.append(build_labels(prompt_ids, target_ids))
+        target_ids, target_labels = selective_sft_encoding(
+            tokenizer, target
+        )
         h_seqs.append(prompt_ids + target_ids)
+        h_labels.append([-100] * len(prompt_ids) + target_labels)
         h_targets.append(target)
         h_singles.append(batch)
 
@@ -907,9 +910,11 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         zbatch = move_batch(zbatch, device)
         zbatch['_meta'] = [meta]
         zprompt_ids = zbatch['input_ids'][0].tolist()
-        post_ids = tokenizer(post_text, add_special_tokens=False).input_ids
-        post_labels.append(build_labels(zprompt_ids, post_ids))
+        post_ids, post_target_labels = selective_sft_encoding(
+            tokenizer, post_text
+        )
         post_seqs.append(zprompt_ids + post_ids)
+        post_labels.append([-100] * len(zprompt_ids) + post_target_labels)
         post_targets.append(post_text)
         post_singles.append(zbatch)
     packed_list, n_sup = [], 0
@@ -1044,15 +1049,12 @@ def batch_loss(model, packed, backward_scale=None):
         shift_labels = packed['labels'][:, 1:].contiguous()
         loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)),
                                shift_labels.view(-1), ignore_index=-100)
-        # Keep the always-present H modules in the autograd graph even when this
-        # batch is H-free (the post-observation stage has no h_box_geoms / h_map).
-        # Without a (zero-weight) edge to their parameters, DDP sees different
-        # parameter sets across ranks/stages and deadlocks in the gradient
-        # all-reduce (NCCL spin, GPU pinned at 100%).
-        for _m in (h_box, h_vpt):
-            if _m is not None:
-                for _p in _m.parameters():
-                    loss = loss + (_p.sum() * 0.0).to(loss.dtype)
+        # NOTE: no zero-weight "keep H modules in the graph" edge here. The H-free
+        # post-observation batch legitimately does not use h_box_prior / h_vpt, and
+        # DDP handles that via ``find_unused_parameters=True`` (set in the config).
+        # A zero-weight ``sum() * 0.0`` edge made those params appear in BOTH the H
+        # and H-free sub-batches of one step, so their DDP hook fired twice and hit
+        # "Expected to mark a variable ready only once".
         if backward_scale is not None:
             (loss * float(backward_scale)).backward()
     return loss

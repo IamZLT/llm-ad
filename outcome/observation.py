@@ -136,4 +136,15 @@ def observation_prompt(class_name, observations, orig_size):
         "Use full-image coordinates normalized to 0-1000. "
         "Write [confirm], close </think>, then output <answer>."
     )
+    lines.append(
+        "The earlier judgment may be incorrect. "
+        "Use the available images to reassess the candidates. "
+        "Explain the specific visual evidence for retaining, modifying, "
+        "or rejecting them. Do not merely repeat the earlier conclusion."
+    )
+    lines.append(
+        "In the final description, summarize the visible abnormality and "
+        "its approximate location, or state that no clear defect is found. "
+        "Do not claim to have inspected an image that was not supplied."
+    )
     return "\n".join(lines)

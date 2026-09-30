@@ -96,11 +96,24 @@ prompt:
     why, localize candidate boxes, imagine whether each candidate actually matches the
     defect (keep / refine / reject / none), then confirm the decision that follows from
     your rehearsal (keep / refine / reject / none). Finally output only <answer>.
-    In your thinking and in the "description" field, describe each anomaly in your own
-    words: what you actually observe in that region and why it cannot be normal for this
-    object, instead of only saying it "differs from the baseline".
-    Example (anomalous): <answer>{"is_anomaly": true, "bboxes_2d": [[120, 200, 480, 620]], "description": "a defect on the upper-left"}</answer>
-    Example (normal): <answer>{"is_anomaly": false, "bboxes_2d": [], "description": "no defect; appearance matches the reference"}</answer>
+    Follow the required stage order and output format, but do not
+    use a fixed sentence template.
+
+    [understand]: Briefly describe visible object or texture features
+    relevant to inspection. Do not repeat task instructions.
+
+    [compare]: Describe concrete visible similarities or differences.
+    Differences may be defects, normal variations, or uncertain.
+    Do not assume an anomaly must exist.
+
+    [localize]: Provide candidate boxes in the required format.
+    Any location description must agree with the boxes.
+
+    [imagine]: Use the required action word, then briefly state
+    the visual basis or what remains uncertain.
+
+    The reference may be a different normal instance of the same class.
+    Describe visible evidence; do not invent defect causes.
     For anomaly=true, bboxes_2d contains one box per spatially disconnected anomalous region, with no duplicates and at most {max_boxes} boxes.
     For anomaly=false, bboxes_2d MUST be [].
     All boxes are integers [x1,y1,x2,y2] in [0,1000] for Image 2 FULL IMAGE, with x1<x2 and y1<y2 (x1=left, y1=top, x2=right, y2=bottom).
@@ -140,7 +153,7 @@ distributed:
   num_gpu: 1
   deepspeed: null
   local_rank: -1
-  ddp_find_unused_parameters: false
+  ddp_find_unused_parameters: true
 outcome:
   version: outcome-multibox-v1
   protocol_weight: 0.01
