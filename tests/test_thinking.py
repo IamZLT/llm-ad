@@ -135,15 +135,14 @@ def test_sft_target_with_thinking_uses_stage_headers_not_xml():
                 prior_candidates=[dict(bbox_2d=[100, 100, 200, 200])])
     target = build_sft_target(meta, multibox=True, thinking=True, sft_cfg={'p_keep': 1.0})
     assert target.startswith('[understand]')
-    assert '[compare]' in target and '[localize]' in target and '[imagine]' in target and '[confirm]' in target
+    assert '[compare]' in target and '[localize]' in target
+    assert '[imagine]' not in target and '[confirm]' not in target
     assert '</think>' in target and '<answer>' in target
     assert '<understand>' not in target and '<ground>' not in target and '<think>' not in target
     p = parse_output(target, thinking_required=True)
     assert p['think_ok'] and p['think_filled']
-    assert p['protocol_core'] and p['protocol_strict']
+    assert p['protocol_core']
     assert p['candidate_bboxes_2d'] == [[100.0, 100.0, 200.0, 200.0]]
-    assert 'action=zoom_box_0' in target and 'action=global_scan' in target and 'action=stop' in target
-    assert p['confirm_valid'] and p['update_action'] in ('keep', 'refine', 'reject', 'discover')
     assert p['bboxes_2d'] == [[100.0, 100.0, 200.0, 200.0]]
     assert 'scratch' not in target
 

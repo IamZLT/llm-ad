@@ -189,6 +189,8 @@ outcome:
     zoom_cost: 1.0
     global_scan_cost: 2.0
     cost_weight: 0.05
+    fp_weight: 0.25
+    stage2_full_test: false
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -214,8 +216,6 @@ outcome:
     # keep_iou_threshold splits keep (box essentially right) from refine (box
     # undershoots/shifted); refine_eps absorbs numeric noise when thresholding the
     # delta_refine sign (a first-round box that is already right is "unchanged").
-    discrim_weight: 0.1    # legacy [confirm] verdict vs sign(delta_refine)
-    imagine_weight: 0.1    # legacy [imagine] verdict vs objective verdict
     planner_weight: 0.10
     gain_calib_weight: 0.05
     confirm_weight: 0.10

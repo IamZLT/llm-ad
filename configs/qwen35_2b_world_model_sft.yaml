@@ -178,6 +178,8 @@ outcome:
     zoom_cost: 1.0
     global_scan_cost: 2.0
     cost_weight: 0.05
+    fp_weight: 0.25
+    stage2_full_test: false
   # P0 intermediate-state SFT sampling probabilities (train_region_sft.py).
   # Each round is a (localize, imagine, confirm) triple: the model rehearses whether
   # its candidate matches the defect ([imagine]) before committing ([confirm]).
@@ -201,11 +203,27 @@ outcome:
     # missing boxes). Start values, not yet validated optima.
     correction_p_empty: 0.15
     correction_p_drop: 0.35
-    # Stage-2 confirm sees one sampled action. [imagine] still labels every action.
+    # Three separate targets. A wrong B0 is only a masked prefix.
+    task_sampling:
+      localize: 0.4
+      planner: 0.3
+      updater: 0.3
+    planner_state_sampling:
+      perfect: 0.20
+      undershoot: 0.20
+      overshoot: 0.10
+      shifted: 0.15
+      missing_component: 0.20
+      false_positive: 0.10
+      empty_anomaly: 0.05
     observation_action_sampling:
       zoom: 0.5
       global_scan: 0.3
       stop: 0.2
+    confirm_prediction_corruption:
+      supported: 0.60
+      contradicted: 0.30
+      uncertain: 0.10
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -223,7 +241,6 @@ outcome:
     refine_clip: 0.2
     cand_weight: 0.2
     cand_iou_threshold: 0.1
-    discrim_weight: 0.1    # rule-verifier anchor: confirm verdict vs GT (confirm_discrim_acc)
     planner_weight: 0.10
     gain_calib_weight: 0.05
     confirm_weight: 0.10

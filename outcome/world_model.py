@@ -13,15 +13,24 @@ from typing import Dict, List, Optional
 
 
 EVIDENCE_TYPES = {
-    "supported",
-    "undershoot",
-    "overshoot",
-    "shifted",
+    "candidate_complete",
+    "boundary_undershoot",
+    "boundary_overshoot",
+    "candidate_shifted",
     "false_alarm",
     "missing_region",
-    "complete_coverage",
+    "no_missing_region",
     "no_new_evidence",
     "uncertain",
+}
+
+# Older checkpoints used coarser names. Parsing maps them onto the current set.
+_EVIDENCE_ALIAS = {
+    "supported": "candidate_complete",
+    "undershoot": "boundary_undershoot",
+    "overshoot": "boundary_overshoot",
+    "shifted": "candidate_shifted",
+    "complete_coverage": "no_missing_region",
 }
 
 
@@ -68,6 +77,7 @@ def parse_imagine_plan(text: str, legal_actions: List[ObservationAction]) -> Wor
             continue
         if action not in legal or not math.isfinite(gain):
             continue
+        evidence = _EVIDENCE_ALIAS.get(evidence, evidence)
         if evidence not in EVIDENCE_TYPES:
             evidence = "uncertain"
         gain = max(-1.0, min(1.0, gain))

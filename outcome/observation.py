@@ -128,14 +128,21 @@ def plan_observations(test_img, boxes, orig_size, cfg):
 
 
 def observation_prompt(class_name, observations, orig_size, selected_action=None,
-                       predicted_evidence=None, predicted_gain=None):
+                       predicted_evidence=None, predicted_gain=None,
+                       include_full_test=False):
     w, h = orig_size
-    lines = [
-        f"Image 1 is a defect-free reference of {class_name}.",
-        "Image 2 is the full inspection image.",
-    ]
+    lines = [f"Image 1 is a defect-free reference of {class_name}."]
+    next_image = 2
+    if include_full_test:
+        lines.append("Image 2 is the full inspection image.")
+        next_image = 3
+    else:
+        lines.append(
+            "The full inspection image is not shown again. "
+            "Use only the supplied observation images and the frozen candidate text."
+        )
 
-    for image_id, obs in enumerate(observations, start=3):
+    for image_id, obs in enumerate(observations, start=next_image):
         x1, y1, x2, y2 = obs.window_px
         window = [
             round(x1 * 1000 / w, 1),

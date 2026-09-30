@@ -273,7 +273,10 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
     result['verify_action'] = vaction
     result['action'] = vaction
     result['verify_evidence'] = vevidence
-    iaction, _ = parse_verify(imagine_text) if imagine_text.strip() else (None, '')
+    if 'action=' in imagine_text.lower():
+        iaction = None
+    else:
+        iaction, _ = parse_verify(imagine_text) if imagine_text.strip() else (None, '')
     result['imagine_action'] = iaction
     # Phase-1 observation fields. ``pre_observation_prediction`` is the raw
     # [imagine] body (written before the crop); ``predicted_effect`` is the
@@ -657,15 +660,24 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 + dense_weight * loc_reward
                 + cand_weight * cand_cov_val
                 + refine_weight * float(min(max(delta_refine, -refine_clip), refine_clip)))
-    task = task + discrim_weight * discrim_correct + imagine_weight * imagine_correct
     planner_signal = 0.0
     confirm_signal = 0.0
     gain_error = None
     predicted_gain = None
     observation_cost = 0.0
+    from outcome.planner_supervision import build_action_supervision
+    from outcome.state_quality import state_quality
+    gt_for_quality = comps if meta['is_anomaly'] else []
+    state_q0 = state_quality(cand_boxes, gt_for_quality, meta['orig_size'], loc)
+    state_q1 = state_quality(parsed['bboxes_2d'], gt_for_quality, meta['orig_size'], loc)
+    supervision_rows = build_action_supervision(
+        cand_boxes, gt_for_quality, meta['orig_size'], loc)
+    oracle = max(supervision_rows, key=lambda row: row.target_gain) if supervision_rows else None
+    oracle_action = oracle.action if oracle else None
+    oracle_gain = oracle.target_gain if oracle else None
     if trace is not None and getattr(trace, 'rounds', None):
         rnd = trace.rounds[-1]
-        actual_gain = float(q1 - q0)
+        actual_gain = float(state_q1 - state_q0)
         rnd.actual_gain = actual_gain
         predicted_gain = rnd.selected_predicted_gain
         observation_cost = float(rnd.observation_cost or 0.0)
@@ -675,7 +687,7 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
         planner_signal = (actual_gain
                           - float(loc.get('cost_weight', 0.05)) * observation_cost
                           - float(loc.get('gain_calib_weight', 0.05)) * (gain_error or 0.0))
-        confirm_signal = 0.5 * float(q1) + 0.5 * actual_gain
+        confirm_signal = 0.5 * float(state_q1) + 0.5 * actual_gain
         if parsed.get('confirm_valid'):
             rnd.observed_evidence = parsed.get('observed_evidence')
             rnd.prediction_consistency = parsed.get('prediction_consistency')
@@ -705,4 +717,8 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 false_keep=bool(imagine_action == 'keep' and not candidate_diag['complete']),
                 planner_signal=planner_signal, confirm_signal=confirm_signal,
                 gain_error=gain_error, predicted_gain=predicted_gain,
-                observation_cost=observation_cost)
+                observation_cost=observation_cost,
+                state_q0=state_q0, state_q1=state_q1,
+                oracle_action=oracle_action, oracle_gain=oracle_gain,
+                planner_regret=(None if oracle_gain is None
+                                else float(oracle_gain) - float(state_q1 - state_q0)))

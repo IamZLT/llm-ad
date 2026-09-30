@@ -55,7 +55,9 @@ from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_observation_b
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
 from outcome.observation import execute_observation_action, observation_prompt
 from outcome.planner_supervision import (build_action_supervision, confirm_for_action,
-                                         render_action_supervisions, sample_observation_action)
+                                         render_action_supervisions, render_imagine_prefix,
+                                         sample_belief_boxes, sample_observation_action,
+                                         sample_prediction_view)
 from outcome.policy import generate_group
 from outcome.protocol import iou, to_pixels, valid_box
 from outcome.protocol_multibox import parse_output_cfg, score_output
@@ -529,24 +531,30 @@ def sample_correction_candidates(meta, gt_boxes, sft_cfg):
     ]
 
 
-def build_correction_staged_targets(meta, collator, sft_cfg):
-    """Two-stage correction targets driven by real set-level scoring.
+def _weighted_choice(weights: dict) -> str:
+    names = [name for name, weight in weights.items() if float(weight) > 0]
+    total = sum(float(weights[name]) for name in names)
+    draw = random.random() * total
+    acc = 0.0
+    chosen = names[-1]
+    for name in names:
+        acc += float(weights[name])
+        if draw <= acc:
+            return name
+    return chosen
 
-    Returns ``(pre_text, post_text, cand_boxes)``. ``pre_text`` is the stage-1
-    chain carrying an *artificial wrong* candidate set (used only as the stage-2
-    condition, label=-100). ``post_text`` is ``[confirm]</think><answer>`` whose
-    ``[confirm]`` comes from the true set-localization effect (not hardcoded
-    'improved') and whose answer is the GT box set (or empty for normal samples).
-    """
-    cls = str(meta.get('class_name') or 'object').replace('_', ' ')
+
+def _belief_components(meta):
     is_anom = bool(meta['is_anomaly'])
     comps = list(meta.get('component_bboxes') or [])
-    if not comps and meta.get('gt_box_px') is not None:
+    if is_anom and not comps and meta.get('gt_box_px') is not None:
         comps = [meta['gt_box_px']]
     gt_boxes = _boxes_to_1000(comps, meta['orig_size']) if is_anom else []
+    return is_anom, comps, gt_boxes
 
-    cand_boxes = sample_correction_candidates(meta, gt_boxes, sft_cfg)
 
+def _prefix_prose(meta):
+    cls = str(meta.get('class_name') or 'object').replace('_', ' ')
     understand = (
         f'Image 1 is a defect-free {cls} and sets the normal baseline: treat its '
         'material, structure, texture, print, and lighting as expected appearance. '
@@ -554,35 +562,70 @@ def build_correction_staged_targets(meta, collator, sft_cfg):
         'baseline aside from a true defect. Weigh the anomaly heatmap as a fallible '
         'search hint; do not decide anomaly or coordinates yet'
     )
-    # Deliberately non-leaking: never state how many regions the GT has.
     compare = (
         'Compare the inspection image against the normal reference. '
         'The current candidate set is provisional; both its validity '
         'and its coverage require verification.'
     )
-    localize = _ground_multibox(cand_boxes)
+    return understand, compare
 
-    rows = build_action_supervision(cand_boxes, comps, meta['orig_size'], collator.cfg)
-    chosen = sample_observation_action(rows, sft_cfg)
-    imagine = render_action_supervisions(rows)
-    confirm = confirm_for_action(chosen)
 
-    if is_anom:
-        n = len(gt_boxes)
-        description = (
-            f'A localized defect is present on the {cls}: {_region_count(n)} '
-            f'{_plural(n, "differs", "differ")} from the Image 1 baseline in a way '
-            f'material or appearance variation cannot explain.'
-        )
-        answer = json.dumps({'is_anomaly': True, 'bboxes_2d': gt_boxes, 'description': description})
+def _answer_for_boxes(boxes):
+    """The committed belief, not the untouched ground truth."""
+    frozen = [[float(v) for v in box] for box in boxes]
+    if frozen:
+        answer = {
+            'is_anomaly': True,
+            'bboxes_2d': frozen,
+            'description': 'The candidate set was updated from the supplied observation.',
+        }
     else:
-        answer = json.dumps({
+        answer = {
             'is_anomaly': False,
             'bboxes_2d': [],
-            'description': 'No defect is identified after reviewing the image.',
-        })
+            'description': 'No defect remains in the current candidate set.',
+        }
+    return json.dumps(answer)
 
-    pre = f'[understand]\n{understand}\n[compare]\n{compare}\n[localize]\n{localize}\n[imagine]\n{imagine}\n'
+
+def build_planner_sft_texts(meta, cfg, sft_cfg):
+    """Unlabeled B0 prefix plus a supervised imagine plan for every legal action."""
+    is_anom, comps, gt_boxes = _belief_components(meta)
+    weights = (sft_cfg or {}).get('planner_state_sampling')
+    _mode, cand_boxes = sample_belief_boxes(gt_boxes, is_anomaly=is_anom, weights=weights)
+    rows = build_action_supervision(cand_boxes, comps if is_anom else [], meta['orig_size'], cfg)
+    understand, compare = _prefix_prose(meta)
+    prefix = (
+        f'[understand]\n{understand}\n[compare]\n{compare}\n'
+        f'[localize]\n{_ground_multibox(cand_boxes)}\n'
+    )
+    imagine = f'[imagine]\n{render_action_supervisions(rows)}\n'
+    return prefix, imagine
+
+
+def build_correction_staged_targets(meta, collator, sft_cfg):
+    """Updater target for one real observation.
+
+    The stage-1 prefix, including an artificial B0 and a possibly wrong imagine
+    line, is label=-100. The answer boxes are the boxes that action is allowed
+    to produce, not the full ground truth. Stop is not an updater action.
+    """
+    is_anom, comps, gt_boxes = _belief_components(meta)
+    weights = (sft_cfg or {}).get('planner_state_sampling')
+    _mode, cand_boxes = sample_belief_boxes(gt_boxes, is_anomaly=is_anom, weights=weights)
+    understand, compare = _prefix_prose(meta)
+    localize = _ground_multibox(cand_boxes)
+    rows = build_action_supervision(
+        cand_boxes, comps if is_anom else [], meta['orig_size'], collator.cfg)
+    chosen = sample_observation_action(rows, sft_cfg, include_stop=False)
+    predicted, consistency = sample_prediction_view(chosen, sft_cfg)
+    imagine = render_imagine_prefix(rows, chosen, predicted)
+    confirm = confirm_for_action(chosen, consistency)
+    answer = _answer_for_boxes(chosen.target_boxes)
+    pre = (
+        f'[understand]\n{understand}\n[compare]\n{compare}\n'
+        f'[localize]\n{localize}\n[imagine]\n{imagine}\n'
+    )
     post = f'[confirm]\n{confirm}\n{THINK_CLOSE_PREFIX}<answer>\n{answer}\n</answer>'
     return pre, post, cand_boxes, chosen
 
@@ -647,17 +690,15 @@ def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = Fal
             rounds = _normal_rounds(meta, cls, sft_cfg)
         if answer_only:
             return f'<answer>\n{answer}\n</answer>'
-        ground, imagine, verify = rounds[0]
+        ground = _ground_multibox(gt_boxes if is_anom else [])
         if thinking:
-            from outcome.protocol_multibox import parse_boxes_list
-            state, parsed_boxes = parse_boxes_list(ground)
-            sup_boxes = parsed_boxes if state == 'list' else []
-            sup_gt = comps if is_anom else []
-            rows = build_action_supervision(
-                sup_boxes, sup_gt, meta['orig_size'], {'outcome': {}})
-            imagine = render_action_supervisions(rows)
-            verify = confirm_for_action(max(rows, key=lambda row: row.target_gain))
-            return staged_sft_target(understand, compare, ground, imagine, verify, answer)
+            return (
+                f'[understand]\n{understand}\n'
+                f'[compare]\n{compare}\n'
+                f'[localize]\n{ground}\n'
+                f'{THINK_CLOSE_PREFIX}<answer>\n{answer}\n</answer>'
+            )
+        imagine, verify = rounds[0][1], rounds[0][2]
         return (
             f'<understand>\n{understand}\n</understand>\n'
             f'<compare>\n{compare}\n</compare>\n'
@@ -826,67 +867,70 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
     stays consistent within a batch.
     """
     sft_cfg = sft_cfg or {}
-    zoom_prob = float(sft_cfg.get('zoom_prob', 0.0))
     zcfg = (collator.cfg.get('outcome') or {}).get('zoom') or {}
     crop_min_pixels = zcfg.get('crop_min_pixels')
+    split_tasks = bool(multibox and thinking and not answer_only)
+    task_weights = (sft_cfg.get('task_sampling') or {
+        'localize': 0.4, 'planner': 0.3, 'updater': 0.3,
+    }) if split_tasks else {'localize': 1.0}
     h_singles, h_seqs, h_labels, h_targets = [], [], [], []
     post_singles, post_seqs, post_labels, post_targets = [], [], [], []
     for sample in samples:
         batch = move_batch(collator([sample]), device)
         meta = batch['_meta'][0]
-
-        # Every sample always keeps its normal (single-pass) SFT target.
         prompt_ids = batch['input_ids'][0].tolist()
+        task = _weighted_choice(task_weights)
+
+        if task == 'planner':
+            prefix, imagine = build_planner_sft_texts(meta, collator.cfg, sft_cfg)
+            prefix_ids = tokenizer(prefix, add_special_tokens=False).input_ids
+            imagine_ids, imagine_labels = selective_sft_encoding(tokenizer, imagine)
+            h_seqs.append(prompt_ids + prefix_ids + imagine_ids)
+            h_labels.append([-100] * (len(prompt_ids) + len(prefix_ids)) + imagine_labels)
+            h_targets.append(prefix + imagine)
+            h_singles.append(batch)
+            continue
+
+        if task == 'updater':
+            pre_text, post_text, cand_boxes, chosen = build_correction_staged_targets(
+                meta, collator, sft_cfg)
+            execution = execute_observation_action(
+                meta['test'], cand_boxes, tuple(meta['orig_size']), chosen.action, collator.cfg)
+            if execution.executed:
+                include_full_test = bool(
+                    ((collator.cfg.get('outcome') or {}).get('planner') or {}).get(
+                        'stage2_full_test', False))
+                cont = observation_prompt(
+                    str(meta.get('class_name', 'object')), execution.observations,
+                    tuple(meta['orig_size']), selected_action=chosen.action,
+                    predicted_evidence=chosen.evidence, predicted_gain=chosen.target_gain,
+                    include_full_test=include_full_test)
+                zbatch = build_observation_batch(
+                    collator.processor, collator.prior, collator.cfg,
+                    meta['ref'], meta['test'],
+                    [obs.image for obs in execution.observations],
+                    cont, device,
+                    crop_min_pixels=crop_min_pixels,
+                    prefill_text=pre_text,
+                    include_full_test=include_full_test,
+                )
+                zbatch = move_batch(zbatch, device)
+                zbatch['_meta'] = [meta]
+                zprompt_ids = zbatch['input_ids'][0].tolist()
+                post_ids, post_target_labels = selective_sft_encoding(tokenizer, post_text)
+                post_seqs.append(zprompt_ids + post_ids)
+                post_labels.append([-100] * len(zprompt_ids) + post_target_labels)
+                post_targets.append(post_text)
+                post_singles.append(zbatch)
+                continue
+
         target = build_sft_target(meta, multibox=multibox, thinking=thinking,
                                   answer_only=answer_only, sft_cfg=sft_cfg, zoom=False)
-        target_ids, target_labels = selective_sft_encoding(
-            tokenizer, target
-        )
+        target_ids, target_labels = selective_sft_encoding(tokenizer, target)
         h_seqs.append(prompt_ids + target_ids)
         h_labels.append([-100] * len(prompt_ids) + target_labels)
         h_targets.append(target)
         h_singles.append(batch)
-
-        # Optional stage-2 correction continuation (H-free, multi-observation).
-        do_correction = (
-            zoom_prob > 0
-            and multibox
-            and thinking
-            and not answer_only
-            and random.random() < zoom_prob
-        )
-        if not do_correction:
-            continue
-
-        pre_text, post_text, cand_boxes, chosen = build_correction_staged_targets(
-            meta, collator, sft_cfg)
-        execution = execute_observation_action(
-            meta['test'], cand_boxes, tuple(meta['orig_size']), chosen.action, collator.cfg)
-        cont = observation_prompt(
-            str(meta.get('class_name', 'object')), execution.observations,
-            tuple(meta['orig_size']), selected_action=chosen.action,
-            predicted_evidence=chosen.evidence, predicted_gain=chosen.target_gain)
-        zbatch = build_observation_batch(
-            collator.processor, collator.prior, collator.cfg,
-            meta['ref'], meta['test'],
-            [obs.image for obs in execution.observations],
-            cont, device,
-            crop_min_pixels=crop_min_pixels,
-            prefill_text=pre_text,
-        )
-        # build_observation_batch returns CPU tensors (only image_embeds is on device);
-        # move the whole batch to device like the collator path does, then re-attach the
-        # collator's meta (H-free builder has no _meta) so _pack_group can build metas.
-        zbatch = move_batch(zbatch, device)
-        zbatch['_meta'] = [meta]
-        zprompt_ids = zbatch['input_ids'][0].tolist()
-        post_ids, post_target_labels = selective_sft_encoding(
-            tokenizer, post_text
-        )
-        post_seqs.append(zprompt_ids + post_ids)
-        post_labels.append([-100] * len(zprompt_ids) + post_target_labels)
-        post_targets.append(post_text)
-        post_singles.append(zbatch)
     packed_list, n_sup = [], 0
     if h_singles:
         packed, ns = _pack_group(h_singles, h_seqs, h_labels, h_targets, tokenizer, device)

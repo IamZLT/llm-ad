@@ -358,6 +358,11 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                         planner_advantages = None
                     if bool(confirm_advantages.abs().max().item() <= 1e-8):
                         confirm_advantages = None
+                    reward_cfg = oc.get('reward') or {}
+                    if planner_advantages is not None:
+                        planner_advantages = planner_advantages * float(reward_cfg.get('planner_weight', 0.1))
+                    if confirm_advantages is not None:
+                        confirm_advantages = confirm_advantages * float(reward_cfg.get('confirm_weight', 0.1))
                     verify_advantages = None
                 # Skip the update only when EVERY valid-token advantage collapsed
                 # (task + candidate + final + verify), not just the task term.

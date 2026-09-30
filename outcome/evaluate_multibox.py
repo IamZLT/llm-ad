@@ -128,7 +128,11 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes,
         observed_evidence=parsed.get('observed_evidence'),
         prediction_consistency=parsed.get('prediction_consistency'),
         observation_cost=score.get('observation_cost'),
-        quality_before=score.get('q0'), quality_after=score.get('q1'),
+        quality_before=score.get('state_q0', score.get('q0')),
+        quality_after=score.get('state_q1', score.get('q1')),
+        oracle_action=score.get('oracle_action'),
+        oracle_gain=score.get('oracle_gain'),
+        planner_regret=score.get('planner_regret'),
         stage1_early_end=(trace.stage1_early_end if trace is not None else None),
         stop_reason=completion.stop_reason, new_tokens=len(completion.ids)-prompt_len,
         seconds=elapsed, text=completion.text)
@@ -219,7 +223,9 @@ def summarize(rows):
         mean_q0=mean(r['quality_before'] for r in rows if r.get('quality_before') is not None),
         mean_q1=mean(r['quality_after'] for r in rows if r.get('quality_after') is not None),
         mean_delta_q=mean((r['quality_after'] - r['quality_before'])
-                          for r in rows if r.get('quality_after') is not None and r.get('quality_before') is not None))
+                          for r in rows if r.get('quality_after') is not None and r.get('quality_before') is not None),
+        mean_oracle_gain=mean(r['oracle_gain'] for r in rows if r.get('oracle_gain') is not None),
+        mean_planner_regret=mean(r['planner_regret'] for r in rows if r.get('planner_regret') is not None))
     for size in ('small','medium','large'):
         subset = [r for r in abnormal if r['size_bin'] == size]
         tp = [r for r in subset if r['pred'] is True and r['task_valid']]

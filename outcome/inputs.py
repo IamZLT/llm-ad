@@ -437,7 +437,8 @@ def build_zoom_batch(processor, prior, cfg: dict, ref_img: Image.Image,
 def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
                             test_img: Image.Image, crop_img: Image.Image = None,
                             continuation_text: str = '', device=None, crop_min_pixels: int = None,
-                            prefill_text: str = '', observation_images=None) -> dict:
+                            prefill_text: str = '', observation_images=None,
+                            include_full_test: bool = None) -> dict:
     """Build the stage-2 observation batch (ref + test + observation images).
 
     Merges the old train 3-image and eval H-free paths into one constructor: stage 2
@@ -452,13 +453,18 @@ def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
     """
     if observation_images is not None:
         crop_img = observation_images
+    if include_full_test is None:
+        include_full_test = bool(
+            ((cfg.get('outcome') or {}).get('planner') or {}).get('stage2_full_test', False))
     data = cfg.get('data') or {}
     max_size = int(data.get('max_image_size', 768))
     factor = qwen_vision_factor(processor, getattr(prior, 'visual', None))
     cap = max_size * max_size
     test_rs = _smart_resize_image(test_img, max_size, factor, 256 * 256, cap)
     ref_rs = ref_img.resize(test_rs.size, Image.Resampling.BICUBIC)
-    images = [ref_rs, test_rs]
+    images = [ref_rs]
+    if include_full_test:
+        images.append(test_rs)
     if crop_img is None:
         crops = []
     elif isinstance(crop_img, (list, tuple)):

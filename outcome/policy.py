@@ -1,6 +1,7 @@
 """Finite rollouts, genuine completion lengths and one outcome advantage."""
 from __future__ import annotations
 
+import json
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -252,6 +253,26 @@ def _think_stage_body(stage1_text: str, stage: str) -> str:
     return info['bodies'].get(stage, '') or info['first_bodies'].get(stage, '')
 
 
+def _finalize_stop(stage1, boxes, trace):
+    """Stop ends the loop. The committed boxes are exactly B0."""
+    frozen = [[float(v) for v in box] for box in boxes]
+    trace.final_boxes = frozen
+    if trace.rounds:
+        trace.rounds[-1].output_boxes = [list(box) for box in frozen]
+        trace.rounds[-1].confirm_text = ""
+    answer = json.dumps({
+        "is_anomaly": bool(frozen),
+        "bboxes_2d": frozen,
+        "description": "No additional observation was acquired. The current candidate set is unchanged.",
+    })
+    text = stage1.text or ""
+    if "</think>" not in text.lower():
+        text = text.rstrip() + "\n</think>\n\n"
+    if "<answer>" not in text.lower():
+        text = text.rstrip() + f"\n<answer>\n{answer}\n</answer>"
+    return Completion(stage1.ids, text, "stop"), trace
+
+
 def generate_inspection_group(model, processor, prior, batch, cfg, group=1, sample=False):
     """Unified two-stage world-model inspection flow (train & eval share this).
 
@@ -360,11 +381,17 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
     ]
     trace.apply_round(rnd)
 
+    if selected_action == "stop":
+        return _finalize_stop(stage1, boxes, trace)
+
+    include_full_test = bool(
+        ((cfg.get("outcome") or {}).get("planner") or {}).get("stage2_full_test", False))
     cont = observation_prompt(
         class_name, execution.observations, orig_size,
         selected_action=selected_action,
         predicted_evidence=rnd.selected_predicted_evidence,
         predicted_gain=rnd.selected_predicted_gain,
+        include_full_test=include_full_test,
     )
 
     device = batch['input_ids'].device
@@ -379,6 +406,7 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
         device,
         crop_min_pixels=zcfg.get('crop_min_pixels'),
         prefill_text=stage1.text,
+        include_full_test=include_full_test,
     )
     zbatch = move_batch(zbatch, device)
     stage2 = generate_group(model, processor, zbatch, cfg, group=1, sample=sample)[0]
