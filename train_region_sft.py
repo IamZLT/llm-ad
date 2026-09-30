@@ -1269,6 +1269,15 @@ def main():
         dev_dataset = dataset_cls(dev, cfg, processor, 'eval', pool)
 
     collator = collator_cls(processor, prior, cfg)
+    if main_proc and thinking and multibox:
+        from outcome.planner_supervision import summarize_dataset_beliefs
+        belief = summarize_dataset_beliefs(getattr(dataset, 'samples', train), cfg, limit=400, seed=seed)
+        print('[sft] planner-target ' + json.dumps(
+            {key: belief[key] for key in (
+                'n', 'all_zero_rate', 'zoom_positive_rate', 'scan_positive_rate',
+                'best_action_stop_rate', 'best_action_zoom_rate', 'best_action_scan_rate',
+                'gain_mean', 'gain_std')},
+            ensure_ascii=False), flush=True)
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=float(args.lr), weight_decay=0.0)
 

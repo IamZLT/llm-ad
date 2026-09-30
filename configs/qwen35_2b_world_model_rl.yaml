@@ -208,14 +208,9 @@ outcome:
     refine_clip: 0.2
     cand_weight: 0.1
     cand_iou_threshold: 0.1
-    # World-model rehearsal calibration — two orthogonal questions:
-    #   * [imagine] predicts the candidate box's objective quality (keep/refine/reject/
-    #     none), scored against objective_verdict (imagine_calib_acc).
-    #   * [confirm] predicts the refine loop's net effect (improved/unchanged/degraded),
-    #     scored against sign(delta_refine) (confirm_discrim_acc).
-    # keep_iou_threshold splits keep (box essentially right) from refine (box
-    # undershoots/shifted); refine_eps absorbs numeric noise when thresholding the
-    # delta_refine sign (a first-round box that is already right is "unchanged").
+    #   * [imagine] predicts evidence and gain for every legal observation.
+    #   * [confirm] reports the real observation and whether that prediction held.
+    # planner_weight / confirm_weight scale the normalized token advantages.
     planner_weight: 0.10
     gain_calib_weight: 0.05
     confirm_weight: 0.10

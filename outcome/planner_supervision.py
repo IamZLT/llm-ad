@@ -298,6 +298,30 @@ def _action_cost(name: str, cfg) -> float:
     return 0.0
 
 
+def summarize_dataset_beliefs(samples, cfg, limit: int = 400, seed: int = 0) -> dict:
+    """Planner-target distribution on real boxes, without loading full training images."""
+    from PIL import Image
+    rng = random.Random(seed)
+    chosen = list(samples or [])
+    rng.shuffle(chosen)
+    records = []
+    for sample in chosen:
+        if len(records) >= limit:
+            break
+        meta = sample.get("metadata") or sample
+        comps = list(meta.get("component_bboxes") or [])
+        is_anom = bool(meta.get("anomaly", meta.get("is_anomaly", False)))
+        path = sample.get("full_img_path") or sample.get("image_path") or sample.get("image")
+        if not path:
+            continue
+        with Image.open(path) as image:
+            orig = image.size
+        gt_1000 = [_to_1000(box, orig) for box in comps] if is_anom else []
+        _mode, boxes = sample_belief_boxes(gt_1000, is_anomaly=is_anom and bool(gt_1000), rng=rng)
+        records.append(build_action_supervision(boxes, comps if is_anom else [], orig, cfg))
+    return summarize_supervision(records, cfg)
+
+
 def summarize_supervision(records: Sequence[dict], cfg=None) -> dict:
     """Aggregate planner targets. ``records`` are lists of ActionSupervision rows.
 

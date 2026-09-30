@@ -393,24 +393,34 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     protocol_strict_rate=sum(p['protocol_strict'] for p in parsed)/len(parsed),
                     think_ok_rate=sum(bool(p.get('think_ok')) for p in parsed)/len(parsed),
                     think_filled_rate=sum(bool(p.get('think_filled')) for p in parsed)/len(parsed),
-                    reject_rate=sum(p.get('imagine_action') == 'reject' for p in parsed)/len(parsed),
-                    confirm_discrim_acc=sum(s.get('discrim_correct', 0.0) for s in scores)/len(scores),
-                    imagine_calib_acc=sum(s.get('imagine_correct', 0.0) for s in scores)/len(scores),
                     truncation_rate=sum(c.stop_reason == 'length' for c in completions)/len(completions))
-                if zoom_enabled and traces:
+                if traces:
+                    def _defined(values):
+                        nums = [float(v) for v in values if v is not None]
+                        return sum(nums) / len(nums) if nums else 0.0
+                    actions = [((t.rounds[-1].selected_observation_action if t.rounds else None)
+                                 or t.selected_action or '') for t in traces]
                     metrics.update(
-                        zoom_executed_rate=sum(bool(t.zoom_executed) for t in traces)/len(traces),
-                        zoom_skip_rate=sum(bool(t.zoom_skip_reason) for t in traces)/len(traces),
-                        mean_quality_before=sum(s.get('q0', 0.0) for s in scores)/len(scores),
-                        mean_quality_after=sum(s.get('q1', 0.0) for s in scores)/len(scores),
-                        mean_delta_refine=sum(s['delta_refine'] for s in scores)/len(scores))
+                        planner_valid_rate=sum(bool(t.rounds and t.rounds[-1].world_model_valid) for t in traces) / len(traces),
+                        zoom_rate=sum(a.startswith('zoom_box_') for a in actions) / len(actions),
+                        global_scan_rate=sum(a == 'global_scan' for a in actions) / len(actions),
+                        stop_rate=sum(a == 'stop' for a in actions) / len(actions),
+                        mean_predicted_gain=_defined(s.get('predicted_gain') for s in scores),
+                        mean_actual_gain=_defined(
+                            (t.rounds[-1].actual_gain if t.rounds else None) for t in traces),
+                        mean_gain_error=_defined(s.get('gain_error') for s in scores),
+                        mean_planner_regret=_defined(s.get('planner_regret') for s in scores),
+                        mean_quality_before=_defined(s.get('state_q0') for s in scores),
+                        mean_quality_after=_defined(s.get('state_q1') for s in scores),
+                    )
                 metrics.update(prompt_tokens=meta['prompt_tokens'], visual_tokens=meta['visual_tokens'],
                                mean_new_tokens=sum(len(c.ids)-int(batch['prompt_len'][0]) for c in completions)/len(completions))
                 # Average the per-sample metrics across ranks so TB/console show the
                 # global value; the counters (attempts/updates/skipped_total) are kept.
                 metrics = {k: (avg_across_ranks(float(v), device) if k not in ('attempts', 'updates', 'skipped_total') else v)
                            for k, v in metrics.items()}
-                rows = [make_record(p,s,meta,c,int(batch['prompt_len'][0]),0.,max_boxes) for p,s,c in zip(parsed,scores,completions)]
+                rows = [make_record(p, s, meta, c, int(batch['prompt_len'][0]), 0., max_boxes, trace=t)
+                        for p, s, c, t in zip(parsed, scores, completions, traces or [None] * len(parsed))]
                 stream.write(json.dumps(dict(attempt=attempt, update_before=updates, zero_advantage=zero,
                                              task_reward_std=task_std, resamples_used=resamples,
                                              loc_reward_mean=float(loc_rewards.mean()), loc_reward_std=loc_std,
@@ -483,7 +493,14 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                           f'rs={resamples} tv={metrics["task_valid_rate"]:.2f} '
                           f'pc={metrics["protocol_core_rate"]:.2f} ps={metrics["protocol_strict_rate"]:.2f} '
                           f'tk={metrics["think_ok_rate"]:.2f} tok={metrics["mean_new_tokens"]:.0f} '
-                          f'disc={metrics["confirm_discrim_acc"]:.2f} '
+                          f'pvalid={metrics.get("planner_valid_rate", 0):.2f} '
+                          f'zoom={metrics.get("zoom_rate", 0):.2f} '
+                          f'scan={metrics.get("global_scan_rate", 0):.2f} '
+                          f'stop={metrics.get("stop_rate", 0):.2f} '
+                          f'pgain={_f(metrics.get("mean_predicted_gain"))} '
+                          f'again={_f(metrics.get("mean_actual_gain"))} '
+                          f'gerr={_f(metrics.get("mean_gain_error"))} '
+                          f'regret={_f(metrics.get("mean_planner_regret"))} '
                           f'{loss_part} '
                           f'({time.perf_counter()-started:.1f}s)', flush=True)
                 every = int(cfg['training'].get('eval_every_n_steps', 0))
