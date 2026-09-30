@@ -314,6 +314,14 @@ def selective_sft_encoding(tokenizer, text):
                     (start + separator + 1, end)
                 )
 
+        elif stage == "imagine" and "action=" in body.lower():
+            for reason in re.finditer(r"reason\s*=\s*\S[^\n]*", body, re.I):
+                masked_spans.append((start + reason.start(), start + reason.end()))
+
+        elif stage == "confirm" and "observed=" in body.lower():
+            for reason in re.finditer(r"reason\s*=\s*\S[^\n]*", body, re.I):
+                masked_spans.append((start + reason.start(), start + reason.end()))
+
         elif stage in ("imagine", "confirm"):
             action = re.match(
                 r"\s*(keep|refine|reject|discover|none|"
@@ -438,22 +446,20 @@ def verify_char_spans(text: str) -> list:
 
 def verify_token_mask(tokenizer, text: str) -> list:
     """Per-token 0/1 mask: 1 = imagine/confirm reasoning token."""
-    text = text or ''
-    try:
-        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    except TypeError:
-        return []
-    ids, offs = _encoding_fields(enc)
-    mask = [0] * len(ids)
-    spans = verify_char_spans(text)
-    if not spans or not offs:
-        return mask
-    for i, pair in enumerate(offs):
-        s, e = int(pair[0]), int(pair[1])
-        if e <= s:
-            continue
-        for cs, ce in spans:
-            if s < ce and e > cs:
-                mask[i] = 1
-                break
-    return mask
+    return _spans_to_token_mask(tokenizer, text, verify_char_spans(text))
+
+
+def imagine_char_spans(text: str) -> list:
+    return [(m.start(), m.end()) for m in IMAGINE_SPAN_RE.finditer(text or "")]
+
+
+def confirm_char_spans(text: str) -> list:
+    return [(m.start(), m.end()) for m in CONFIRM_SPAN_RE.finditer(text or "")]
+
+
+def imagine_token_mask(tokenizer, text: str) -> list:
+    return _spans_to_token_mask(tokenizer, text, imagine_char_spans(text))
+
+
+def confirm_token_mask(tokenizer, text: str) -> list:
+    return _spans_to_token_mask(tokenizer, text, confirm_char_spans(text))

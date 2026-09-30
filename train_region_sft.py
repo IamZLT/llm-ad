@@ -53,11 +53,12 @@ from models.vision_cache import bind_cached_image_features
 from outcome.inputs import (OutcomeCollator, OutcomeDataset, build_observation_batch,
                             build_zoom_train_batch)
 from outcome.inputs_multibox import OutcomeMultiboxCollator, OutcomeMultiboxDataset
-from outcome.observation import observation_prompt, plan_observations
+from outcome.observation import execute_observation_action, observation_prompt
+from outcome.planner_supervision import (build_action_supervision, confirm_for_action,
+                                         render_action_supervisions, sample_observation_action)
 from outcome.policy import generate_group
 from outcome.protocol import iou, to_pixels, valid_box
-from outcome.protocol_multibox import (objective_verdict, parse_output_cfg, refine_verdict,
-                                       score_output, set_localization_reward)
+from outcome.protocol_multibox import parse_output_cfg, score_output
 from outcome.thinking import (THINK_CLOSE_PREFIX, selective_sft_encoding,
                               staged_sft_target, thinking_enabled)
 from rl.grpo import forward_with_vision, model_inputs, move_batch
@@ -528,28 +529,6 @@ def sample_correction_candidates(meta, gt_boxes, sft_cfg):
     ]
 
 
-def _verdict_imagine(verdict, cls):
-    """Objective-verdict -> [imagine] rehearsal text (candidate quality)."""
-    if verdict == 'keep':
-        return 'keep; this candidate set matches the observed defect and is absent from the reference'
-    if verdict == 'refine':
-        return 'refine; this candidate set marks a defect but its extent or coverage needs correction'
-    if verdict == 'reject':
-        return 'reject; this candidate is not supported by a real defect and must be discarded'
-    if verdict == 'discover':
-        return 'discover; no candidate was proposed but a defect may still be present, so keep searching'
-    return f'none; this candidate region shows no true defect on the {cls}'
-
-
-def _effect_confirm(effect):
-    """Refine-effect -> [confirm] text (did the correction help)."""
-    if effect == 'improved':
-        return 'improved; correcting the candidate set recovers the complete defect set'
-    if effect == 'degraded':
-        return 'degraded; the correction worsened the set relative to the original candidate'
-    return 'unchanged; the candidate set already matched, so no correction was needed'
-
-
 def build_correction_staged_targets(meta, collator, sft_cfg):
     """Two-stage correction targets driven by real set-level scoring.
 
@@ -583,26 +562,10 @@ def build_correction_staged_targets(meta, collator, sft_cfg):
     )
     localize = _ground_multibox(cand_boxes)
 
-    loc_cfg = {
-        **((collator.cfg.get('outcome') or {}).get('localization') or {}),
-        **((collator.cfg.get('outcome') or {}).get('reward') or {}),
-    }
-    loc_args = {
-        'iou_threshold': float(loc_cfg.get('iou_threshold', 0.30)),
-        'geometry_weight': float(loc_cfg.get('geometry_weight', 0.30)),
-    }
-    q0 = set_localization_reward(cand_boxes, comps, meta['orig_size'], **loc_args)['reward']
-    q1 = set_localization_reward(gt_boxes, comps, meta['orig_size'], **loc_args)['reward']
-    effect = refine_verdict(q1 - q0, float(loc_cfg.get('refine_eps', 0.05)))
-    cand_px = [to_pixels(b, meta['orig_size']) for b in cand_boxes]
-    verdict = objective_verdict(
-        cand_px, comps,
-        float(loc_cfg.get('cand_iou_threshold', 0.10)),
-        float(loc_cfg.get('keep_iou_threshold', 0.50)),
-    )
-
-    imagine = _verdict_imagine(verdict, cls)
-    confirm = _effect_confirm(effect)
+    rows = build_action_supervision(cand_boxes, comps, meta['orig_size'], collator.cfg)
+    chosen = sample_observation_action(rows, sft_cfg)
+    imagine = render_action_supervisions(rows)
+    confirm = confirm_for_action(chosen)
 
     if is_anom:
         n = len(gt_boxes)
@@ -621,7 +584,7 @@ def build_correction_staged_targets(meta, collator, sft_cfg):
 
     pre = f'[understand]\n{understand}\n[compare]\n{compare}\n[localize]\n{localize}\n[imagine]\n{imagine}\n'
     post = f'[confirm]\n{confirm}\n{THINK_CLOSE_PREFIX}<answer>\n{answer}\n</answer>'
-    return pre, post, cand_boxes
+    return pre, post, cand_boxes, chosen
 
 
 def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = False,
@@ -686,8 +649,15 @@ def build_sft_target(meta: dict, *, multibox: bool = False, thinking: bool = Fal
             return f'<answer>\n{answer}\n</answer>'
         ground, imagine, verify = rounds[0]
         if thinking:
-            return staged_sft_target(understand, compare, ground, imagine, verify, answer,
-                                     extra_rounds=rounds[1:])
+            from outcome.protocol_multibox import parse_boxes_list
+            state, parsed_boxes = parse_boxes_list(ground)
+            sup_boxes = parsed_boxes if state == 'list' else []
+            sup_gt = comps if is_anom else []
+            rows = build_action_supervision(
+                sup_boxes, sup_gt, meta['orig_size'], {'outcome': {}})
+            imagine = render_action_supervisions(rows)
+            verify = confirm_for_action(max(rows, key=lambda row: row.target_gain))
+            return staged_sft_target(understand, compare, ground, imagine, verify, answer)
         return (
             f'<understand>\n{understand}\n</understand>\n'
             f'<compare>\n{compare}\n</compare>\n'
@@ -888,18 +858,18 @@ def pack_sft_batch(collator, device, samples, tokenizer, multibox, thinking=Fals
         if not do_correction:
             continue
 
-        pre_text, post_text, cand_boxes = build_correction_staged_targets(meta, collator, sft_cfg)
-
-        observations = plan_observations(
-            meta['test'], cand_boxes, tuple(meta['orig_size']), collator.cfg
-        )
+        pre_text, post_text, cand_boxes, chosen = build_correction_staged_targets(
+            meta, collator, sft_cfg)
+        execution = execute_observation_action(
+            meta['test'], cand_boxes, tuple(meta['orig_size']), chosen.action, collator.cfg)
         cont = observation_prompt(
-            str(meta.get('class_name', 'object')), observations, tuple(meta['orig_size'])
-        )
+            str(meta.get('class_name', 'object')), execution.observations,
+            tuple(meta['orig_size']), selected_action=chosen.action,
+            predicted_evidence=chosen.evidence, predicted_gain=chosen.target_gain)
         zbatch = build_observation_batch(
             collator.processor, collator.prior, collator.cfg,
             meta['ref'], meta['test'],
-            [obs.image for obs in observations],
+            [obs.image for obs in execution.observations],
             cont, device,
             crop_min_pixels=crop_min_pixels,
             prefill_text=pre_text,

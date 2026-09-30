@@ -268,7 +268,8 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                     for name,ds in [('train',train_set),('dev',dev_set),('test',test_set)]}
         (output_dir/'split_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     try:
-        loc_cfg = {**(oc.get('localization') or {}), **(oc.get('reward') or {})}
+        loc_cfg = {**(oc.get('localization') or {}), **(oc.get('reward') or {}),
+                   **(oc.get('planner') or {})}
         zoom_enabled = bool((oc.get('zoom') or {}).get('enabled', False))
         resample_cfg = oc.get('resampling') or {}
         max_group_resamples = int(resample_cfg.get('max_group_resamples', 3))
@@ -304,7 +305,11 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                         completions = generate_group(model, processor, batch, cfg, group=int(gc['group_size']), sample=True)
                     rollout_sec += time.perf_counter() - t_gen
                     parsed = [parse_output_cfg(c.text, cfg, max_boxes=max_boxes) for c in completions]
-                    scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg, max_boxes=max_boxes) for p in parsed]
+                    scores = [score_output(p, meta, float(oc['protocol_weight']), loc_cfg,
+                                           max_boxes=max_boxes, trace=t)
+                              for p, t in zip(parsed, traces)] if traces is not None else [
+                        score_output(p, meta, float(oc['protocol_weight']), loc_cfg, max_boxes=max_boxes)
+                        for p in parsed]
                     task_rewards = torch.tensor([s['task'] for s in scores], device=device)
                     loc_rewards = torch.tensor([s['loc_reward'] for s in scores], device=device)
                     task_std = float(task_rewards.std(unbiased=False))
@@ -343,10 +348,22 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                                      if bool(gc.get('per_token_advantage', True)) else None)
                 if verify_advantages is not None and bool(verify_advantages.abs().max().item() <= 1e-8):
                     verify_advantages = None
+                planner_advantages = confirm_advantages = None
+                if traces is not None and bool(gc.get('per_token_advantage', True)):
+                    planner_rewards = torch.tensor([s.get('planner_signal', 0.0) for s in scores], device=device)
+                    confirm_rewards = torch.tensor([s.get('confirm_signal', 0.0) for s in scores], device=device)
+                    planner_advantages = group_advantages(planner_rewards, bool(gc.get('scale_rewards', False)))
+                    confirm_advantages = group_advantages(confirm_rewards, bool(gc.get('scale_rewards', False)))
+                    if bool(planner_advantages.abs().max().item() <= 1e-8):
+                        planner_advantages = None
+                    if bool(confirm_advantages.abs().max().item() <= 1e-8):
+                        confirm_advantages = None
+                    verify_advantages = None
                 # Skip the update only when EVERY valid-token advantage collapsed
                 # (task + candidate + final + verify), not just the task term.
                 zero = bool(advantages.abs().max().item() <= 1e-8)
-                for a in (cand_advantages, loc_advantages, verify_advantages):
+                for a in (cand_advantages, loc_advantages, verify_advantages,
+                          planner_advantages, confirm_advantages):
                     if a is not None:
                         zero = zero and bool(a.abs().max().item() <= 1e-8)
                 if world > 1:
@@ -412,7 +429,9 @@ def run_train(cfg, model, processor, prior, train_set, dev_set, test_set, output
                             model, processor, rollouts, advantages, opt, cfg, skip=zero,
                             cand_advantages=cand_advantages,
                             final_advantages=loc_advantages,
-                            verify_advantages=verify_advantages)
+                            verify_advantages=verify_advantages,
+                            imagine_advantages=planner_advantages,
+                            confirm_advantages=confirm_advantages)
                     else:
                         loss_stats = optimize_group(model, processor, batch, completions, advantages, opt, cfg, skip=zero,
                                                     loc_advantages=loc_advantages,

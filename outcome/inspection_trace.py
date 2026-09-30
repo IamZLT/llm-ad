@@ -84,6 +84,57 @@ class RolloutSegment:
 
 
 @dataclass
+class InspectionRound:
+    """One predict-select-observe-update step. ``T>1`` appends more rounds."""
+    round_index: int = 0
+    input_boxes: List[List[float]] = field(default_factory=list)
+    legal_observation_actions: List[str] = field(default_factory=list)
+    world_model_predictions: List[dict] = field(default_factory=list)
+    world_model_valid: bool = False
+    world_model_error: Optional[str] = None
+    selected_observation_action: Optional[str] = None
+    selected_predicted_gain: Optional[float] = None
+    selected_predicted_evidence: Optional[str] = None
+    policy_score: Optional[float] = None
+    observation_cost: float = 0.0
+    observation_executed: bool = False
+    observation_skip_reason: Optional[str] = None
+    observations: List[dict] = field(default_factory=list)
+    confirm_text: str = ""
+    observed_evidence: Optional[str] = None
+    prediction_consistency: Optional[str] = None
+    update_action: Optional[str] = None
+    output_boxes: List[List[float]] = field(default_factory=list)
+    actual_gain: Optional[float] = None
+    gain_error: Optional[float] = None
+
+    def to_record(self) -> dict:
+        return dict(
+            round_index=self.round_index,
+            input_boxes=self.input_boxes,
+            legal_observation_actions=self.legal_observation_actions,
+            world_model_predictions=self.world_model_predictions,
+            world_model_valid=self.world_model_valid,
+            world_model_error=self.world_model_error,
+            selected_observation_action=self.selected_observation_action,
+            selected_predicted_gain=self.selected_predicted_gain,
+            selected_predicted_evidence=self.selected_predicted_evidence,
+            policy_score=self.policy_score,
+            observation_cost=self.observation_cost,
+            observation_executed=self.observation_executed,
+            observation_skip_reason=self.observation_skip_reason,
+            observations=self.observations,
+            confirm_text=self.confirm_text,
+            observed_evidence=self.observed_evidence,
+            prediction_consistency=self.prediction_consistency,
+            update_action=self.update_action,
+            output_boxes=self.output_boxes,
+            actual_gain=self.actual_gain,
+            gain_error=self.gain_error,
+        )
+
+
+@dataclass
 class InspectionTrace:
     """One inspection's full two-stage trajectory (B0 -> observe -> B1)."""
     initial_boxes: List[List[float]] = field(default_factory=list)   # B0 (0-1000)
@@ -105,6 +156,23 @@ class InspectionTrace:
 
     segments: List[RolloutSegment] = field(default_factory=list)      # stage 1, then stage 2
     stage1_early_end: Optional[str] = None                            # </think>/<answer>/eos/length
+    rounds: List[InspectionRound] = field(default_factory=list)
+
+    def apply_round(self, rnd: "InspectionRound") -> None:
+        """Mirror the latest observation action onto the legacy trace fields."""
+        self.rounds.append(rnd)
+        self.initial_boxes = [list(b) for b in rnd.input_boxes]
+        self.observations = list(rnd.observations)
+        self.observation_executed = bool(rnd.observation_executed)
+        self.selected_action = rnd.selected_observation_action
+        self.pre_observation_prediction = rnd.selected_predicted_evidence or ""
+        action = rnd.selected_observation_action or ""
+        candidate = next((o for o in rnd.observations if o.get("kind") == "candidate"), None)
+        self.zoom_executed = action.startswith("zoom_box_") and rnd.observation_executed
+        self.selected_box_index = int(candidate["candidate_index"]) if candidate and candidate.get("candidate_index") is not None else -1
+        window = candidate.get("window_px") if candidate else None
+        self.crop_window_px = tuple(window) if window else None
+        self.zoom_skip_reason = None if self.zoom_executed else (rnd.observation_skip_reason or action or None)
 
     def to_record(self) -> dict:
         """JSON-serializable snapshot for evaluation rows."""
@@ -122,4 +190,5 @@ class InspectionTrace:
             predicted_effect=self.predicted_effect,
             final_boxes=self.final_boxes,
             stage1_early_end=self.stage1_early_end,
+            rounds=[rnd.to_record() for rnd in self.rounds],
         )

@@ -116,11 +116,20 @@ def make_record(parsed, score, meta, completion, prompt_len, elapsed, max_boxes,
         observations=(trace.observations if trace is not None else []),
         selected_box_index=(trace.selected_box_index if trace is not None else -1),
         crop_window_px=(list(trace.crop_window_px) if trace is not None and trace.crop_window_px else None),
-        selected_action=parsed.get('selected_action'),
+        selected_action=(trace.selected_action if trace is not None and trace.selected_action
+                         else parsed.get('selected_action')),
         predicted_effect=parsed.get('predicted_effect'),
         pre_observation_prediction=parsed.get('pre_observation_prediction', ''),
-        stage1_early_end=(trace.stage1_early_end if trace is not None else None),
+        planner_valid=(trace.rounds[-1].world_model_valid if trace is not None and trace.rounds else None),
+        predicted_gain=(trace.rounds[-1].selected_predicted_gain if trace is not None and trace.rounds else score.get('predicted_gain')),
+        actual_gain=(trace.rounds[-1].actual_gain if trace is not None and trace.rounds else None),
+        gain_error=score.get('gain_error'),
+        predicted_evidence=(trace.rounds[-1].selected_predicted_evidence if trace is not None and trace.rounds else None),
+        observed_evidence=parsed.get('observed_evidence'),
+        prediction_consistency=parsed.get('prediction_consistency'),
+        observation_cost=score.get('observation_cost'),
         quality_before=score.get('q0'), quality_after=score.get('q1'),
+        stage1_early_end=(trace.stage1_early_end if trace is not None else None),
         stop_reason=completion.stop_reason, new_tokens=len(completion.ids)-prompt_len,
         seconds=elapsed, text=completion.text)
     if cm is not None:
@@ -198,7 +207,19 @@ def summarize(rows):
         gt_over_max_boxes_rate=mean(r['gt_over_max_boxes'] for r in abnormal),
         mean_cap_reward_ceiling=mean(r['reward_ceiling_from_cap'] for r in abnormal),
         mean_num_boxes=mean(r['num_boxes'] for r in abnormal),
-        mean_num_components=mean(r['num_components'] for r in abnormal))
+        mean_num_components=mean(r['num_components'] for r in abnormal),
+        planner_valid_rate=mean(r['planner_valid'] for r in rows if r.get('planner_valid') is not None),
+        mean_predicted_gain=mean(r['predicted_gain'] for r in rows if r.get('predicted_gain') is not None),
+        mean_actual_gain=mean(r['actual_gain'] for r in rows if r.get('actual_gain') is not None),
+        gain_mae=mean(r['gain_error'] for r in rows if r.get('gain_error') is not None),
+        zoom_rate=mean(str(r.get('selected_action') or '').startswith('zoom_box_') for r in rows),
+        global_scan_rate=mean(r.get('selected_action') == 'global_scan' for r in rows),
+        stop_rate=mean(r.get('selected_action') == 'stop' for r in rows),
+        mean_observation_cost=mean(r['observation_cost'] for r in rows if r.get('observation_cost') is not None),
+        mean_q0=mean(r['quality_before'] for r in rows if r.get('quality_before') is not None),
+        mean_q1=mean(r['quality_after'] for r in rows if r.get('quality_after') is not None),
+        mean_delta_q=mean((r['quality_after'] - r['quality_before'])
+                          for r in rows if r.get('quality_after') is not None and r.get('quality_before') is not None))
     for size in ('small','medium','large'):
         subset = [r for r in abnormal if r['size_bin'] == size]
         tp = [r for r in subset if r['pred'] is True and r['task_valid']]
@@ -383,15 +404,17 @@ def evaluate(cfg, model, processor, prior, dataset, output_path, limit=None, wri
             meta = batch['_meta'][0]
             reward = score_output(parsed, meta, float(cfg['outcome']['protocol_weight']),
                                   {**cfg['outcome'].get('localization', {}),
-                                   **cfg['outcome'].get('reward', {})}, max_boxes=max_boxes)
-            # Backfill the trace's B1 / action / effect from the parsed chain (only
-            # available after parsing); B0 may already be set by the generator.
+                                   **cfg['outcome'].get('reward', {}),
+                                   **((cfg['outcome'].get('planner') or {}))},
+                                  max_boxes=max_boxes, trace=trace)
+            # B1 and confirm fields come from the parser. The selected observation
+            # action was already chosen by the controller and must not be overwritten.
             if trace is not None:
                 if not trace.initial_boxes and parsed['candidate_bboxes_2d']:
                     trace.initial_boxes = [list(b) for b in parsed['candidate_bboxes_2d']]
                 trace.final_boxes = [list(b) for b in parsed['bboxes_2d']]
-                trace.selected_action = parsed.get('selected_action')
-                trace.predicted_effect = parsed.get('predicted_effect')
+                if trace.rounds:
+                    trace.rounds[-1].output_boxes = [list(b) for b in parsed['bboxes_2d']]
             row = make_record(parsed, reward, meta, completion, int(batch['prompt_len'][0]),
                               time.perf_counter()-started, max_boxes, trace)
             rows.append(row)

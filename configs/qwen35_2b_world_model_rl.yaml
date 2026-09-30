@@ -8,10 +8,10 @@
 # tracks whether the internal [confirm] verdict matches the GT (world-model discriminator).
 paths:
   dataset_root: /root/data-fs/bljiao/datasets
-  output_dir: ./outputs/train/qwen35_2b_world_model_rl_selective_v1
+  output_dir: ./outputs/train/qwen35_2b_world_model_rl_wm_planner_v1
 runtime:
   mode: train
-  run_name: qwen35_2b_world_model_rl_selective_v1
+  run_name: qwen35_2b_world_model_rl_wm_planner_v1
   auto_create_output_dir: true
 tensorboard:
   port: 5010
@@ -99,10 +99,19 @@ prompt:
     some may be false alarms, and real defects may be unmarked or imperfectly centered.
     Inspect the images directly, verify each candidate against the Image 1 baseline, and
     expand beyond the hint when needed.
-    Reason inside your thinking as: understand the reference, compare the differences and
-    why, localize candidate boxes, imagine whether each candidate actually matches the
-    defect (keep / refine / reject / none), then confirm the decision that follows from
-    your rehearsal (keep / refine / reject / none). Finally output only <answer>.
+    Reason in this order, then output only <answer>.
+    [understand] Establish the normal visual baseline from the reference image.
+    [compare] Compare the inspection image with the reference and identify
+    task-relevant differences.
+    [localize] Produce the current candidate anomaly boxes.
+    [imagine] Before seeing any additional crop or scan, predict the expected
+    outcome of every legal observation action. For every current candidate among
+    the first K boxes write one line:
+    action=zoom_box_i; evidence=<type>; gain=<value>
+    Also write:
+    action=global_scan; evidence=<type>; gain=<value>
+    action=stop; evidence=no_new_evidence; gain=0.00
+    Do not claim to have seen a crop or scan that has not yet been supplied.
     Follow the required stage order and output format, but do not
     use a fixed sentence template.
 
@@ -116,8 +125,8 @@ prompt:
     [localize]: Provide candidate boxes in the required format.
     Any location description must agree with the boxes.
 
-    [imagine]: Use the required action word, then briefly state
-    the visual basis or what remains uncertain.
+    [imagine]: Predict every legal action before any extra crop.
+    One line per action: action=<name>; evidence=<type>; gain=<value>.
 
     The reference may be a different normal instance of the same class.
     Describe visible evidence; do not invent defect causes.
@@ -172,6 +181,14 @@ outcome:
   reasoning_mode: fsm
   thinking:
     enabled: true
+  planner:
+    mode: world_model
+    max_zoom_candidates: 3
+    max_rounds: 1
+    invalid_fallback: stop
+    zoom_cost: 1.0
+    global_scan_cost: 2.0
+    cost_weight: 0.05
   localization:
     iou_threshold: 0.30
     geometry_weight: 0.30
@@ -197,14 +214,17 @@ outcome:
     # keep_iou_threshold splits keep (box essentially right) from refine (box
     # undershoots/shifted); refine_eps absorbs numeric noise when thresholding the
     # delta_refine sign (a first-round box that is already right is "unchanged").
-    discrim_weight: 0.1    # final [confirm] refine-loop verdict vs sign(delta_refine)
-    imagine_weight: 0.1    # [imagine] box-quality rehearsal vs objective verdict
+    discrim_weight: 0.1    # legacy [confirm] verdict vs sign(delta_refine)
+    imagine_weight: 0.1    # legacy [imagine] verdict vs objective verdict
+    planner_weight: 0.10
+    gain_calib_weight: 0.05
+    confirm_weight: 0.10
     keep_iou_threshold: 0.5
     refine_eps: 0.05
   resampling:
     min_loc_range: 0.001
     max_group_resamples: 3
-  sft_adapter: outputs/train/world_model_sft_2b_selective_v1
+  sft_adapter: outputs/train/world_model_sft_2b_wm_planner_v1
   # H-Box geometry-token prior (static linear projection, no gate / no cross-attn):
   # H connected-component boxes -> geometry vectors -> <|h_box|> placeholder embeddings.
   h_box_prior:

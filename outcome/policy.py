@@ -11,8 +11,9 @@ from transformers import GenerationConfig, StoppingCriteriaList, StopStringCrite
 from models.qwen35 import force_vision_eval, unwrap_model
 from models.vision_cache import bind_cached_image_features
 from outcome.inspection_trace import InspectionTrace, RolloutSegment, SKIP_NO_ORIG_SIZE
-from outcome.thinking import (candidate_token_mask, final_box_token_mask, loc_token_mask,
-                               parse_think_stages, verify_token_mask)
+from outcome.thinking import (candidate_token_mask, confirm_token_mask, final_box_token_mask,
+                               imagine_token_mask, loc_token_mask, parse_think_stages,
+                               verify_token_mask)
 from rl.grpo import (clipped_pg_kl, disable_adapter_ctx, dropout_eval, expand_gen_in_for_group,
                      forward_with_vision, micro_batch_ranges, model_inputs, move_batch,
                      padded_completion_tensors, token_logprobs, token_logprobs_nograd)
@@ -254,12 +255,10 @@ def _think_stage_body(stage1_text: str, stage: str) -> str:
 def generate_inspection_group(model, processor, prior, batch, cfg, group=1, sample=False):
     """Unified two-stage world-model inspection flow (train & eval share this).
 
-    Stage 1 writes ``[understand][compare][localize][imagine]`` (pre-observation
-    prediction). ``plan_observations`` then decides what to re-encode for stage 2:
-    a candidate-centric crop for a single candidate, or two overlapping full-image
-    partitions (``global_scan``) for empty/multi/oversized candidates; stage 2
-    continues from ``[confirm]`` conditioned on ref + test + those observation
-    windows. ``B0`` and ``B1`` are kept separate in the returned ``InspectionTrace``.
+    Stage 1 writes ``[understand][compare][localize][imagine]``. The planner
+    reads predicted gain for every legal action and selects one. Stage 2
+    executes that action (zoom, global scan, or stop) and continues from
+    ``[confirm]``. ``B0`` and ``B1`` stay separate on the returned trace.
 
     Returns ``(completion, trace)``. ``completion.text`` is the concatenated think
     chain for the parser. ``trace.final_boxes`` / ``selected_action`` /
@@ -300,7 +299,10 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
 
     from outcome.protocol_multibox import parse_boxes_list
     from outcome.inputs import build_observation_batch
-    from outcome.observation import plan_observations, observation_prompt
+    from outcome.observation import execute_observation_action, observation_prompt
+    from outcome.planner import build_observation_actions, select_action
+    from outcome.world_model import parse_imagine_plan
+    from outcome.inspection_trace import InspectionRound
 
     if test_img is None or orig_size is None:
         # Should not happen (the collator always sets test/orig_size), but a missing
@@ -320,38 +322,50 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
     trace.initial_boxes = [list(b) for b in boxes]
     trace.candidate_parse_state = state
 
-    observations = plan_observations(test_img, boxes, orig_size, cfg)
-
-    trace.observations = [
+    legal_actions = build_observation_actions(boxes, cfg)
+    wm_plan = parse_imagine_plan(_imagine_body(stage1.text), legal_actions)
+    selected_action, policy_meta = select_action(wm_plan, boxes, legal_actions, cfg)
+    selected_pred = wm_plan.predictions.get(selected_action) if wm_plan.valid else None
+    action_cost = 0.0
+    for action in legal_actions:
+        if action.name == selected_action:
+            action_cost = float(action.cost)
+            break
+    rnd = InspectionRound(
+        round_index=0,
+        input_boxes=[list(b) for b in boxes],
+        legal_observation_actions=[a.name for a in legal_actions],
+        world_model_predictions=[
+            {"action": p.action, "evidence": p.evidence, "expected_gain": p.expected_gain}
+            for p in wm_plan.predictions.values()
+        ],
+        world_model_valid=wm_plan.valid,
+        world_model_error=wm_plan.error,
+        selected_observation_action=selected_action,
+        selected_predicted_gain=(selected_pred.expected_gain if selected_pred else None),
+        selected_predicted_evidence=(selected_pred.evidence if selected_pred else None),
+        policy_score=policy_meta.get("score"),
+        observation_cost=action_cost,
+    )
+    execution = execute_observation_action(test_img, boxes, orig_size, selected_action, cfg)
+    rnd.observation_executed = bool(execution.executed)
+    rnd.observation_skip_reason = execution.skip_reason
+    rnd.observations = [
         {
-            'kind': obs.kind,
-            'window_px': list(obs.window_px),
-            'candidate_index': obs.candidate_index,
+            "kind": obs.kind,
+            "window_px": list(obs.window_px),
+            "candidate_index": obs.candidate_index,
         }
-        for obs in observations
+        for obs in execution.observations
     ]
-    trace.observation_executed = bool(observations)
+    trace.apply_round(rnd)
 
-    # Back-compat fields: ``zoom_*`` specifically mean the candidate-centric crop.
-    candidate_obs = next(
-        (obs for obs in observations if obs.kind == 'candidate'),
-        None,
+    cont = observation_prompt(
+        class_name, execution.observations, orig_size,
+        selected_action=selected_action,
+        predicted_evidence=rnd.selected_predicted_evidence,
+        predicted_gain=rnd.selected_predicted_gain,
     )
-
-    trace.zoom_executed = candidate_obs is not None
-    trace.selected_box_index = (
-        candidate_obs.candidate_index
-        if candidate_obs is not None else -1
-    )
-    trace.crop_window_px = (
-        candidate_obs.window_px
-        if candidate_obs is not None else None
-    )
-    trace.zoom_skip_reason = (
-        None if candidate_obs is not None else 'scan_instead'
-    )
-
-    cont = observation_prompt(class_name, observations, orig_size)
 
     device = batch['input_ids'].device
     zbatch = build_observation_batch(
@@ -360,7 +374,7 @@ def generate_inspection_group(model, processor, prior, batch, cfg, group=1, samp
         cfg,
         ref_img,
         test_img,
-        [obs.image for obs in observations],
+        [obs.image for obs in execution.observations],
         cont,
         device,
         crop_min_pixels=zcfg.get('crop_min_pixels'),
@@ -652,13 +666,14 @@ def _segment_tensors(segment, pad, device):
 
 
 def _segment_advantage(segment, stage_idx, traj_idx, advantages, cand_advantages,
-                       final_advantages, verify_advantages, tokenizer, device):
-    """Per-token advantage [1, max_t] for one segment, split B0 / B1 / verify.
+                       final_advantages, verify_advantages, tokenizer, device,
+                       imagine_advantages=None, confirm_advantages=None):
+    """Per-token advantage [1, max_t] for one segment.
 
-    Stage 1's ``[localize]`` candidate tokens (B0) carry ``cand_advantages``;
-    stage 2's final ``bboxes_2d`` tokens (B1) carry ``final_advantages``; the
-    ``[imagine]``/``[confirm]`` reasoning carries ``verify_advantages``. All other
-    sampled tokens carry the trajectory's task advantage.
+    Stage 1 ``[localize]`` tokens carry ``cand_advantages``. Stage 2 ``bboxes_2d``
+    tokens carry ``final_advantages``. ``[imagine]`` carries the planner advantage
+    and ``[confirm]`` carries the update advantage. ``verify_advantages`` remains
+    only for callers that still share one signal across both stages.
     """
     n_comp = int(segment.completion.ids.numel()) - int(segment.prompt_len)
     max_t = int(segment.completion.ids.numel())
@@ -674,7 +689,18 @@ def _segment_advantage(segment, stage_idx, traj_idx, advantages, cand_advantages
         for j, flag in enumerate(flags[:n_comp]):
             if flag:
                 adv[0, int(segment.prompt_len) + j] = float(final_advantages[traj_idx])
-    if verify_advantages is not None:
+    if imagine_advantages is not None or confirm_advantages is not None:
+        if imagine_advantages is not None:
+            flags = imagine_token_mask(tokenizer, text)
+            for j, flag in enumerate(flags[:n_comp]):
+                if flag:
+                    adv[0, int(segment.prompt_len) + j] = float(imagine_advantages[traj_idx])
+        if confirm_advantages is not None:
+            flags = confirm_token_mask(tokenizer, text)
+            for j, flag in enumerate(flags[:n_comp]):
+                if flag:
+                    adv[0, int(segment.prompt_len) + j] = float(confirm_advantages[traj_idx])
+    elif verify_advantages is not None:
         flags = verify_token_mask(tokenizer, text)
         for j, flag in enumerate(flags[:n_comp]):
             if flag:
@@ -684,7 +710,8 @@ def _segment_advantage(segment, stage_idx, traj_idx, advantages, cand_advantages
 
 def optimize_inspection_group(model, processor, trajectories, advantages, optimizer, cfg,
                               skip=False, cand_advantages=None, final_advantages=None,
-                              verify_advantages=None):
+                              verify_advantages=None, imagine_advantages=None,
+                              confirm_advantages=None):
     """Two-stage on-policy PPO update over real ``RolloutSegment`` trajectories.
 
     Unlike ``optimize_group`` (which assumes every trajectory shares one ``batch``
@@ -716,7 +743,9 @@ def optimize_inspection_group(model, processor, trajectories, advantages, optimi
         for s_idx, seg in enumerate(trace.segments):
             outputs, attn, labels = _segment_tensors(seg, pad, device)
             adv = _segment_advantage(seg, s_idx, i, advantages, cand_advantages,
-                                     final_advantages, verify_advantages, tokenizer, device)
+                                     final_advantages, verify_advantages, tokenizer, device,
+                                     imagine_advantages=imagine_advantages,
+                                     confirm_advantages=confirm_advantages)
             n_comp = int(seg.completion.ids.numel()) - int(seg.prompt_len)
             seg_meta.append(dict(seg=seg, outputs=outputs, attn=attn, labels=labels,
                                  adv=adv, n_comp=n_comp))

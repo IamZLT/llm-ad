@@ -106,6 +106,26 @@ def parse_verify(text: str):
     return None, stripped
 
 
+def parse_confirm(text: str) -> dict:
+    """Parse ``observed=...; consistency=...; update=...`` from ``[confirm]``."""
+    match = re.search(
+        r"observed\s*=\s*([a-zA-Z0-9_]+)\s*;\s*"
+        r"consistency\s*=\s*(supported|contradicted|uncertain)\s*;\s*"
+        r"update\s*=\s*([a-zA-Z0-9_]+)",
+        text or "",
+        re.I,
+    )
+    if not match:
+        return dict(valid=False, observed_evidence=None,
+                    prediction_consistency=None, update_action=None)
+    return dict(
+        valid=True,
+        observed_evidence=match.group(1).lower(),
+        prediction_consistency=match.group(2).lower(),
+        update_action=match.group(3).lower(),
+    )
+
+
 def parse_refine_verify(text: str):
     """Parse a ``[confirm]`` body into ``(improved|unchanged|degraded, evidence)``."""
     stripped = text.strip()
@@ -148,7 +168,9 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
                   think_headers=[], think_bodies={},
                   # Two-stage observation bookkeeping (phase 1): B0/B1 are the initial
                   # [localize] boxes and the final <answer> boxes respectively.
-                  pre_observation_prediction='', selected_action=None, predicted_effect=None)
+                  pre_observation_prediction='', selected_action=None, predicted_effect=None,
+                  observed_evidence=None, prediction_consistency=None, update_action=None,
+                  confirm_valid=False)
     blocks = list(BLOCK.finditer(text))
     result['tags'] = {m[1]: m[2].strip() for m in blocks}
     answers = list(re.finditer(r'<answer>(.*?)</answer>', text, re.S))
@@ -236,9 +258,15 @@ def parse_output(text: str, max_boxes: int = DEFAULT_MAX_BOXES, thinking_require
         result['first_candidate_bboxes_2d'] = []
 
     if thinking_required:
-        # [confirm] evaluates the refine loop (improved/unchanged/degraded), a
-        # different question from [imagine]'s box-quality rehearsal (keep/refine/...).
-        vaction, vevidence = parse_refine_verify(verify_text)
+        confirm = parse_confirm(verify_text)
+        result['confirm_valid'] = confirm['valid']
+        result['observed_evidence'] = confirm['observed_evidence']
+        result['prediction_consistency'] = confirm['prediction_consistency']
+        result['update_action'] = confirm['update_action']
+        if confirm['valid']:
+            vaction, vevidence = confirm['update_action'], confirm['observed_evidence']
+        else:
+            vaction, vevidence = parse_refine_verify(verify_text)
     else:
         # Legacy <verify> tag keeps the old box-quality action vocabulary.
         vaction, vevidence = parse_verify(verify_text)
@@ -496,7 +524,8 @@ def validate_gt(meta):
         raise ValueError('normal sample must have null GT')
 
 
-def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxes=DEFAULT_MAX_BOXES):
+def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxes=DEFAULT_MAX_BOXES,
+                 trace=None):
     """Fine-grained reward: classification + GIoU/count/focus/refine (AD-FM style).
 
     ``R_task`` decomposes as:
@@ -629,6 +658,28 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 + cand_weight * cand_cov_val
                 + refine_weight * float(min(max(delta_refine, -refine_clip), refine_clip)))
     task = task + discrim_weight * discrim_correct + imagine_weight * imagine_correct
+    planner_signal = 0.0
+    confirm_signal = 0.0
+    gain_error = None
+    predicted_gain = None
+    observation_cost = 0.0
+    if trace is not None and getattr(trace, 'rounds', None):
+        rnd = trace.rounds[-1]
+        actual_gain = float(q1 - q0)
+        rnd.actual_gain = actual_gain
+        predicted_gain = rnd.selected_predicted_gain
+        observation_cost = float(rnd.observation_cost or 0.0)
+        if predicted_gain is not None:
+            gain_error = abs(float(predicted_gain) - actual_gain)
+            rnd.gain_error = gain_error
+        planner_signal = (actual_gain
+                          - float(loc.get('cost_weight', 0.05)) * observation_cost
+                          - float(loc.get('gain_calib_weight', 0.05)) * (gain_error or 0.0))
+        confirm_signal = 0.5 * float(q1) + 0.5 * actual_gain
+        if parsed.get('confirm_valid'):
+            rnd.observed_evidence = parsed.get('observed_evidence')
+            rnd.prediction_consistency = parsed.get('prediction_consistency')
+            rnd.update_action = parsed.get('update_action')
     protocol_core = float(parsed['protocol_core'])
     return dict(task=task, protocol=protocol_core, protocol_core=protocol_core,
                 protocol_strict=float(parsed['protocol_strict']),
@@ -651,4 +702,7 @@ def score_output(parsed, meta, protocol_weight=0.01, localization=None, max_boxe
                 candidate_fn=candidate_diag['fn'], final_tp=final_diag['tp'],
                 final_fp=final_diag['fp'], final_fn=final_diag['fn'],
                 final_set_complete=bool(parsed['task_valid'] and final_diag['complete']),
-                false_keep=bool(imagine_action == 'keep' and not candidate_diag['complete']))
+                false_keep=bool(imagine_action == 'keep' and not candidate_diag['complete']),
+                planner_signal=planner_signal, confirm_signal=confirm_signal,
+                gain_error=gain_error, predicted_gain=predicted_gain,
+                observation_cost=observation_cost)

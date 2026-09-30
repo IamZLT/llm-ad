@@ -435,9 +435,9 @@ def build_zoom_batch(processor, prior, cfg: dict, ref_img: Image.Image,
 
 
 def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
-                            test_img: Image.Image, crop_img: Image.Image,
-                            continuation_text: str, device, crop_min_pixels: int = None,
-                            prefill_text: str = '') -> dict:
+                            test_img: Image.Image, crop_img: Image.Image = None,
+                            continuation_text: str = '', device=None, crop_min_pixels: int = None,
+                            prefill_text: str = '', observation_images=None) -> dict:
     """Build the stage-2 observation batch (ref + test + observation images).
 
     Merges the old train 3-image and eval H-free paths into one constructor: stage 2
@@ -448,7 +448,10 @@ def build_observation_batch(processor, prior, cfg: dict, ref_img: Image.Image,
     candidate), the batch is ref + test only, so the model still commits from the
     *same* candidate without the local observation — it never re-rolls a fresh
     single-pass trajectory, which would forfeit evaluating that candidate.
+    ``observation_images`` is the same argument as ``crop_img``.
     """
+    if observation_images is not None:
+        crop_img = observation_images
     data = cfg.get('data') or {}
     max_size = int(data.get('max_image_size', 768))
     factor = qwen_vision_factor(processor, getattr(prior, 'visual', None))
